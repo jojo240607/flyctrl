@@ -11,3 +11,6 @@ flyctrl-core = { path = "../core" }
 [features]
 # 启用 host 端耗时测量（依赖 std::time）。嵌入式固件不开启。
 std-time = []
+
+[dev-dependencies]
+flyctrl-core = { path = "../core" }

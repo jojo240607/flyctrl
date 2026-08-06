@@ -73,16 +73,17 @@ impl Physics {
 
         // 2) 混控 -> 机体总推力(沿 -Z 机体) 与力矩
         //    电机布局 X 型：0=前右(CCW) 1=后左(CCW) 2=前左(CW) 3=后右(CW)
+        //    约定（与控制器/姿态提取一致）：前右电机(0)更高 -> 右滚(+) + 上仰(+)。
         let f_total: f32 = self.motor_force.iter().sum();
-        // 俯仰力矩：前后电机差（前=0,2 下标沿 X；这里用绕 Y 轴的力矩）
+        // 俯仰力矩：前(0,2)高 -> 机头上仰(+pitch，绕 +Y)
         let m_pitch = p.arm_length * (self.motor_force[0] + self.motor_force[2]
                                       - self.motor_force[1] - self.motor_force[3]);
-        // 横滚力矩：左右电机差（绕 X 轴）
+        // 横滚力矩：右(0,3)高 -> 右滚(+roll，绕 +X)
         let m_roll = p.arm_length * (self.motor_force[0] + self.motor_force[3]
                                      - self.motor_force[1] - self.motor_force[2]);
-        // 偏航力矩：CW/CCW 反扭差（绕 Z 轴）
-        let m_yaw = p.torque_coeff * (self.motor_force[1] + self.motor_force[2]
-                                      - self.motor_force[0] - self.motor_force[3]);
+        // 偏航力矩：CW/CCW 反扭差（绕 Z 轴）；CCW=(0,1) 反转矩 -> +yaw
+        let m_yaw = p.torque_coeff * (self.motor_force[0] + self.motor_force[1]
+                                     - self.motor_force[2] - self.motor_force[3]);
 
         // 机体推力向量（沿机体 -Z）
         let f_body = [0.0, 0.0, -f_total];

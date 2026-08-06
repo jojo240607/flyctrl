@@ -122,3 +122,18 @@ pub fn rotate_vec_by_quat_inverse(q: Quaternion, v: [f32; 3]) -> [f32; 3] {
     rotate_vec_by_quat(Quaternion { w: q.w, x: -q.x, y: -q.y, z: -q.z }, v)
 }
 
+/// 四元数共轭（单位四元数即逆）：机体->世界映射的反向。
+pub fn quat_conj(q: Quaternion) -> Quaternion {
+    Quaternion { w: q.w, x: -q.x, y: -q.y, z: -q.z }
+}
+
+/// 标准 Hamilton 积 q1 ⊗ q2。
+pub fn quat_mul(q1: Quaternion, q2: Quaternion) -> Quaternion {
+    Quaternion {
+        w: q1.w * q2.w - q1.x * q2.x - q1.y * q2.y - q1.z * q2.z,
+        x: q1.w * q2.x + q1.x * q2.w + q1.y * q2.z - q1.z * q2.y,
+        y: q1.w * q2.y - q1.x * q2.z + q1.y * q2.w + q1.z * q2.x,
+        z: q1.w * q2.z + q1.x * q2.y - q1.y * q2.x + q1.z * q2.w,
+    }
+}
+

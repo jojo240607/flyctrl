@@ -25,7 +25,7 @@ fn main() {
     let world = World::new(WorldParams::default());
 
     // --- 算法组合（基线） ---
-    let est = ComplementaryEstimator::new(0.98, 0.1);
+    let est = ComplementaryEstimator::new(0.5, 0.1, 0.1);
     let ctrl = PidController::default_quad();
 
     let dt = Second(0.005); // 200 Hz 控制环
@@ -35,14 +35,12 @@ fn main() {
     let sp = Setpoint::hover([Meter(0.0), Meter(0.0), Meter(-10.0)], Radian(0.0));
 
     println!("[sim] running 8s @ 200Hz, target hover at z=-10m ...");
-    // 临时：每秒打印一次状态用于调试
-    for sec in 0..8 {
-        let _ = harness.run(Second(1.0), &sp);
-        let s = harness.state();
-        println!("  t={}s pos=({:.2},{:.2},{:.2}) alt={:.2}",
-            sec+1, s.pos[0].0, s.pos[1].0, s.pos[2].0, -s.pos[2].0);
-    }
-    let m = harness.run(Second(0.0), &sp);
+    // 先跑 4s 打印中间状态用于诊断，再续跑 4s 收集指标
+    let _ = harness.run(Second(4.0), &sp);
+    let s = harness.state();
+    println!("  t=4s pos=({:.2},{:.2},{:.2}) alt={:.2}",
+        s.pos[0].0, s.pos[1].0, s.pos[2].0, -s.pos[2].0);
+    let m = harness.run(Second(4.0), &sp);
     report("PID+Complementary", m);
 
     // 打印最终状态

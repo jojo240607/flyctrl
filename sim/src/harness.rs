@@ -22,6 +22,7 @@ pub struct Harness<E: Estimator, C: Controller> {
     t: Second,
     last_cmd: ActuatorCmd,
     metrics: Metrics,
+    last_est: VehicleState,
 }
 
 /// 对比指标集合。
@@ -42,6 +43,7 @@ impl<E: Estimator, C: Controller> Harness<E, C> {
             dt, t: Second::ZERO,
             last_cmd: ActuatorCmd::zero(),
             metrics: Metrics::default(),
+            last_est: VehicleState::zero(),
         }
     }
 
@@ -61,6 +63,7 @@ impl<E: Estimator, C: Controller> Harness<E, C> {
             let (imu, pos) = self.world.sense(self.dt, ideal, true_pos);
             // 3) 估计
             let est = self.estimator.step(self.dt, imu, pos);
+            self.last_est = est;
             // 4) 控制（计时最坏耗时）
             let t0 = now_ms();
             let cmd = self.controller.control(self.dt, setpoint, &est);
@@ -100,6 +103,12 @@ impl<E: Estimator, C: Controller> Harness<E, C> {
     }
 
     pub fn state(&self) -> VehicleState { self.physics.state() }
+
+    /// 暴露最近一次估计状态（调试用）。
+    pub fn last_est(&self) -> VehicleState { self.last_est }
+
+    /// 暴露最近一次控制输出（调试用）。
+    pub fn last_cmd(&self) -> ActuatorCmd { self.last_cmd }
 }
 
 /// 位置误差幅值 (m)。

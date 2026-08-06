@@ -18,7 +18,7 @@ impl Default for WorldParams {
     fn default() -> Self {
         Self {
             accel_noise: 0.05,
-            gyro_noise: 0.005,
+            gyro_noise: 0.0003,
             pos_noise: 0.3,
             wind: [0.0, 0.0, 0.0],
             wind_gust: 0.0,
