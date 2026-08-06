@@ -44,6 +44,12 @@ pub struct Physics {
     state: VehicleState,
     /// 电机实际推力（带一阶滞后），用于动力学积分
     motor_force: [f32; 4],
+    /// 当前环境风（世界系 NED，m/s）。气动阻力相对空气计算，从而风成为扰动。
+    wind: [f32; 3],
+    /// 阵风幅度 (m/s)。在常值风基础上叠加一个随时间正弦变化的阵风。
+    wind_gust: f32,
+    /// 仿真累计时间 (s)，用于阵风相位。
+    t: f32,
 }
 
 impl Physics {
@@ -52,10 +58,19 @@ impl Physics {
             params,
             state: VehicleState::zero(),
             motor_force: [0.0; 4],
+            wind: [0.0; 3],
+            wind_gust: 0.0,
+            t: 0.0,
         }
     }
 
     pub fn state(&self) -> VehicleState { self.state }
+
+    /// 设置环境风（世界系 NED，m/s）。用于抗风扰场景。
+    pub fn set_wind(&mut self, wind: [f32; 3]) { self.wind = wind; }
+
+    /// 设置阵风幅度 (m/s)。叠加在 set_wind 的常值风之上（沿北向脉动）。
+    pub fn set_wind_gust(&mut self, gust: f32) { self.wind_gust = gust; }
 
     /// 推进一个控制周期。
     /// `cmd` 为控制器输出，`dt` 为周期。返回该周期内的"理想 IMU 测量"
@@ -63,6 +78,7 @@ impl Physics {
     pub fn step(&mut self, dt: Second, cmd: ActuatorCmd) -> ImuSample {
         let dt = dt.0;
         let p = &self.params;
+        self.t += dt;
 
         // 1) 电机一阶响应：实际推力趋近指令推力
         for i in 0..4 {
@@ -94,12 +110,24 @@ impl Physics {
         let a_body = [f_body[0] / p.mass, f_body[1] / p.mass, f_body[2] / p.mass];
         let a_world = rotate_by_quat(r, a_body);
         let v = self.state.vel;
-        // 气动阻力（机体速度平方，近似）：取世界速度平方的反向
-        let speed2 = v[0].0 * v[0].0 + v[1].0 * v[1].0 + v[2].0 * v[2].0;
+        // 阵风：在常值风基础上沿北向叠加正弦脉动（周期 ~5s）。
+        let gust = self.wind_gust * flyctrl_core::math::sin(2.0 * core::f32::consts::PI * self.t / 5.0);
+        let wind_eff = [
+            self.wind[0] + gust,
+            self.wind[1],
+            self.wind[2],
+        ];
+        // 气动阻力相对空气计算：v_rel = 世界速度 - 风。
+        let vr = [
+            v[0].0 - wind_eff[0],
+            v[1].0 - wind_eff[1],
+            v[2].0 - wind_eff[2],
+        ];
+        let speed2 = vr[0] * vr[0] + vr[1] * vr[1] + vr[2] * vr[2];
         let speed = speed2.sqrt();
         let drag = if speed > 1e-6 {
             let d = p.drag_coeff * speed2 / p.mass;
-            [-v[0].0 / speed * d, -v[1].0 / speed * d, -v[2].0 / speed * d]
+            [-vr[0] / speed * d, -vr[1] / speed * d, -vr[2] / speed * d]
         } else { [0.0; 3] };
 
         let ax = a_world[0] + drag[0];

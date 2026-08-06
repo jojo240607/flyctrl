@@ -9,3 +9,4 @@
 pub mod physics;
 pub mod world;
 pub mod harness;
+pub mod scenario;

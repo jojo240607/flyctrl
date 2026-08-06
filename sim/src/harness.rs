@@ -12,6 +12,7 @@ use flyctrl_core::vehicle::{ActuatorCmd, VehicleState};
 
 pub use crate::physics::{Physics, PhysicsParams};
 pub use crate::world::{World, WorldParams};
+pub use crate::scenario::{Scenario, ScenarioKind};
 
 pub struct Harness<E: Estimator, C: Controller> {
     physics: Physics,
@@ -77,6 +78,61 @@ impl<E: Estimator, C: Controller> Harness<E, C> {
             if err > self.metrics.pos_max { self.metrics.pos_max = err; }
             if first_settle < 0.0 && err < tol && i as f32 * self.dt.0 > 0.2 {
                 first_settle = i as f32 * self.dt.0;
+            }
+            if !est.pos[0].0.is_finite() || !est.att.w.is_finite() {
+                self.metrics.nan_detected = true;
+                break;
+            }
+            self.t = Second(self.t.0 + self.dt.0);
+        }
+
+        self.metrics.steps = n;
+        self.metrics.pos_rms = (err_sq_sum / n as f32).sqrt();
+        self.metrics.settle_time = first_settle;
+        self.metrics.worst_step_ms = worst;
+        self.metrics
+    }
+
+    /// 运行 `duration` 秒，目标由 `scenario` 随时间给出（支持阶跃/轨迹/风扰）。
+    ///
+    /// 同时把 scenario 的世界环境（风扰）应用到物理与世界。
+    pub fn run_scenario(&mut self, duration: Second, scenario: &Scenario) -> Metrics {
+        // 应用风扰到物理模型
+        let wp = scenario.world_params();
+        self.physics.set_wind(wp.wind);
+        self.physics.set_wind_gust(wp.wind_gust);
+        let n = (duration.0 / self.dt.0).round() as u32;
+        let mut err_sq_sum = 0.0f32;
+        let mut first_settle: f32 = -1.0;
+        let mut worst = 0.0f32;
+
+        for i in 0..n {
+            let tt = Second(i as f32 * self.dt.0);
+            let setpoint = scenario.setpoint_at(tt);
+            // 1) 物理推进
+            let ideal = self.physics.step(self.dt, self.last_cmd);
+            let true_pos = self.physics.state().pos;
+            // 2) 世界加噪
+            let (imu, pos) = self.world.sense(self.dt, ideal, true_pos);
+            // 3) 估计
+            let est = self.estimator.step(self.dt, imu, pos);
+            self.last_est = est;
+            // 4) 控制
+            let t0 = now_ms();
+            let cmd = self.controller.control(self.dt, &setpoint, &est);
+            let el = now_ms() - t0;
+            if el > worst { worst = el; }
+            self.last_cmd = cmd;
+
+            // 5) 指标：轨迹误差 = 估计位置与当前目标位置之差
+            let err = pos_error(&est, &setpoint);
+            err_sq_sum += err * err;
+            if err > self.metrics.pos_max { self.metrics.pos_max = err; }
+            // 稳定判定：仅在阶跃之后允许（避免起始过渡），且目标已稳定
+            if scenario.kind() != ScenarioKind::Step || tt.0 >= scenario.step_time() {
+                if first_settle < 0.0 && err < 0.5 && tt.0 > 0.2 {
+                    first_settle = tt.0;
+                }
             }
             if !est.pos[0].0.is_finite() || !est.att.w.is_finite() {
                 self.metrics.nan_detected = true;
