@@ -12,5 +12,7 @@ pub mod math;
 pub mod units;
 pub mod state;
 pub mod vehicle;
+pub mod config;
 pub mod estimator;
 pub mod controller;
+pub mod fdir;

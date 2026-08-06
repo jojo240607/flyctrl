@@ -140,10 +140,10 @@ flyctrl/
 - [x] 标准测试场景（`sim/scenario.rs` + `Physics` 风扰模型）：定点悬停 / 阶跃目标 / 定点抗风扰 / 方形航线 / 圆形轨迹，命令行 `--scenario <hover|step|wind|square|circle>` 一键对比（见 §3-A）
 
 ### M3：控制深度扩展
-- [ ] `controller` 增加 MPC 实现（短视界，对比 LQR 抗约束能力）
-- [ ] 轨迹跟踪（位置环 + 速度前馈），而非仅定点悬停
-- [ ] 机型配置抽象（`VehicleConfig`：质量/惯量/机臂/推力系数），支持多旋翼/垂起参数化
-- [ ] FDIR 雏形（传感器失效检测 + 降级模式，复用 `state` 类型机）
+- [x] `controller` 增加 MPC 实现（`mpc.rs`：短视界双积分器滚动优化 + 倾角/推力约束，投影梯度求解；复用 LQR 姿态内环 + X 混控；`--ctrl mpc`）
+- [x] 轨迹跟踪（位置环 + 速度前馈）：PID/LQR 外环接入 `Setpoint.vel` 前馈，方形/圆形航线 RMS 显著下降
+- [x] 机型配置抽象（`core/src/config.rs` 的 `VehicleConfig`：质量/惯量/机臂/推力系数/倾角/悬停油门；派生 `dyn_params()`→`PhysicsParams` 与 `ctrl_params()`→`CtrlParams`；PID/LQR/MPC 均提供 `from_config`）
+- [x] FDIR 雏形（`core/src/fdir.rs`：IMU 冻结检测 + GPS dropout 检测 → `Health::{Nominal,Degraded,Critical}`；`bin/sitl --fdir` 注入 GPS 丢失窗口 [4s,8s) 演示降级保持与恢复）
 
 ---
 

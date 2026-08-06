@@ -39,6 +39,21 @@ impl Default for PhysicsParams {
     }
 }
 
+impl From<flyctrl_core::config::DynParams> for PhysicsParams {
+    fn from(p: flyctrl_core::config::DynParams) -> Self {
+        Self {
+            mass: p.mass,
+            arm_length: p.arm_length,
+            thrust_coeff: p.thrust_coeff,
+            torque_coeff: p.torque_coeff,
+            inertia: p.inertia,
+            motor_tau: p.motor_tau,
+            drag_coeff: p.drag_coeff,
+            gravity: p.gravity,
+        }
+    }
+}
+
 pub struct Physics {
     params: PhysicsParams,
     state: VehicleState,

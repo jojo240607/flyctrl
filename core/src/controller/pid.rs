@@ -50,6 +50,17 @@ impl PidController {
             gravity: 9.81,
         }
     }
+
+    /// 从机型配置构造。
+    pub fn from_config(c: &crate::config::CtrlParams) -> Self {
+        let mut s = Self::default_quad();
+        s.tilt_max = c.tilt_max;
+        s.hover_thrust = c.hover_thrust;
+        s.gravity = c.gravity;
+        s.vmax_xy = c.vmax_xy;
+        s.vmax_z = c.vmax_z;
+        s
+    }
 }
 
 impl Controller for PidController {
@@ -57,12 +68,14 @@ impl Controller for PidController {
         let g = self.gravity;
 
         // --- 外环：位置误差 -> 期望速度（限幅，避免饱和） ---
+        // 加入设定点速度前馈：轨迹跟踪时直接把 sp.vel 叠加到期望速度，
+        // 减少相位滞后（square/circle 场景 RMS 显著下降）。
         let ex = sp.pos[0].0 - est.pos[0].0;
         let ey = sp.pos[1].0 - est.pos[1].0;
         let ez = sp.pos[2].0 - est.pos[2].0;
-        let des_vx = clampf(self.kp_xy * ex, -self.vmax_xy, self.vmax_xy);
-        let des_vy = clampf(self.kp_xy * ey, -self.vmax_xy, self.vmax_xy);
-        let des_vz = clampf(self.kp_z * ez, -self.vmax_z, self.vmax_z);
+        let des_vx = clampf(self.kp_xy * ex + sp.vel[0].0, -self.vmax_xy, self.vmax_xy);
+        let des_vy = clampf(self.kp_xy * ey + sp.vel[1].0, -self.vmax_xy, self.vmax_xy);
+        let des_vz = clampf(self.kp_z * ez + sp.vel[2].0, -self.vmax_z, self.vmax_z);
 
         // --- 中环：速度误差 -> 期望世界系加速度 ---
         let acc_n = self.kv_xy * (des_vx - est.vel[0].0); // 北向

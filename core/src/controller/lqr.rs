@@ -44,6 +44,7 @@ pub struct LqrController {
     k_q: f32,
     k_r: f32,
     tilt_max: f32,
+    hover_thrust: f32,
 }
 
 impl LqrController {
@@ -59,11 +60,21 @@ impl LqrController {
             k_q: 1.2,
             k_r: 0.6,
             tilt_max: 0.35,
+            hover_thrust: 0.5,
         }
     }
 
     pub fn default_quad() -> Self {
         Self::new()
+    }
+
+    /// 从机型配置构造（从 [`crate::config::CtrlParams`] 取重力/倾角/悬停油门）。
+    pub fn from_config(c: &crate::config::CtrlParams) -> Self {
+        let mut s = Self::new();
+        s.g = c.gravity;
+        s.tilt_max = c.tilt_max;
+        s.hover_thrust = c.hover_thrust;
+        s
     }
 }
 
@@ -84,7 +95,7 @@ impl Controller for LqrController {
 
         // 期望推力：悬停基准 0.5（归一化），由垂直加速度误差调制。
         // 世界系 z 向下为正，需要下降(az>0)时减小推力。
-        let des_thrust = clampf(0.5 - az / self.g, 0.1, 1.0);
+        let des_thrust = clampf(self.hover_thrust - az / self.g, 0.1, 1.0);
 
         // 期望姿态角（小角几何）：phi 对应 east(accel y), theta 对应 north(accel x)
         let phi_des = clampf(ay / self.g, -self.tilt_max, self.tilt_max);
