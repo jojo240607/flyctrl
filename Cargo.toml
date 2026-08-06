@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = [
+    "core",
+    "sim",
+    "bin",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["flyctrl"]
+license = "MIT OR Apache-2.0"
+
+# 核心控制逻辑禁用标准库与堆分配：硬实时、可移植到 no_std 飞控固件。
+# host 仿真时仍通过 std 运行，但 core crate 自身不依赖 std/alloc。
+[workspace.dependencies]
+num-traits = "0.2"
+nalgebra = { version = "0.32", default-features = false }
+heapless = "0.8"

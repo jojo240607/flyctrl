@@ -1,0 +1,13 @@
+[package]
+name = "flyctrl-sim"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+flyctrl-core = { path = "../core" }
+
+[features]
+# 启用 host 端耗时测量（依赖 std::time）。嵌入式固件不开启。
+std-time = []

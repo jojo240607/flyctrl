@@ -1,0 +1,14 @@
+[package]
+name = "flyctrl-sitl"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "sitl"
+path = "src/main.rs"
+
+[dependencies]
+flyctrl-core = { path = "../core" }
+flyctrl-sim = { path = "../sim", features = ["std-time"] }

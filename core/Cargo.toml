@@ -1,0 +1,11 @@
+[package]
+name = "flyctrl-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+# 本 crate 是飞控核心逻辑：单位系统、状态机、估计算法、控制律。
+# 设计为 no_std 友好（不依赖 std/alloc），可在 host 与嵌入式固件间共享。
+[dependencies]
+libm = "0.2"
