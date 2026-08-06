@@ -5,6 +5,8 @@
 
 pub mod trait_def;
 pub mod pid;
+pub mod lqr;
 
 pub use trait_def::{Controller, Setpoint};
 pub use pid::PidController;
+pub use lqr::LqrController;

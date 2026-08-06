@@ -340,6 +340,35 @@ fn parallel_true_vs_est() {
 }
 
 #[test]
+fn ekf_est_diag() {
+    // 诊断 EKF 估计质量：EKF 估计 + PID 控制，打印 est vs true 的姿态/位置。
+    use flyctrl_core::estimator::ekf::EkfEstimator;
+    use flyctrl_core::vehicle::{ActuatorCmd, ImuSample, Meter, Radian, Second};
+    let mut phys = Physics::new(PhysicsParams::default());
+    let mut world = World::new(WorldParams::default());
+    let mut est = EkfEstimator::default_quad();
+    let mut ctrl = PidController::default_quad();
+    let dt = Second(0.005);
+    let sp = Setpoint::hover([Meter(0.0), Meter(0.0), Meter(-10.0)], Radian(0.0));
+    let mut cmd = ActuatorCmd { motor: [0.5; 4] };
+    for k in 0..3000 {
+        let ideal = phys.step(dt, cmd);
+        let s = phys.state();
+        let (imu, gps) = world.sense(dt, ideal, s.pos);
+        let e = est.step(dt, imu, gps);
+        cmd = ctrl.control(dt, &sp, &e);
+        if k % 50 == 0 {
+            let b = est.gyro_bias();
+            eprintln!("k={} TRUE w={:.4} om=({:.3},{:.3},{:.3}) | EST w={:.4} om=({:.3},{:.3},{:.3}) | TRUE z={:.3} EST z={:.3} bias=({:.4},{:.4},{:.4})",
+                k, s.att.w, s.omega[0].0, s.omega[1].0, s.omega[2].0,
+                e.att.w, e.omega[0].0, e.omega[1].0, e.omega[2].0,
+                s.pos[2].0, e.pos[2].0,
+                b[0], b[1], b[2]);
+        }
+    }
+}
+
+#[test]
 fn trace_loop() {
     let phys = Physics::new(PhysicsParams::default());
     let mut world = World::new(WorldParams::default());

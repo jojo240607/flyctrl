@@ -5,6 +5,8 @@
 
 pub mod trait_def;
 pub mod complementary;
+pub mod ekf;
 
 pub use trait_def::Estimator;
 pub use complementary::ComplementaryEstimator;
+pub use ekf::EkfEstimator;

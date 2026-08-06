@@ -10,8 +10,8 @@ use flyctrl_core::estimator::Estimator;
 use flyctrl_core::units::*;
 use flyctrl_core::vehicle::{ActuatorCmd, VehicleState};
 
-use crate::physics::Physics;
-use crate::world::World;
+pub use crate::physics::{Physics, PhysicsParams};
+pub use crate::world::{World, WorldParams};
 
 pub struct Harness<E: Estimator, C: Controller> {
     physics: Physics,

@@ -4,7 +4,7 @@
 //! 返回 [`ActuatorCmd`]（各电机归一化推力）。核心只依赖 trait，不关心具体算法。
 
 use crate::units::*;
-use crate::vehicle::{ActuatorCmd, VehicleState};
+pub use crate::vehicle::{ActuatorCmd, VehicleState};
 
 pub struct Setpoint {
     pub pos: [Meter; 3],       // 期望 NED 位置（D 向下为正，悬停通常为负高度）

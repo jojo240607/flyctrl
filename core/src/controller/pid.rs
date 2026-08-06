@@ -53,8 +53,7 @@ impl PidController {
 }
 
 impl Controller for PidController {
-    fn control(&mut self, dt: Second, sp: &Setpoint, est: &VehicleState) -> ActuatorCmd {
-        let dt = dt.0;
+    fn control(&mut self, _dt: Second, sp: &Setpoint, est: &VehicleState) -> ActuatorCmd {
         let g = self.gravity;
 
         // --- 外环：位置误差 -> 期望速度（限幅，避免饱和） ---

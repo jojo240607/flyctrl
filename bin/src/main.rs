@@ -1,63 +1,247 @@
-//! SITL 入口：在 host 上跑通 PID + 互补滤波的闭环仿真，并打印轨迹与指标。
+//! SITL 主机端：把 `flyctrl-core` 的仿真后端（Physics + World）与
+//! 估计器/控制器组合驱动起来，打印统一收敛指标。
 //!
-//! 这一步的目标是验证"核心控制逻辑 <-> 物理仿真"解耦是否干净：
-//! 控制器不关心物理，仿真不关心算法。后续加入 LQR/EKF 时只需替换 trait 实现。
+//! 用法：
+//!   cargo run -p flyctrl-sitl
+//!   cargo run -p flyctrl-sitl -- --seconds 12
+//!   cargo run -p flyctrl-sitl -- --est all --ctrl all
+//!   cargo run -p flyctrl-sitl -- --est ekf --ctrl lqr
+//!
+//! 默认对所有 (估计器 × 控制器) 组合跑一遍并输出对比表。
 
-use flyctrl_core::controller::{Controller, PidController, Setpoint};
-use flyctrl_core::estimator::{ComplementaryEstimator, Estimator};
-use flyctrl_core::state::{Fcs, Disarmed, Armed};
-use flyctrl_core::units::*;
-use flyctrl_sim::harness::{Harness, Metrics};
-use flyctrl_sim::physics::{Physics, PhysicsParams};
-use flyctrl_sim::world::{World, WorldParams};
+use flyctrl_core::controller::lqr::LqrController;
+use flyctrl_core::controller::pid::PidController;
+use flyctrl_core::controller::trait_def::{ActuatorCmd, Controller, Setpoint};
+use flyctrl_core::estimator::complementary::ComplementaryEstimator;
+use flyctrl_core::estimator::ekf::EkfEstimator;
+use flyctrl_core::estimator::trait_def::Estimator;
+use flyctrl_core::vehicle::{Meter, Radian, Second, VehicleState};
+use flyctrl_sim::harness::{Physics, PhysicsParams, World, WorldParams};
 
-fn main() {
-    println!("=== flyctrl SITL: PID + ComplementaryFilter baseline ===");
-
-    // --- 飞控状态机：类型级保证"先校准/解锁才能飞" ---
-    let fcs: Fcs<Disarmed> = Fcs::new();
-    let fcs: Fcs<Armed> = fcs.arm(); // 仿真中直接解锁（已隐含"校准完成"前置）
-    println!("[fcs] armed, type-state guarantees calibration-before-arm");
-
-    // --- 物理参数：典型 450mm 四旋翼 ---
-    let physics = Physics::new(PhysicsParams::default());
-    // --- 世界：带传感器噪声，无风（先干净基线） ---
-    let world = World::new(WorldParams::default());
-
-    // --- 算法组合（基线） ---
-    let est = ComplementaryEstimator::new(0.5, 0.1, 0.1);
-    let ctrl = PidController::default_quad();
-
-    let dt = Second(0.005); // 200 Hz 控制环
-    let mut harness = Harness::new(physics, world, est, ctrl, dt);
-
-    // 目标：悬停在 (0,0,-10) NED（即离地 10m 高度）
-    let sp = Setpoint::hover([Meter(0.0), Meter(0.0), Meter(-10.0)], Radian(0.0));
-
-    println!("[sim] running 8s @ 200Hz, target hover at z=-10m ...");
-    // 先跑 4s 打印中间状态用于诊断，再续跑 4s 收集指标
-    let _ = harness.run(Second(4.0), &sp);
-    let s = harness.state();
-    println!("  t=4s pos=({:.2},{:.2},{:.2}) alt={:.2}",
-        s.pos[0].0, s.pos[1].0, s.pos[2].0, -s.pos[2].0);
-    let m = harness.run(Second(4.0), &sp);
-    report("PID+Complementary", m);
-
-    // 打印最终状态
-    let s = harness.state();
-    println!(
-        "[final] pos=({:.2},{:.2},{:.2})m  alt={:.2}m  att.w={:.3}",
-        s.pos[0].0, s.pos[1].0, s.pos[2].0, -s.pos[2].0, s.att.w
-    );
-    let _ = fcs;
+#[derive(Clone, Copy, PartialEq)]
+enum EstKind {
+    Complementary,
+    Ekf,
+}
+#[derive(Clone, Copy, PartialEq)]
+enum CtrlKind {
+    Pid,
+    Lqr,
 }
 
-fn report(name: &str, m: Metrics) {
-    println!("--- {name} ---");
-    println!("  steps        : {}", m.steps);
-    println!("  pos_rms (m)  : {:.4}", m.pos_rms);
-    println!("  pos_max (m)  : {:.4}", m.pos_max);
-    println!("  settle (s)   : {}", if m.settle_time < 0.0 { "N/A".into() } else { format!("{:.2}", m.settle_time) });
-    println!("  worst_step(ms): {:.4}", m.worst_step_ms);
-    println!("  nan/diverge  : {}", m.nan_detected);
+fn est_name(e: EstKind) -> &'static str {
+    match e {
+        EstKind::Complementary => "Complementary",
+        EstKind::Ekf => "EKF",
+    }
+}
+fn ctrl_name(c: CtrlKind) -> &'static str {
+    match c {
+        CtrlKind::Pid => "PID",
+        CtrlKind::Lqr => "LQR",
+    }
+}
+
+struct Metrics {
+    pos_rms: f32,
+    settle_time: f32,
+    diverge: bool,
+    final_alt: f32,
+    final_att_w: f32,
+    ctrl_effort: f32,
+}
+
+/// 跑一个 (估计器×控制器) 组合，返回收敛指标。
+fn run_combo(est_kind: EstKind, ctrl_kind: CtrlKind, seconds: f32) -> Metrics {
+    let mut phys = Physics::new(PhysicsParams::default());
+    let mut world = World::new(WorldParams::default());
+
+    let mut comp = ComplementaryEstimator::new(0.5, 0.1, 0.1);
+    let mut ekf = EkfEstimator::default_quad();
+    let mut pid = PidController::default_quad();
+    let mut lqr = LqrController::default_quad();
+
+    let dt = Second(0.005);
+    let sp = Setpoint::hover([Meter(0.0), Meter(0.0), Meter(-10.0)], Radian(0.0));
+
+    let mut cmd = ActuatorCmd { motor: [0.5; 4] };
+    let steps = (seconds / dt.0) as usize;
+
+    let target = [0.0f32, 0.0, -10.0];
+    let mut sum_sq = 0.0f32;
+    let mut settle = seconds;
+    let mut settled = false;
+    let mut diverge = false;
+    let mut ctrl_eff = 0.0f32;
+    let mut final_att_w = 1.0f32;
+    let mut final_alt = 0.0f32;
+
+    for k in 0..steps {
+        let ideal = phys.step(dt, cmd);
+        let s = phys.state();
+        let (imu, gps) = world.sense(dt, ideal, s.pos);
+        let est: VehicleState = match est_kind {
+            EstKind::Complementary => comp.step(dt, imu, gps),
+            EstKind::Ekf => ekf.step(dt, imu, gps),
+        };
+        cmd = match ctrl_kind {
+            CtrlKind::Pid => pid.control(dt, &sp, &est),
+            CtrlKind::Lqr => lqr.control(dt, &sp, &est),
+        };
+
+        let t = k as f32 * dt.0;
+        let pe = [
+            est.pos[0].0 - target[0],
+            est.pos[1].0 - target[1],
+            est.pos[2].0 - target[2],
+        ];
+        let e = (pe[0] * pe[0] + pe[1] * pe[1] + pe[2] * pe[2]).sqrt();
+        sum_sq += e * e;
+
+        if !settled {
+            if e < 0.5 {
+                settled = true;
+                settle = t;
+            }
+        } else if e > 1.0 {
+            settled = false;
+        }
+
+        let msum: f32 = cmd.motor.iter().sum();
+        ctrl_eff += msum / 4.0;
+
+        if est.att.w < 0.0 || e > 20.0 {
+            diverge = true;
+        }
+        final_att_w = s.att.w; // 物理真值姿态：<0 表示翻转
+        final_alt = s.pos[2].0;
+    }
+
+    Metrics {
+        pos_rms: (sum_sq / steps as f32).sqrt(),
+        settle_time: if diverge { seconds } else { settle },
+        diverge,
+        final_alt,
+        final_att_w,
+        ctrl_effort: ctrl_eff / steps as f32,
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let mut seconds = 12.0f32;
+    let mut est_filter = "all".to_string();
+    let mut ctrl_filter = "all".to_string();
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--seconds" => {
+                if i + 1 < args.len() {
+                    seconds = args[i + 1].parse().unwrap_or(12.0);
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--est" => {
+                if i + 1 < args.len() {
+                    est_filter = args[i + 1].clone();
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            "--ctrl" => {
+                if i + 1 < args.len() {
+                    ctrl_filter = args[i + 1].clone();
+                    i += 2;
+                } else {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
+    }
+
+    let ests = if est_filter == "all" {
+        vec![EstKind::Complementary, EstKind::Ekf]
+    } else if est_filter == "comp" || est_filter == "complementary" {
+        vec![EstKind::Complementary]
+    } else if est_filter == "ekf" {
+        vec![EstKind::Ekf]
+    } else {
+        vec![EstKind::Complementary, EstKind::Ekf]
+    };
+
+    let ctrls = if ctrl_filter == "all" {
+        vec![CtrlKind::Pid, CtrlKind::Lqr]
+    } else if ctrl_filter == "pid" {
+        vec![CtrlKind::Pid]
+    } else if ctrl_filter == "lqr" {
+        vec![CtrlKind::Lqr]
+    } else {
+        vec![CtrlKind::Pid, CtrlKind::Lqr]
+    };
+
+    println!(
+        "flyctrl SITL — 算法对比表 (悬停 setpoint z=-10m, T={}s, dt=5ms)",
+        seconds
+    );
+    println!(
+        "{:<16}{:<8}{:>9}{:>9}{:>10}{:>9}{:>9}",
+        "estimator", "ctrl", "posRMS", "settle", "finalAlt", "attW", "ctrlEff"
+    );
+    println!("{}", "-".repeat(68));
+
+    for &e in &ests {
+        for &c in &ctrls {
+            let m = run_combo(e, c, seconds);
+            println!(
+                "{:<16}{:<8}{:>9.3}{:>9.2}{:>10.2}{:>9.3}{:>9.3}{}",
+                est_name(e),
+                ctrl_name(c),
+                m.pos_rms,
+                m.settle_time,
+                m.final_alt,
+                m.final_att_w,
+                m.ctrl_effort,
+                if m.diverge { "  DIVERGED" } else { "" }
+            );
+        }
+    }
+
+    // 单独再跑一遍 PID+Complementary 并把细节打印出来（便于肉眼核对 M1 验收）
+    print_detail(seconds);
+}
+
+/// 详细打印 PID+Complementary 的时间序列（对齐 PLAN 的 M1 验收）。
+fn print_detail(seconds: f32) {
+    println!("\n[detail] PID + Complementary 悬停轨迹:");
+    let mut phys = Physics::new(PhysicsParams::default());
+    let mut world = World::new(WorldParams::default());
+    let mut comp = ComplementaryEstimator::new(0.5, 0.1, 0.1);
+    let mut pid = PidController::default_quad();
+    let dt = Second(0.005);
+    let sp = Setpoint::hover([Meter(0.0), Meter(0.0), Meter(-10.0)], Radian(0.0));
+    let mut cmd = ActuatorCmd { motor: [0.5; 4] };
+    let steps = (seconds / dt.0) as usize;
+    println!(
+        "{:>6}{:>10}{:>10}{:>10}",
+        "t(s)", "EST_z", "TRUE_z", "attW"
+    );
+    for k in 0..steps {
+        let ideal = phys.step(dt, cmd);
+        let s = phys.state();
+        let (imu, gps) = world.sense(dt, ideal, s.pos);
+        let est = comp.step(dt, imu, gps);
+        cmd = pid.control(dt, &sp, &est);
+        let t = k as f32 * dt.0;
+        if (k % 200) == 0 || k == steps - 1 {
+            println!(
+                "{:>6.2}{:>10.3}{:>10.3}{:>10.3}",
+                t, est.pos[2].0, s.pos[2].0, est.att.w
+            );
+        }
+    }
 }

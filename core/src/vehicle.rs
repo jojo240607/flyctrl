@@ -2,7 +2,7 @@
 //!
 //! 这里只放"纯数据"，不含任何算法逻辑。状态估计与控制都围绕这些结构交换数据。
 
-use crate::units::*;
+pub use crate::units::*;
 
 /// 机体坐标系（前-X，右-Y，下-Z，右手系）下的姿态四元数。
 ///
@@ -51,6 +51,13 @@ impl Quaternion {
         let dy = 0.5 * (w * q + z * p - x * r);
         let dz = 0.5 * (w * r + x * q - y * p);
         Self { w: w + dw * dt, x: x + dx * dt, y: y + dy * dt, z: z + dz * dt }.normalize()
+    }
+}
+
+impl core::ops::Mul for Quaternion {
+    type Output = Self;
+    fn mul(self, rhs: Self) -> Self {
+        quat_mul(self, rhs)
     }
 }
 
@@ -134,6 +141,24 @@ pub fn quat_mul(q1: Quaternion, q2: Quaternion) -> Quaternion {
         x: q1.w * q2.x + q1.x * q2.w + q1.y * q2.z - q1.z * q2.y,
         y: q1.w * q2.y - q1.x * q2.z + q1.y * q2.w + q1.z * q2.x,
         z: q1.w * q2.z + q1.x * q2.y - q1.y * q2.x + q1.z * q2.w,
+    }
+}
+
+impl Quaternion {
+    /// 由旋转轴（不必单位化）与旋转角构造四元数（Rodrigues）。
+    pub fn from_axis_angle(axis: [f32; 3], angle: Radian) -> Self {
+        let n = crate::math::sqrt(axis[0] * axis[0] + axis[1] * axis[1] + axis[2] * axis[2]);
+        if n < 1e-8 {
+            return Self::IDENTITY;
+        }
+        let half = angle.0 * 0.5;
+        let s = crate::math::sin(half) / n;
+        Self {
+            w: crate::math::cos(half),
+            x: axis[0] * s,
+            y: axis[1] * s,
+            z: axis[2] * s,
+        }
     }
 }
 
