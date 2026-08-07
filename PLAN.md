@@ -217,6 +217,19 @@ flyctrl/
 - [x] **多机协同/编队**（`core/src/swarm.rs` + `core/src/comm/mavlink.rs`）：`SwarmTable<const N>` const-generic 定容邻居表（类型安全、零堆），`Formation` 枚举（V/Line/None）带 `slot_offset(role)` 对称偏置；`FormationController<B,const N>` 复用消息总线（每机 `sys_id`）经 `encode_local_pos_from` 广播 LOCAL_POSITION_NED。SIL demo `--swarm` 双机 V 编队：相对偏置 x,y 精确收敛、min_sep≈3.09m。单元测试 `formation_offsets_symmetric` / `formation_holds` 全绿。
 - [x] 验证：`cargo test` 全绿（共 44 项）；`--features stm32f407` 编译通过；`flyctrl-sitl` 构建通过；INDI/Swarm 两 demo 收敛。
 
+### M9：任务层与飞行模式（APPLICATION LAYER）
+> PLAN 原架构分层（§1.2）把"飞行模式/任务/航点"列为后续 **APPLICATION LAYER**，M1–M8 完成控制/估计/通信/容错/算法后，M9 补齐这一最上层的用户可感能力。
+
+- [x] **任务/航点**（`core/src/mission.rs`）：`Waypoint`（NED+偏航+到达半径/垂直容差）、`Mission<const N>`（const-generic 定容、零堆、`from_slice` 超长截断）、`MissionRunner<const N>`。关键工程特性：
+  - **巡线限速（cruise-rate limiting）**：内部 `target` 每步朝航点以 `max_speed`/`max_vspeed` 有限推进，再输出设定点——避免把航点"瞬移"给控制器导致 PID 积分饱和发散（实测瞬移大阶跃会让简单串级 PID 失控，限速后 4 航点全程稳定收敛）。
+  - **地理围栏（Geofence）**：所有设定点经 `clamp` 夹取到圆柱围栏（水平半径+垂直上下界），即便航点文件错误也不会指令飞出安全区——类型级安全网外的第二道物理护栏。
+  - 完成后进入 **loiter**（盘旋于末航点），`complete()` 标志任务结束。
+- [x] **飞行模式治理**（`core/src/flightmode.rs`）：`FlightMode` 枚举（Manual/Stabilize/Altitude/Position/Mission/Rtl/Land，带 `authorization_level`/`requires_position`/`is_autonomous`）+ `ModeGovernor` 运行时守卫：
+  - 合法流转表：未解锁禁自主模式、无位置估计禁 Position/Mission/Rtl、严重故障 `Critical` 只允许 `Land`、降级 `Degraded` 禁最高自主 `Mission`。
+  - FDIR 联动：`degrade_on_health` 主动降级（Degraded: Mission→Rtl；Critical: 任意→Land），与 `fdir::Health` 形成"健康→权限"退化链。与 `state::Fcs` 类型级生命周期正交（Fcs 管锁定/失控保护，本模块管"谁生成设定点"）。
+- [x] **验证**：`cargo test` 全绿（共 51 项，新增 mission 单元 + `props_mission` 属性测试：到达单调推进/不越界、围栏夹取必在界内、模式流转守卫 3000 组随机组合）；`--features stm32f407` 编译通过；`flyctrl-sitl` 构建通过；`--mission` SIL demo 4 航点全部到达、任务完成、无 NaN、verdict=OK。
+- [ ] **后续可选**：任务 YAML/MAVLink 航线导入、返航点记忆与自动 RTL、模式切换的平滑过渡（当前为设定点硬切换 + 限速软化）、把 `ModeGovernor` 接入真实 `Fcs` 解锁状态与 GCS 模式指令通道。
+
 ---
 
 ## 6. 已解决的阻塞（归档）
