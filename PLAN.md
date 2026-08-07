@@ -252,8 +252,19 @@ flyctrl/
 - [x] **验证**：`cargo test` 全绿（bus 单元 + `props_bus` 属性测试：随机 FIFO/满拒绝/多主题数量守恒/4 路扇出无丢失）；
       `--features stm32f407` 编译通过；`--bus` SIL demo 8 节点经总线**稳定悬停（pos≈(0,0,-12)、mode=Position、
       health=Nominal）、总线 0 丢帧、verdict=OK**。
-- [ ] **后续可选**：编译期主题注册表（`TopicId`）、发布/订阅运行时发现、消息时间标签与 QoS（如"最新值"/
-      可靠投递）、IRQ 上下文 `irq_lock` 包裹示例、把 `neighbor` 跨机链路接到真实 `comm/mavlink` 形成多机解耦栈。
+- [x] **编译期主题注册表（单一事实来源）**：`define_topics!` 宏以**扁平主题列表**定义全部 20 个主题
+      （8 生产者 + 12 消费者端点），每个主题关联「变体名 / 标记类型（`*Topic`）/ 角色 / 载荷类型 / 容量 / 字段」。
+      由此自动生成：`TopicId` 枚举（注册表全集，`all()` 可遍历）、`Topic`/`PubTopic`/`SubTopic` 契约 trait、
+      以及**角色门控**的 `push`/`pop` 实现（仅生产者 `impl PubTopic`、仅消费者 `impl SubTopic`，遗漏任一即编译失败）。
+      上层用类型安全门面 `bus.publish::<ImuTopic>(sample)` / `bus.subscribe::<EstToCtrlTopic>()`——**载荷类型由主题
+      唯一确定，写错类型编译器拒绝**（如 `bus.publish::<ImuTopic>(Meter(1.0))` 编译失败）。具名便捷方法
+      `publish_imu`/`recv_est_ctrl` 等保留并委托到泛型门面，向后兼容。新增主题只改宏一行。
+- [ ] **后续可选（按优先级）**：
+      1. **IRQ 上下文 `irq_lock` 包裹示例**：在中断里安全 `pump`/发布（贴近真实 MCU 部署，HAL 落地前置）。
+      2. **消息时间标签 + QoS**：`publish` 带 `Timestamp`，订阅支持"最新值覆盖"(`latest`)与"可靠投递"(`reliable`)，
+         基于注册表的 `CAP` 与 `Ring` 语义扩展。
+      3. **`neighbor` 跨机链路接 `comm/mavlink`**：把单总线 demo 升级为真实多机解耦栈（依赖注册表与 QoS）。
+      4. 发布/订阅运行时发现（动态端点登记）。
 
 ---
 
