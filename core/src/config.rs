@@ -18,7 +18,14 @@ pub struct VehicleConfig {
     pub torque_coeff: f32,     // N·m 力矩系数（偏航混控用）
     pub inertia: [f32; 3],     // 主惯量 Ixx Iyy Izz (kg·m^2)
     pub motor_tau: f32,        // 电机一阶响应时间常数 (s)
-    pub drag_coeff: f32,       // 平移气动阻力系数 (N/(m/s)^2)
+    /// 机体阻力系数（前/右/下三轴，N/(m/s)^2），描述机身/机臂外露气动阻力。
+    pub drag_coeff: [f32; 3],
+    /// 诱导阻力系数（无量纲），旋翼向下诱导速度产生的附加阻力。
+    pub induced_drag_coeff: f32,
+    /// 桨盘面积 (m^2)，动量理论诱导速度计算用。
+    pub disk_area: f32,
+    /// 空气密度 (kg/m^3)。
+    pub air_density: f32,
     pub gravity: f32,          // m/s^2（NED 下为正）
     /// 最大可指令倾角（rad），用于位置环限幅（防饱和、保稳定）。
     pub tilt_max: f32,
@@ -40,7 +47,13 @@ impl VehicleConfig {
             torque_coeff: 0.02,
             inertia: [0.02, 0.02, 0.04],
             motor_tau: 0.05,
-            drag_coeff: 0.15,
+            // 机身/机臂外露阻力（前向略大，向下最小）：N/(m/s)^2 × v^2
+            drag_coeff: [0.18, 0.18, 0.10],
+            // 诱导阻力：与总推力平方根成正比（动量理论），无量纲标定
+            induced_drag_coeff: 0.12,
+            // 450mm 四旋翼等效桨盘面积（4× 桨盘），约 0.19 m^2
+            disk_area: 0.19,
+            air_density: 1.225,
             gravity: 9.81,
             tilt_max: 0.35,
             hover_thrust: 0.5,
@@ -58,8 +71,11 @@ impl VehicleConfig {
             torque_coeff: self.torque_coeff,
             inertia: self.inertia,
             motor_tau: self.motor_tau,
-            drag_coeff: self.drag_coeff,
             gravity: self.gravity,
+            drag_coeff: self.drag_coeff,
+            induced_drag_coeff: self.induced_drag_coeff,
+            disk_area: self.disk_area,
+            air_density: self.air_density,
         }
     }
 
@@ -86,8 +102,16 @@ pub struct DynParams {
     pub torque_coeff: f32,
     pub inertia: [f32; 3],
     pub motor_tau: f32,
-    pub drag_coeff: f32,
     pub gravity: f32,
+    /// 机体阻力系数（前/右/下三轴，N/(m/s)^2），描述机身/机臂外露气动阻力。
+    pub drag_coeff: [f32; 3],
+    /// 诱导阻力系数（无量纲）：旋翼向下诱导速度产生的附加阻力，
+    /// 与总推力平方根成正比（动量理论：v_ind = sqrt(T/(2·ρ·A))）。
+    pub induced_drag_coeff: f32,
+    /// 桨盘面积 (m^2)，用于诱导速度计算（动量理论）。
+    pub disk_area: f32,
+    /// 空气密度 (kg/m^3)，标准海平面 1.225。
+    pub air_density: f32,
 }
 
 /// 控制律共享参数子集（从 [`VehicleConfig`] 派生）。

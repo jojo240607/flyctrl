@@ -12,6 +12,7 @@
 use flyctrl_core::units::*;
 use flyctrl_core::vehicle::{ActuatorCmd, ImuSample, Quaternion, VehicleState};
 
+#[derive(Clone, Copy)]
 pub struct PhysicsParams {
     pub mass: f32,            // kg
     pub arm_length: f32,      // m（机臂长度）
@@ -19,8 +20,15 @@ pub struct PhysicsParams {
     pub torque_coeff: f32,    // N·m 力矩系数（偏航混控用）
     pub inertia: [f32; 3],    // 主惯量 Ixx Iyy Izz
     pub motor_tau: f32,       // 电机一阶响应时间常数 (s)
-    pub drag_coeff: f32,      // 平移气动阻力系数 (N/(m/s)^2)
     pub gravity: f32,         // m/s^2（NED 下为正，沿 +Z）
+    /// 机体阻力系数（前/右/下三轴，N/(m/s)^2），描述机身/机臂外露气动阻力。
+    pub drag_coeff: [f32; 3],
+    /// 诱导阻力系数（无量纲），旋翼向下诱导速度产生的附加阻力。
+    pub induced_drag_coeff: f32,
+    /// 桨盘面积 (m^2)，动量理论诱导速度计算用。
+    pub disk_area: f32,
+    /// 空气密度 (kg/m^3)。
+    pub air_density: f32,
 }
 
 impl Default for PhysicsParams {
@@ -33,8 +41,11 @@ impl Default for PhysicsParams {
             torque_coeff: 0.02,
             inertia: [0.02, 0.02, 0.04],
             motor_tau: 0.05,
-            drag_coeff: 0.15,
             gravity: 9.81,
+            drag_coeff: [0.18, 0.18, 0.10],
+            induced_drag_coeff: 0.12,
+            disk_area: 0.19,
+            air_density: 1.225,
         }
     }
 }
@@ -48,8 +59,11 @@ impl From<flyctrl_core::config::DynParams> for PhysicsParams {
             torque_coeff: p.torque_coeff,
             inertia: p.inertia,
             motor_tau: p.motor_tau,
-            drag_coeff: p.drag_coeff,
             gravity: p.gravity,
+            drag_coeff: p.drag_coeff,
+            induced_drag_coeff: p.induced_drag_coeff,
+            disk_area: p.disk_area,
+            air_density: p.air_density,
         }
     }
 }
@@ -138,12 +152,30 @@ impl Physics {
             v[1].0 - wind_eff[1],
             v[2].0 - wind_eff[2],
         ];
-        let speed2 = vr[0] * vr[0] + vr[1] * vr[1] + vr[2] * vr[2];
-        let speed = speed2.sqrt();
-        let drag = if speed > 1e-6 {
-            let d = p.drag_coeff * speed2 / p.mass;
-            [-vr[0] / speed * d, -vr[1] / speed * d, -vr[2] / speed * d]
-        } else { [0.0; 3] };
+        // 把空气相对速度旋到机体坐标系（前/右/下），按机体三轴阻力系数分别施加：
+        // 机体阻力系数表捕捉机身/机臂外露面积差异（前向最大、向下最小）。
+        let vr_body = rotate_by_quat_inverse(r, vr);
+        let mut drag_body = [0.0f32; 3];
+        for i in 0..3 {
+            // 寄生阻力：-0.5·ρ·Cd·A·|v|·v ≈ -k_i·v_i·|v_i|（此处 Cd 已含面积，用标量系数）
+            let vi = vr_body[i];
+            drag_body[i] = -p.drag_coeff[i] * vi * vi.abs();
+        }
+        // 桨盘滑流 / 诱导阻力：旋翼向下诱导速度产生向下附加阻力（动量理论）。
+        // 诱导速度 v_ind = sqrt(T / (2·ρ·A))，诱导阻力 ∝ T·v_ind（投影到机体下轴）。
+        // 这里用总推力基值 f_total 表示 T（已含重力 + 机动），无量纲系数标定。
+        let t_thrust = f_total.abs();
+        let v_ind = flyctrl_core::math::sqrt(t_thrust / (2.0 * p.air_density * p.disk_area).max(1e-6));
+        // 诱导阻力沿机体下轴（-Z 机体）阻力为正（阻碍前进->展向阻力抵消机身向下流）
+        let induced = -p.induced_drag_coeff * v_ind * v_ind.abs();
+        drag_body[2] += induced; // 机体下轴
+        // 旋回世界系
+        let drag_world = rotate_by_quat(r, drag_body);
+        let drag = [
+            drag_world[0] / p.mass,
+            drag_world[1] / p.mass,
+            drag_world[2] / p.mass,
+        ];
 
         let ax = a_world[0] + drag[0];
         let ay = a_world[1] + drag[1];

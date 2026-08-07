@@ -150,10 +150,20 @@ flyctrl/
 ## 5. 长期规划（M4+，逼近/超越传统飞控）
 
 ### M4：仿真真实度提升
-- [ ] 更精细气动模型（诱导阻力、桨盘滑流、机体气动系数表）
-- [ ] 传感器故障注入（漂移/卡死/丢帧）+ 鲁棒性对比
-- [ ] 蒙特卡洛批量仿真（参数不确定性 + 风谱），输出统计指标
-- [ ] 实时因子评估（host 跑固件级步长，估 F407 上的 CPU 占用）
+- [x] 更精细气动模型（诱导阻力、桨盘滑流、机体气动系数表）
+- [x] 传感器故障注入（漂移/卡死/丢帧）+ 鲁棒性对比
+- [x] 蒙特卡洛批量仿真（参数不确定性 + 风谱），输出统计指标
+- [x] 实时因子评估（host 跑固件级步长，估 F407 上的 CPU 占用）
+
+**§4-A M4 验收（2026-08-07，host 端验证）**
+
+1. 精细气动（`sim/src/physics.rs`）：`PhysicsParams` 新增 `drag_coeff:[f32;3]`（机体三轴系数表）、`induced_drag_coeff`、`disk_area`、`air_density`；阻力改为"机体坐标系按轴系数施加 + 动量理论诱导阻力（v_ind=√(T/2ρA)）"，更接近真实四旋翼滑流。
+2. 故障注入（`sim/src/world.rs`）：`FaultKind::{ImuDrift,ImuStuck,GpsDropout}` + `set_fault(t0,t1)`；`World::sense` 在窗口内注入偏置/冻结/丢帧。bin 新增 `--fault <kind>`、`--robust`（四类故障 × EKF+MPC 最大误差对比）。
+   - 实测（Hover T=12s）：None/ImuDrift/GpsDropout 均收敛（maxErr≈10m，稳态后恢复），ImuStuck 发散（冻结 IMU 摧毁姿态估计，符合预期——提示需 FDIR 处理卡死）。
+3. 蒙特卡洛（`--montecarlo N`）：扰动 ±10% 质量、±15% 惯量、±20% 阻力、±2 m/s 风（确定性种子），输出 posRMS 均值/标准差/p95/发散率。实测 N=30：发散率 0%、均值 3.9±0.26m。
+4. 实时因子（`--rtf`）：测量 host 每步墙钟（含 EKF+MPC+物理），按 ×30 MCU 减速比估 F407 168MHz CPU 负载。实测 host 55µs/步（RTF≈90x），估 MCU 33% 控制周期占用 → OK 余量充足。
+
+新增 CLI：`--fault imudrift|imustuck|gpsdropout`、`--robust`、`--montecarlo N`、`--rtf`。
 
 ### M5：HAL 与嵌入式落地
 - [ ] `hal/sensor` trait + `stm32f407` 具体实现（IMU/GPS/气压/罗盘）
