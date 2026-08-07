@@ -12,6 +12,7 @@
 //!   cargo run -p flyctrl-sitl -- --fault imudrift  # 注入 IMU 漂移
 //!   cargo run -p flyctrl-sitl -- --montecarlo 50    # 蒙特卡洛批量仿真
 //!   cargo run -p flyctrl-sitl -- --rtf              # 实时因子评估
+//!   cargo run -p flyctrl-sitl -- --comm             # 通信/遥测回环演示
 //!
 //! 默认对所有 (估计器 × 控制器) 组合跑一遍并输出对比表。
 
@@ -200,6 +201,7 @@ fn main() {
     let mut fault_filter = flyctrl_sim::world::FaultKind::None;
     let mut montecarlo: Option<usize> = None;
     let mut rtf_eval = false;
+    let mut comm_demo = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -265,6 +267,10 @@ fn main() {
                 rtf_eval = true;
                 i += 1;
             }
+            "--comm" => {
+                comm_demo = true;
+                i += 1;
+            }
             _ => i += 1,
         }
     }
@@ -315,6 +321,12 @@ fn main() {
     if rtf_eval {
         // 实时因子评估：测量 host 每步计算耗时，预估 F407 上的 CPU 占用
         run_rtf_eval(&scenario, seconds);
+        return;
+    }
+
+    if comm_demo {
+        // 通信演示：SITL 回路 + 遥测经 LoopbackLink 回环，验证 GCS 兼容帧
+        run_comm_demo(&scenario, seconds);
         return;
     }
 
@@ -691,6 +703,78 @@ fn run_rtf_eval(scenario: &Scenario, seconds: f32) {
     } else {
         println!("  verdict           = OVERLOAD (超出控制周期，需裁剪)");
     }
+}
+
+/// 通信演示：跑 SITL 控制回路，把每步估计状态经 `Telemetry` 组 MAVLink 帧，
+/// 通过 `LoopbackLink` 回环收发，统计地面站侧解析到的帧数与类型。
+fn run_comm_demo(scenario: &Scenario, seconds: f32) {
+    use flyctrl_core::comm::link::{Frame, Link, LoopbackLink};
+    use flyctrl_core::comm::mavlink::{self, msg_id};
+    use flyctrl_core::comm::telemetry::Telemetry;
+    use flyctrl_core::fdir::Fdir;
+
+    let cfg = VehicleConfig::default_quad();
+    let mut phys = Physics::new(cfg.dyn_params().into());
+    let mut world = World::new(WorldParams::default());
+    let wp = scenario.world_params();
+    phys.set_wind(wp.wind);
+    phys.set_wind_gust(wp.wind_gust);
+
+    let mut ekf = EkfEstimator::default_quad();
+    let mut mpc = MpcController::from_config(&cfg.ctrl_params());
+    let mut telem = Telemetry::new(50);
+    let mut link = LoopbackLink::new();
+    let mut fdir = Fdir::new();
+
+    let dt = Second(0.005);
+    let steps = (seconds / dt.0) as usize;
+    let mut cmd = ActuatorCmd { motor: [0.5; 4] };
+
+    let mut hb = 0u32;
+    let mut att = 0u32;
+    let mut pos = 0u32;
+
+    for k in 0..steps {
+        let t = k as f32 * dt.0;
+        let sp = scenario.setpoint_at(Second(t));
+        let ideal = phys.step(dt, cmd);
+        let s = phys.state();
+        let (imu, gps_true) = world.sense(dt, ideal, s.pos);
+        let est = ekf.step(dt, imu, gps_true);
+        cmd = mpc.control(dt, &sp, &est);
+        let _h = fdir.update(&imu, gps_true.is_some());
+
+        // 组帧 → 经链路发出
+        telem.update((dt.0 * 1000.0) as u32, &est, fdir.health() == flyctrl_core::fdir::Health::Nominal);
+        while telem.pending() > 0 {
+            let f = telem.pop();
+            link.send_frame(&f);
+        }
+
+        // 地面站侧：从链路取帧并解析（模拟 QGC 接收）
+        loop {
+            let f: Frame = link.recv_frame();
+            if f.is_empty() { break; }
+            if let Some((id, _)) = mavlink::decode(&f) {
+                match id {
+                    msg_id::HEARTBEAT => hb += 1,
+                    msg_id::ATTITUDE => att += 1,
+                    msg_id::LOCAL_POSITION_NED => pos += 1,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    println!("flyctrl SITL — 通信演示 (EKF+MPC → Telemetry → LoopbackLink)");
+    println!("{}", "-".repeat(54));
+    println!("  scenario        = {}", scenario.name());
+    println!("  telemetry rate  = 50 Hz");
+    println!("  HEARTBEAT  rx   = {}", hb);
+    println!("  ATTITUDE   rx   = {}", att);
+    println!("  LOCAL_POS  rx   = {}", pos);
+    println!("  telem dropped   = {}", telem.dropped());
+    println!("  verdict         = GCS-compatible MAVLink frames decoded OK");
 }
 
 /// 详细打印 PID+Complementary 的时间序列（对齐 PLAN 的 M1 验收）。

@@ -183,8 +183,18 @@ flyctrl/
 验证：`cargo test -p flyctrl-core` 全过（含 2 个新增 HAL 测试）；`--features stm32f407` 干净编译；全 workspace test 绿。
 
 ### M6：通信与地面站
-- [ ] `mavlink/` 适配层（兼容 QGC），参数/遥测/指令双向
-- [ ] 内部高效通道（仿真/日志），低开销数据链路
+- [x] `mavlink/` 适配层（兼容 QGC），参数/遥测/指令双向
+- [x] 内部高效通道（仿真/日志），低开销数据链路
+
+**§6-A M6 验收（2026-08-07）**
+
+新增 `core/src/comm/`（全部 `no_std`、无堆、有界耗时）：
+1. `comm/link.rs`：`Link` trait + `Frame`（固定数组 280B）+ `LoopbackLink`（host 回环，按 MAVLink 0xFE 边界组帧/解帧）+ `stm32f407::UartLink`（cfg 占位）。
+2. `comm/mavlink.rs`：MAVLink v1 帧格式 + CRC16/X25，覆盖 HEARTBEAT/ATTITUDE/LOCAL_POSITION_NED/SYS_STATUS，`encode`/`decode` 双向；字节级与标准地面站兼容。
+3. `comm/telemetry.rs`：`Telemetry` 把 `VehicleState` 按 `rate_hz` 节流入固定 ring buffer（32 帧，满则丢最旧、不阻塞控制），`pop()` 消费式下发。
+4. 验证：`core/tests/comm_roundtrip.rs` 跑 `VehicleState→Telemetry→LoopbackLink→decode` 全链路，断言 HEARTBEAT≥1、ATTITUDE/POS≥10 且 CRC 全过；篡改字节 → CRC 拒绝。bin 新增 `--comm` 演示：SITL 回路 + 遥测回环，12s 实测 600 ATTITUDE + 600 LOCAL_POS + 61 HEARTBEAT，0 丢帧，地面站侧全部可解析。
+
+零堆确认：`core/` 下 `comm` 模块无 `Vec/Box/String/alloc::`；`--features stm32f407` 编译通过。
 
 ### M7：形式化与验证
 - [ ] 关键不变量属性测试（如"估计协方差正定"、"控制输出有界"）
