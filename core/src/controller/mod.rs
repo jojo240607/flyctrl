@@ -7,8 +7,10 @@ pub mod trait_def;
 pub mod pid;
 pub mod lqr;
 pub mod mpc;
+pub mod indi;
 
 pub use trait_def::{Controller, Setpoint};
 pub use pid::PidController;
 pub use lqr::LqrController;
 pub use mpc::MpcController;
+pub use indi::IndiController;

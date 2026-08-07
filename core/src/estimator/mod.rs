@@ -6,7 +6,9 @@
 pub mod trait_def;
 pub mod complementary;
 pub mod ekf;
+pub mod learning;
 
 pub use trait_def::Estimator;
 pub use complementary::ComplementaryEstimator;
 pub use ekf::EkfEstimator;
+pub use learning::{LearningEstimator, NullResidual, ResidualModel, BiasResidual};

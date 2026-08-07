@@ -95,6 +95,9 @@ impl Physics {
 
     pub fn state(&self) -> VehicleState { self.state }
 
+    /// 设定初始状态（用于多机演示中将各机摆到不同初始位置）。
+    pub fn set_state(&mut self, s: VehicleState) { self.state = s; }
+
     /// 设置环境风（世界系 NED，m/s）。用于抗风扰场景。
     pub fn set_wind(&mut self, wind: [f32; 3]) { self.wind = wind; }
 

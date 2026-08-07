@@ -112,6 +112,11 @@ pub fn encode_attitude(state: &VehicleState, seq: u8, out: &mut [u8; MAX_FRAME_L
 
 /// LOCAL_POSITION_NED：NED 位置 + 速度。
 pub fn encode_local_pos(state: &VehicleState, seq: u8, out: &mut [u8; MAX_FRAME_LEN]) -> usize {
+    encode_local_pos_from(SYS_ID, state, seq, out)
+}
+
+/// 同上，但允许指定 `sys_id`（多机协同：每架飞机用各自 sys_id 广播自身状态）。
+pub fn encode_local_pos_from(sys_id: u8, state: &VehicleState, seq: u8, out: &mut [u8; MAX_FRAME_LEN]) -> usize {
     let mut p = [0u8; 28];
     put_i32(&mut p, 0, 0);
     put_f32(&mut p, 4, state.pos[0].0);
@@ -120,7 +125,22 @@ pub fn encode_local_pos(state: &VehicleState, seq: u8, out: &mut [u8; MAX_FRAME_
     put_f32(&mut p, 16, state.vel[0].0);
     put_f32(&mut p, 20, state.vel[1].0);
     put_f32(&mut p, 24, state.vel[2].0);
-    encode(msg_id::LOCAL_POSITION_NED, seq, &p, out)
+    // 复用 encode，但覆盖 sys_id 字节（frame[3]）。
+    let mut frame = [0u8; MAX_FRAME_LEN];
+    let plen = p.len();
+    frame[0] = MAVLINK_MAGIC;
+    frame[1] = plen as u8;
+    frame[2] = seq;
+    frame[3] = sys_id;
+    frame[4] = COMP_ID;
+    frame[5] = msg_id::LOCAL_POSITION_NED;
+    frame[6..6 + plen].copy_from_slice(&p[..plen]);
+    let crc = crc16_x25(0xFFFF, &frame[1..6 + plen]);
+    frame[6 + plen] = (crc & 0xFF) as u8;
+    frame[6 + plen + 1] = (crc >> 8) as u8;
+    let total = 6 + plen + 2;
+    out[..total].copy_from_slice(&frame[..total]);
+    total
 }
 
 /// SYS_STATUS：健康位（取 FDIR 健康；此处仅填传感器位）。

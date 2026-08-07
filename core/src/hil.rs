@@ -112,7 +112,6 @@ mod tests {
     use crate::controller::pid::PidController;
     use crate::controller::Controller;
     use crate::estimator::ekf::EkfEstimator;
-    use crate::estimator::Estimator;
     use crate::hal::actuator::MockMotors;
     use crate::hal::sensor::{MockBaro, MockGps, MockImu, MockMag};
     use crate::invariants::{actuator_bounded, state_finite};

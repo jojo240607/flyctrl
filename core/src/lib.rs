@@ -18,5 +18,6 @@ pub mod controller;
 pub mod fdir;
 pub mod hil;
 pub mod invariants;
+pub mod swarm;
 pub mod hal;
 pub mod comm;
