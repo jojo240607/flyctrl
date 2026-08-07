@@ -102,7 +102,7 @@ fn prop_bus_topics_independent() {
         while bus.pump() > 0 && guard < 16 { guard += 1; }
         // 各自消费数量必须守恒（无串扰、无丢）。
         let mut rcv_imu = 0;
-        while bus.recv_imu().is_some() { rcv_imu += 1; }
+        while bus.recv_imu_est().is_some() { rcv_imu += 1; }
         let mut rcv_sp = 0;
         while bus.recv_setpoint().is_some() { rcv_sp += 1; }
         let mut rcv_mode = 0;

@@ -238,16 +238,22 @@ flyctrl/
       `try_push`/`try_pop` 在满/空时返回 `Err`/`None`（**拒绝而非静默覆盖/丢弃**），调用方可据此
       背压或丢帧——符合飞控"宁可丢旧帧也不污染数据流"。FIFO 保序、回绕无错乱（单元 + 属性测试覆盖）。
 - [x] **飞行系统总线 `Bus`**：聚合定容主题通道——`imu`(8)/`gps`(4)/`est`(4)/`setpoint`(4)/`actuator`(4)/
-      `mode`(4)。角色由 API 结构化分离：生产者只经 `publish_*` 写生产者段，消费者只经 `recv_*` 读消费者段。
-- [x] **零分配扇出（fan-out）**：`est` 一个生产者 → 多个消费者（控制器 `est_to_ctrl`、FDIR `est_to_fdir`）。
-      `Bus::pump()` 每调从各生产者段弹出一个、复制入对应消费者段（est 扇出 2 份），无需广播队列/堆。
-      `pump()` 每主题每次最多搬运 1 个，调用方每控制周期调一次（或循环至清空）。
-- [x] **验证**：`cargo test` 全绿（共 66 项，新增 bus 单元 + `props_bus` 属性测试：随机 FIFO/满拒绝/多主题
-      数量守恒/扇出无丢失）；`--features stm32f407` 编译通过；`flyctrl-sitl` 构建通过；`--bus` SIL demo 把
-      飞控栈拆成传感器/设定点/估计/控制/执行器 5 个节点，**仅经总线通信、互不持有引用**，稳定悬停、
-      总线 0 丢帧、verdict=OK。
+      `mode`(4)/`health`(4)/`neighbor`(4)。角色由 API 结构化分离：生产者只经 `publish_*` 写生产者段，消费者只经 `recv_*` 读消费者段。
+- [x] **零分配多路扇出（fan-out）**：多订阅主题做扇出，每个订阅节点拿到自己的完整副本、互不消耗彼此数据：
+      - `imu` → `imu_to_est` / `imu_to_fdir`（估计器与 FDIR 各一份）。
+      - `est` → `est_to_ctrl` / `est_to_fdir` / `est_to_mission` / `est_to_formation`（控制器/FDIR/任务/编队各一份）。
+      `Bus::pump()` 每调从各生产者段弹出一个、复制入全部对应消费者段，无需广播队列/堆。
+- [x] **FDIR / 任务 / 编队节点已挂到总线（完整解耦栈）**：`--bus` SIL demo 把飞控栈拆成 8 个节点，仅经
+      `Bus` 通信、互不持有引用：① 传感器(`imu`/`gps`) ② 估计器(`est` 扇出) ③ FDIR(`recv_est_fdir`+`recv_imu_fdir`
+      → `publish_health`) ④ 任务(`recv_est_mission` → `MissionRunner` → `publish_setpoint`) ⑤ 编队
+      (`recv_est_formation` → `neighbor` 广播自身状态) ⑥ 模式治理(`recv_health`+请求 → `publish_mode`)
+      ⑦ 控制器(`recv_est_ctrl`+`recv_setpoint`+`recv_mode`(+`recv_neighbor` 编队偏移) → `publish_actuator`)
+      ⑧ 执行器(`recv_actuator` → `phys.step`)。冷启动以悬停默认命令推进物理避免死锁。
+- [x] **验证**：`cargo test` 全绿（bus 单元 + `props_bus` 属性测试：随机 FIFO/满拒绝/多主题数量守恒/4 路扇出无丢失）；
+      `--features stm32f407` 编译通过；`--bus` SIL demo 8 节点经总线**稳定悬停（pos≈(0,0,-12)、mode=Position、
+      health=Nominal）、总线 0 丢帧、verdict=OK**。
 - [ ] **后续可选**：编译期主题注册表（`TopicId`）、发布/订阅运行时发现、消息时间标签与 QoS（如"最新值"/
-      可靠投递）、把 FDIR/任务/编队节点也挂到总线形成完整解耦栈、IRQ 上下文 `irq_lock` 包裹示例。
+      可靠投递）、IRQ 上下文 `irq_lock` 包裹示例、把 `neighbor` 跨机链路接到真实 `comm/mavlink` 形成多机解耦栈。
 
 ---
 

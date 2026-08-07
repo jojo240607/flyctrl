@@ -22,6 +22,7 @@
 use crate::controller::trait_def::{ActuatorCmd, Setpoint};
 use crate::fdir::Health;
 use crate::flightmode::FlightMode;
+use crate::swarm::NeighborState;
 use crate::vehicle::{ImuSample, PosSample, VehicleState};
 
 /// 单生产者单消费者定容环形缓冲（零分配、`no_std`、`Copy`）。
@@ -92,13 +93,17 @@ impl<M: Copy, const CAP: usize> Default for Ring<M, CAP> {
 /// - `imu`（8）：原始 IMU 样本（传感器→估计器）。
 /// - `gps`（4）：位置样本（传感器→估计器）。
 /// - `est`（4）：估计状态（估计器→控制器/FDIR/GCS）。
-/// - `setpoint`（4）：设定点（任务/模式→控制器）。
+/// - `setpoint`（4）：设定点（任务/编队→控制器）。
 /// - `actuator`（4）：执行器命令（控制器→执行器）。
 /// - `mode`（4）：飞行模式 + 健康（模式治理→全体）。
+/// - `health`（4）：FDIR 健康等级（FDIR→模式治理/全体）。
+/// - `neighbor`（4）：编队邻居状态（编队节点相互交换）。
 ///
 /// 每段通道是独立的 `Ring`：生产者段（`*_in`，由 `publish_*` 写入、`pump` 读出）
-/// 与消费者段（`*_out`，由 `pump` 写入、由对应访问器读出）。`est` 额外扇出到
-/// `est_to_ctrl` 与 `est_to_fdir` 两个消费者段。
+/// 与消费者段（`*_out`，由 `pump` 写入、由对应访问器读出）。多订阅主题做扇出：
+/// - `imu` → `imu_to_est` / `imu_to_fdir`（估计器与 FDIR 各一份）。
+/// - `est` → `est_to_ctrl` / `est_to_fdir` / `est_to_mission` / `est_to_formation`。
+/// 每个订阅节点拿到自己的完整副本，互不消耗彼此的数据。
 pub struct Bus {
     // 生产者段（仅 publish_* 写入；pump 读出）。
     imu_in: Ring<ImuSample, 8>,
@@ -107,15 +112,22 @@ pub struct Bus {
     sp_in: Ring<Setpoint, 4>,
     act_in: Ring<ActuatorCmd, 4>,
     mode_in: Ring<(FlightMode, Health), 4>,
+    health_in: Ring<Health, 4>,
+    neighbor_in: Ring<NeighborState, 4>,
 
     // 消费者段（pump 写入；访问器读出）。
-    imu_out: Ring<ImuSample, 8>,
     gps_out: Ring<PosSample, 4>,
     sp_out: Ring<Setpoint, 4>,
     act_out: Ring<ActuatorCmd, 4>,
     mode_out: Ring<(FlightMode, Health), 4>,
+    health_out: Ring<Health, 4>,
+    neighbor_out: Ring<NeighborState, 4>,
+    imu_to_est: Ring<ImuSample, 8>,
+    imu_to_fdir: Ring<ImuSample, 8>,
     est_to_ctrl: Ring<VehicleState, 4>,
     est_to_fdir: Ring<VehicleState, 4>,
+    est_to_mission: Ring<VehicleState, 4>,
+    est_to_formation: Ring<VehicleState, 4>,
 }
 
 impl Bus {
@@ -124,9 +136,13 @@ impl Bus {
         Self {
             imu_in: Ring::new(), gps_in: Ring::new(), est_in: Ring::new(),
             sp_in: Ring::new(), act_in: Ring::new(), mode_in: Ring::new(),
-            imu_out: Ring::new(), gps_out: Ring::new(), sp_out: Ring::new(),
-            act_out: Ring::new(), mode_out: Ring::new(),
+            health_in: Ring::new(), neighbor_in: Ring::new(),
+            gps_out: Ring::new(), sp_out: Ring::new(),
+            act_out: Ring::new(), mode_out: Ring::new(), health_out: Ring::new(),
+            neighbor_out: Ring::new(),
+            imu_to_est: Ring::new(), imu_to_fdir: Ring::new(),
             est_to_ctrl: Ring::new(), est_to_fdir: Ring::new(),
+            est_to_mission: Ring::new(), est_to_formation: Ring::new(),
         }
     }
 
@@ -139,19 +155,26 @@ impl Bus {
     pub fn publish_mode(&mut self, m: (FlightMode, Health)) -> Result<(), (FlightMode, Health)> {
         self.mode_in.try_push(m)
     }
+    pub fn publish_health(&mut self, m: Health) -> Result<(), Health> { self.health_in.try_push(m) }
+    pub fn publish_neighbor(&mut self, m: NeighborState) -> Result<(), NeighborState> { self.neighbor_in.try_push(m) }
 
     // ---- 消费者 API（读出消费者段） ----
-    pub fn recv_imu(&mut self) -> Option<ImuSample> { self.imu_out.try_pop() }
+    pub fn recv_imu_est(&mut self) -> Option<ImuSample> { self.imu_to_est.try_pop() }
+    pub fn recv_imu_fdir(&mut self) -> Option<ImuSample> { self.imu_to_fdir.try_pop() }
     pub fn recv_gps(&mut self) -> Option<PosSample> { self.gps_out.try_pop() }
     pub fn recv_est_ctrl(&mut self) -> Option<VehicleState> { self.est_to_ctrl.try_pop() }
     pub fn recv_est_fdir(&mut self) -> Option<VehicleState> { self.est_to_fdir.try_pop() }
+    pub fn recv_est_mission(&mut self) -> Option<VehicleState> { self.est_to_mission.try_pop() }
+    pub fn recv_est_formation(&mut self) -> Option<VehicleState> { self.est_to_formation.try_pop() }
     pub fn recv_setpoint(&mut self) -> Option<Setpoint> { self.sp_out.try_pop() }
     pub fn recv_actuator(&mut self) -> Option<ActuatorCmd> { self.act_out.try_pop() }
     pub fn recv_mode(&mut self) -> Option<(FlightMode, Health)> { self.mode_out.try_pop() }
+    pub fn recv_health(&mut self) -> Option<Health> { self.health_out.try_pop() }
+    pub fn recv_neighbor(&mut self) -> Option<NeighborState> { self.neighbor_out.try_pop() }
 
     /// 扇出泵：把各生产者段的最新数据复制到对应消费者段。
     ///
-    /// 对 `est`：从 `est_in` 弹出并复制进 `est_to_ctrl` 与 `est_to_fdir`（扇出）。
+    /// 对 `est`：从 `est_in` 弹出并复制进 4 路消费者段（ctrl/fdir/mission/formation 各一份）。
     /// 其余主题：从 `*_in` 弹出推入对应 `*_out`。每调一次最多搬运一个元素/主题，
     /// 调用方通常每控制周期调一次（或循环调至各通道清空）。
     ///
@@ -159,7 +182,8 @@ impl Bus {
     pub fn pump(&mut self) -> usize {
         let mut moved = 0usize;
         if let Some(m) = self.imu_in.try_pop() {
-            if self.imu_out.try_push(m).is_ok() { moved += 1; }
+            if self.imu_to_est.try_push(m).is_ok() { moved += 1; }
+            if self.imu_to_fdir.try_push(m).is_ok() { moved += 1; }
         }
         if let Some(m) = self.gps_in.try_pop() {
             if self.gps_out.try_push(m).is_ok() { moved += 1; }
@@ -167,6 +191,8 @@ impl Bus {
         if let Some(m) = self.est_in.try_pop() {
             if self.est_to_ctrl.try_push(m).is_ok() { moved += 1; }
             if self.est_to_fdir.try_push(m).is_ok() { moved += 1; }
+            if self.est_to_mission.try_push(m).is_ok() { moved += 1; }
+            if self.est_to_formation.try_push(m).is_ok() { moved += 1; }
         }
         if let Some(m) = self.sp_in.try_pop() {
             if self.sp_out.try_push(m).is_ok() { moved += 1; }
@@ -176,6 +202,12 @@ impl Bus {
         }
         if let Some(m) = self.mode_in.try_pop() {
             if self.mode_out.try_push(m).is_ok() { moved += 1; }
+        }
+        if let Some(m) = self.health_in.try_pop() {
+            if self.health_out.try_push(m).is_ok() { moved += 1; }
+        }
+        if let Some(m) = self.neighbor_in.try_pop() {
+            if self.neighbor_out.try_push(m).is_ok() { moved += 1; }
         }
         moved
     }
@@ -238,9 +270,9 @@ mod tests {
         for _ in 0..3 {
             total += bus.pump();
         }
-        // 每个 est 扇出到 2 个订阅者 → 6 次搬运
-        assert_eq!(total, 6);
-        // 两个订阅者各收到 3 个，顺序一致
+        // 每个 est 扇出到 4 个订阅者 → 3*4 = 12 次搬运
+        assert_eq!(total, 12); // 3 个 est × 4 路扇出 = 12 次搬运
+        // 四个订阅者各收到 3 个，顺序一致
         let mut c = 0;
         while let Some(st) = bus.recv_est_ctrl() {
             assert_eq!(st.pos[0].0, c as f32);
@@ -261,12 +293,12 @@ mod tests {
         bus.publish_imu(ImuSample { accel: [MeterPerSecondSquared(1.0), MeterPerSecondSquared(0.0), MeterPerSecondSquared(0.0)], gyro: [RadianPerSecond(0.0); 3] });
         bus.publish_setpoint(Setpoint::hover([Meter(0.0); 3], Radian(0.0)));
         bus.publish_mode((FlightMode::Position, Health::Nominal));
-        assert_eq!(bus.pump(), 3);
+        assert_eq!(bus.pump(), 4);
         // 各主题互不串扰：imu 里不应含 setpoint/mode
-        assert!(bus.recv_imu().is_some());
+        assert!(bus.recv_imu_est().is_some());
         assert!(bus.recv_setpoint().is_some());
         assert!(bus.recv_mode().is_some());
-        assert!(bus.recv_imu().is_none());
+        assert!(bus.recv_imu_est().is_none());
     }
 
     #[test]
@@ -278,12 +310,17 @@ mod tests {
         }
         let overflow = ImuSample { accel: [MeterPerSecondSquared(999.0), MeterPerSecondSquared(0.0), MeterPerSecondSquared(0.0)], gyro: [RadianPerSecond(0.0); 3] };
         assert_eq!(bus.publish_imu(overflow), Err(overflow));
-        // pump 每次每主题最多搬运 1 个；循环至清空。
+        // pump 每次每主题最多搬运 1 个（但扇出到 2 个消费者段 → 计 2）；
+        // 循环至清空。imu 8 个 × 2 段 = 16 次搬运。
         let mut total = 0;
-        while bus.pump() > 0 { total += 1; }
-        assert_eq!(total, 8);
+        loop {
+            let m = bus.pump();
+            if m == 0 { break; }
+            total += m;
+        }
+        assert_eq!(total, 16);
         // 读出顺序仍是最先写入的（未被覆盖）
-        let first = bus.recv_imu().unwrap();
+        let first = bus.recv_imu_est().unwrap();
         assert_eq!(first.accel[0].0, 0.0);
     }
 }

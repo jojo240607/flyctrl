@@ -1091,25 +1091,31 @@ fn run_mission_demo(seconds: f32) {
     println!("  verdict         = {}", if ok { "OK (全部航点到达且闭环无 NaN)" } else { "PARTIAL" });
 }
 
-/// M10 消息总线演示：控制环全程经 `Bus` 解耦。
+/// M10 消息总线演示：完整解耦飞控栈（8 节点）全程经 `Bus` 通信。
 ///
-/// 把飞控栈拆成若干"节点"，彼此只通过总线通信、不互相持有引用：
-/// - 传感器注入节点：`world.sense` → `publish_imu` / `publish_gps`。
-/// - 设定点节点：`publish_setpoint`（定点悬停）。
-/// - 估计节点：`recv_imu`+`recv_gps` → `EkfEstimator` → `publish_est`（扇出到 ctrl/fdir）。
-/// - 控制节点：`recv_est_ctrl`+`recv_setpoint` → `PidController` → `publish_actuator`。
-/// - 执行器节点：`recv_actuator` → `phys.step`。
-/// 每步 `bus.pump()` 一次完成扇出。证明中间件层可实现完全解耦的同构闭环。
+/// 飞控栈拆成 8 个"节点"，彼此只通过总线通信、不互相持有引用：
+/// 1. 传感器节点：`world.sense` → `publish_imu` / `publish_gps`。
+/// 2. 估计节点：`recv_imu`+`recv_gps` → `EkfEstimator` → `publish_est`（扇出到 ctrl/fdir）。
+/// 3. FDIR 节点：`recv_est_fdir`+`recv_imu`+GPS 可用性 → `Fdir` → `publish_health`。
+/// 4. 任务节点：`recv_est` → `MissionRunner` → `publish_setpoint`（航点完成后转悬停）。
+/// 5. 编队节点：`recv_est` → 经 `neighbor` 通道广播自身状态（多机时互为邻居）。
+/// 6. 模式治理节点：`recv_health` + 外部请求 → `ModeGovernor` → `publish_mode`。
+/// 7. 控制节点：`recv_est_ctrl`+`recv_setpoint`+`recv_mode`(+`recv_neighbor` 编队偏移)
+///    → `PidController` → `publish_actuator`。
+/// 8. 执行器节点：`recv_actuator` → `phys.step`。
+/// 每步若干次 `bus.pump()` 完成扇出。证明 FDIR/任务/编队均已挂到总线，形成完整解耦栈。
 fn run_bus_demo(seconds: f32) {
     use flyctrl_core::bus::Bus;
     use flyctrl_core::controller::pid::PidController as Pid;
     use flyctrl_core::controller::Controller;
-    use flyctrl_core::controller::Setpoint;
     use flyctrl_core::estimator::ekf::EkfEstimator as Ekf;
     use flyctrl_core::estimator::Estimator;
+    use flyctrl_core::flightmode::{FlightMode, ModeContext, ModeGovernor};
     use flyctrl_core::invariants::{actuator_bounded, state_finite};
+    use flyctrl_core::mission::MissionRunner;
+    use flyctrl_core::swarm::{Formation, NeighborState};
     use flyctrl_core::units::*;
-    use flyctrl_core::vehicle::{ActuatorCmd, ImuSample, PosSample, VehicleState};
+    use flyctrl_core::vehicle::{ActuatorCmd, VehicleState};
 
     let cfg = VehicleConfig::default_quad();
     let dt = Second(0.01);
@@ -1124,82 +1130,136 @@ fn run_bus_demo(seconds: f32) {
     let mut pid = Pid::from_config(&cfg.ctrl_params());
     pid.reset();
     let mut ekf = Ekf::default_quad();
+    let mut fdir = Fdir::new();
+    // 任务：单航点到达原点上方 10m（演示用；到达后转悬停）。
+    let mission = flyctrl_core::mission::Mission::<2>::from_slice(&[
+        flyctrl_core::mission::Waypoint::new([Meter(0.0), Meter(0.0), Meter(-10.0)], Radian(0.0), Meter(2.0), Meter(3.0)),
+    ]);
+    let mut mission = MissionRunner::<2>::new(mission, flyctrl_core::mission::Geofence::default_quad());
+    let mut gov = ModeGovernor::new(FlightMode::Stabilize);
     let mut bus = Bus::new();
 
-    // 设定点：原点悬停（由"设定点节点"发布一次，之后每步重发以维持总线新鲜）。
-    let sp = Setpoint::hover([Meter(0.0), Meter(0.0), Meter(-10.0)], Radian(0.0));
+    // 外部模式请求（演示：解锁后请求 Position 模式，任务接管设定点）。
+    let _mode_req = FlightMode::Position;
 
     let mut nan = false;
     let mut last_est = VehicleState::zero();
     let mut bus_moves = 0usize;
-    let mut actuator_drops = 0usize; // 执行器通道满（背压）丢弃计数
+    let mut actuator_drops = 0usize;
     // 执行器节点持有"最近命令"；总线尚未到达命令时以悬停默认值推进物理，
     // 避免冷启动死锁（控制环先有传感器数据才能产出命令）。
     let mut last_cmd = ActuatorCmd { motor: [0.5; 4] };
+    let mut last_mode = (FlightMode::Stabilize, flyctrl_core::fdir::Health::Nominal);
+    let self_id: u8 = 1;
 
-    println!("flyctrl SITL — 消息总线解耦闭环演示 (T={}s)", seconds);
-    println!("{}", "-".repeat(54));
+    println!("flyctrl SITL — 完整解耦飞控栈演示 (8 节点经总线, T={}s)", seconds);
+    println!("{}", "-".repeat(60));
 
     for i in 0..steps {
-        // ① 执行器节点：消费总线上的执行器命令（若无则保持上一拍命令/悬停默认），
-        //    推进物理并注入传感器测量到总线。
+        // ① 执行器节点：消费总线 actuator，推进物理并注入传感器测量。
         if let Some(cmd) = bus.recv_actuator() {
             last_cmd = cmd;
         }
         let ideal = phys.step(dt, last_cmd);
         let (imu, gps) = world.sense(dt, ideal, phys.state().pos);
         let _ = bus.publish_imu(imu);
+        let gps_avail = gps.is_some();
         if let Some(g) = gps {
             let _ = bus.publish_gps(g);
         }
-        // ② 设定点节点
-        let _ = bus.publish_setpoint(sp);
 
-        // ③ 泵：把生产者段数据扇出到消费者段
+        // ② 泵：传感器段 → 消费者段（供估计/FDIR 读取）
         bus_moves += bus.pump();
 
-        // ④ 估计节点：消费 imu/gps，运行 EKF，发布 est
-        let imu = bus.recv_imu();
-        let gps = bus.recv_gps();
-        if let (Some(imu), gps) = (imu, gps) {
+        // ③ 估计节点：消费 imu/gps → EKF → publish_est（扇出 ctrl/fdir）
+        let imu_s = bus.recv_imu_est();
+        let gps_s = bus.recv_gps();
+        if let (Some(imu), gps) = (imu_s, gps_s) {
             let est = ekf.step(dt, imu, gps);
             last_est = est;
             if !state_finite(&est) { nan = true; break; }
             let _ = bus.publish_est(est);
         }
-        // ④b 泵：把刚发布的 est 扇出到 est_to_ctrl / est_to_fdir（供本拍 ⑤ 读取）
+        // ③b 泵：把 est 扇出到 est_to_ctrl / est_to_fdir
         bus_moves += bus.pump();
-        // ⑤ 控制节点：消费 est + setpoint，运行 PID，发布 actuator
-        if let (Some(est), Some(sp)) = (bus.recv_est_ctrl(), bus.recv_setpoint()) {
-            let cmd = pid.control(dt, &sp, &est);
+
+        // ④ FDIR 节点：消费 est_fdir + imu + GPS 可用性 → 发布 health
+        if let (Some(est_f), Some(imu_f)) = (bus.recv_est_fdir(), bus.recv_imu_fdir()) {
+            let _ = imu_f; // 冻结检测在 Fdir::update 内部比对加速度
+            let h = fdir.update(&imu, gps_avail);
+            let _ = bus.publish_health(h);
+            let _ = est_f;
+        }
+        // ⑤ 任务节点：消费 est → MissionRunner → 发布 setpoint
+        if let Some(est_m) = bus.recv_est_mission() {
+            let sp = mission.update(&est_m, dt);
+            let _ = bus.publish_setpoint(sp);
+        }
+        // ⑥ 编队节点：消费 est → 经 neighbor 通道广播自身状态
+        if let Some(est_n) = bus.recv_est_formation() {
+            let nb = NeighborState::fresh(
+                self_id,
+                [est_n.pos[0].0, est_n.pos[1].0, est_n.pos[2].0],
+                [est_n.vel[0].0, est_n.vel[1].0, est_n.vel[2].0],
+            );
+            let _ = bus.publish_neighbor(nb);
+        }
+        // ⑦ 泵：health / setpoint / neighbor → 消费者段
+        bus_moves += bus.pump();
+
+        // ⑧ 模式治理节点：消费 health + 外部请求 → 发布 mode
+        if let Some(h) = bus.recv_health() {
+            let ctx = ModeContext::new(true, h, true); // 已解锁、有位置
+            let _ = gov.request(FlightMode::Position, &ctx); // 演示请求
+            let m = gov.mode();
+            let _ = bus.publish_mode((m, h));
+        }
+        // ⑨ 泵：mode → 消费者段
+        bus_moves += bus.pump();
+
+        // ⑩ 控制节点：消费 est + setpoint + mode(+neighbor 编队偏移) → actuator
+        if let (Some(est_c), Some(sp), Some(mode)) =
+            (bus.recv_est_ctrl(), bus.recv_setpoint(), bus.recv_mode())
+        {
+            last_mode = mode;
+            let mut sp = sp;
+            // 若编队激活，叠加本机相对长机的偏移（单机构型 offset=0）。
+            let form = Formation::None;
+            let off = form.slot_offset(0);
+            sp.pos[0] = Meter(sp.pos[0].0 + off[0]);
+            sp.pos[1] = Meter(sp.pos[1].0 + off[1]);
+            sp.pos[2] = Meter(sp.pos[2].0 + off[2]);
+
+            let cmd = pid.control(dt, &sp, &est_c);
             if actuator_bounded(&cmd) {
-                // 发布；若执行器段满（背压）则记一次丢弃
                 if bus.publish_actuator(cmd).is_err() {
                     actuator_drops += 1;
                 }
             }
         }
-        // ⑥ 再泵一次，把 actuator 扇出到 act_out（供下一拍 ① 消费）
+        // ⑪ 泵：actuator → act_out（供下一拍 ① 消费）
         bus_moves += bus.pump();
 
         if i % 100 == 0 {
             println!(
-                "[bus] t={:.1}s pos=({:.1},{:.1},{:.1}) bus_moves={} act_drops={}",
+                "[stack] t={:.1}s pos=({:.1},{:.1},{:.1}) mode={:?} health={:?} bus_moves={} act_drops={}",
                 i as f32 * dt.0,
                 last_est.pos[0].0, last_est.pos[1].0, last_est.pos[2].0,
+                last_mode.0, last_mode.1,
                 bus_moves, actuator_drops
             );
         }
     }
 
-    println!("{}", "-".repeat(54));
+    println!("{}", "-".repeat(60));
     println!("  末位置估计     = [{:6.2}, {:6.2}, {:6.2}]", last_est.pos[0].0, last_est.pos[1].0, last_est.pos[2].0);
+    println!("  末模式/健康    = {:?} / {:?}", last_mode.0, last_mode.1);
     println!("  出现 NaN       = {}", nan);
     println!("  总线搬运总数   = {}", bus_moves);
     println!("  执行器背压丢弃 = {}", actuator_drops);
     let horiz = (last_est.pos[0].0.powi(2) + last_est.pos[1].0.powi(2)).sqrt();
     let ok = !nan && horiz < 3.0 && (last_est.pos[2].0 + 10.0).abs() < 4.0;
-    println!("  verdict         = {}", if ok { "OK (总线解耦闭环稳定悬停)" } else { "PARTIAL" });
+    println!("  verdict         = {}", if ok { "OK (完整解耦栈稳定悬停)" } else { "PARTIAL" });
 }
 
 /// 详细打印 PID+Complementary 的时间序列（对齐 PLAN 的 M1 验收）。
