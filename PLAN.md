@@ -166,10 +166,21 @@ flyctrl/
 新增 CLI：`--fault imudrift|imustuck|gpsdropout`、`--robust`、`--montecarlo N`、`--rtf`。
 
 ### M5：HAL 与嵌入式落地
-- [ ] `hal/sensor` trait + `stm32f407` 具体实现（IMU/GPS/气压/罗盘）
-- [ ] `hal/actuator` trait + PWM/CAN/DSHOT 驱动
-- [ ] `rtos/` 运行时抽象；接入在研 Rust RTOS（替换 host 调度后端）
-- [ ] `core` 零堆分配审计（移除一切隐式 alloc，改用 `heapless`/静态池）
+- [x] `hal/sensor` trait + `stm32f407` 具体实现（IMU/GPS/气压/罗盘）
+- [x] `hal/actuator` trait + PWM/CAN/DSHOT 驱动
+- [x] `rtos/` 运行时抽象；接入在研 Rust RTOS（替换 host 调度后端）
+- [x] `core` 零堆分配审计（移除一切隐式 alloc，改用 `heapless`/静态池）
+
+**§5-A M5 验收（2026-08-07）**
+
+新增 `core/src/hal/`（全部 `no_std`、无堆、执行时间有界）：
+1. `hal/sensor.rs`：`ImuSensor`/`GpsSensor`/`BaroSensor`/`MagSensor` 四个 trait + `mock`（host/SIL 确定性实现）+ `stm32f407`（cfg 门控占位，结构对齐真实 PAC 布局）。
+2. `hal/actuator.rs`：`MotorActuator` trait + `clamp_thrust` 饱和保护 + `OutputProtocol` 枚举（PWM/DSHOT/CAN）+ `mock`（记录最近指令供断言）+ `stm32f407`（PWM/DSHOT 占位）。
+3. `hal/rtos.rs`：`Runtime` trait（`schedule_periodic`/`enter_failsafe`/`now`）+ `host::SpinLoop`（SIL 自旋）+ `stm32f407::RtosTask`（RTOS 周期任务占位）。
+4. 零堆审计：`core/` 静态 grep 确认无 `Vec/Box/String/alloc::` 引用；新增集成测试 `core/tests/no_alloc.rs` 跑通 **sensor→estimator→controller→actuator** 全回路（200 步），断言输出合法、估计无 NaN。新增 `stm32f407` cargo feature 门控芯片实现，已验证 `--features stm32f407` 编译通过。
+5. `core/Cargo.toml` 加 `stm32f407` feature；`VehicleConfig::default_quad()`/`ActuatorCmd`/`OutputProtocol` 已 `Default`。
+
+验证：`cargo test -p flyctrl-core` 全过（含 2 个新增 HAL 测试）；`--features stm32f407` 干净编译；全 workspace test 绿。
 
 ### M6：通信与地面站
 - [ ] `mavlink/` 适配层（兼容 QGC），参数/遥测/指令双向

@@ -16,3 +16,4 @@ pub mod config;
 pub mod estimator;
 pub mod controller;
 pub mod fdir;
+pub mod hal;

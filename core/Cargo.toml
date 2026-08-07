@@ -9,3 +9,7 @@ license.workspace = true
 # 设计为 no_std 友好（不依赖 std/alloc），可在 host 与嵌入式固件间共享。
 [dependencies]
 libm = "0.2"
+
+[features]
+# 启用具体芯片实现（HAL 的 stm32f407 占位模块）。host/SIL 默认关闭。
+stm32f407 = []

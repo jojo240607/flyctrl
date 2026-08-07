@@ -96,7 +96,7 @@ pub struct PosSample {
 
 /// 控制输出：四个电机的归一化推力指令 [0,1]。
 /// 索引对应 X 型四旋翼：0=前右(CCW) 1=后左(CCW) 2=前左(CW) 3=后右(CW)。
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct ActuatorCmd {
     pub motor: [f32; 4],
 }
