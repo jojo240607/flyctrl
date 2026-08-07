@@ -268,11 +268,21 @@ flyctrl/
       供 ISR 内调用。`--features stm32f407` 干净编译（非 arm 退化为 no-op 占位，
       与既有 stm32f407 模块风格一致）。新增测试 `bus_irq_locked_publish_pump_subscribe`
       验证 IRQ 安全 API 与裸 API 行为一致（host）。
+- [x] **消息时间标签 + QoS（基于注册表 CAP 与 Ring 语义）**：
+      - `Bus` 持单调时钟 `now: Second`，`tick(dt)` 推进；`publish`/`pump` 均按总线时钟
+        盖 `Stamped<M>{msg, ts}` 时间戳（生产端戳记，泵转发不改戳，供老化/QoS 判定）。
+      - `QosKind::{Reliable,Latest}` 作为主题关联常量注册到 `Topic` trait（`define_topics!`
+        第 6 列）；`PubTopic::push` 据 QOS 选择 `try_push`（满拒收→Err）或 `force_push`
+        （满覆盖最旧，总成功）——`Ring` 新增 `force_push`。
+      - 容量/策略分配：`Imu/Gps/Est/Neighbor` 及所有 est/imu 消费者段 = `Latest`（高频、
+        旧值无意义）；`Setpoint/Actuator/Mode/Health` 及对应消费者段 = `Reliable`（命令/
+        健康宁可丢新也不污染）。`subscribe` 返回 `Stamped<Payload>`；具名 `recv_*` 仍返回
+        裸值（向后兼容），新增 `recv_*_stamped` 供 QoS/老化用。
+      - 测试：`bus_qos_latest_overwrites_oldest`（Imu 满覆盖最旧、999 在段尾）、
+        `bus_qos_reliable_rejects_when_full`（Setpoint 满拒收 Err）。
 - [ ] **后续可选（按优先级）**：
-      1. **消息时间标签 + QoS**：`publish` 带 `Timestamp`，订阅支持"最新值覆盖"(`latest`)与"可靠投递"(`reliable`)，
-         基于注册表的 `CAP` 与 `Ring` 语义扩展。
-      2. **`neighbor` 跨机链路接 `comm/mavlink`**：把单总线 demo 升级为真实多机解耦栈（依赖注册表与 QoS）。
-      3. 发布/订阅运行时发现（动态端点登记）。
+      1. **`neighbor` 跨机链路接 `comm/mavlink`**：把单总线 demo 升级为真实多机解耦栈（依赖注册表与 QoS）。
+      2. 发布/订阅运行时发现（动态端点登记）。
 
 ---
 

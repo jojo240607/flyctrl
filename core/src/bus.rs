@@ -30,6 +30,23 @@ use crate::hal::irq::IrqLock;
 use crate::swarm::NeighborState;
 use crate::vehicle::{ImuSample, PosSample, VehicleState};
 
+use crate::units::Second;
+
+/// 带时间戳的消息包装：发布时由总线时钟盖戳，供 QoS/老化判定使用。
+#[derive(Debug, Clone, Copy)]
+pub struct Stamped<M: Copy> {
+    /// 载荷。
+    pub msg: M,
+    /// 发布时刻（总线单调时钟，秒）。
+    pub ts: Second,
+}
+
+impl<M: Copy> Stamped<M> {
+    pub fn new(msg: M, ts: Second) -> Self { Self { msg, ts } }
+    /// 取出裸载荷。
+    pub fn into_inner(self) -> M { self.msg }
+}
+
 /// 单生产者单消费者定容环形缓冲（零分配、`no_std`、`Copy`）。
 ///
 /// 内部用 `head`/`tail`/`count` 三标记，避免 `head==tail` 的空/满歧义。
@@ -86,10 +103,37 @@ impl<M: Copy, const CAP: usize> Ring<M, CAP> {
         self.count -= 1;
         Some(m)
     }
+
+    /// 强制推入：满时**覆盖最旧元素**（用于 `latest` QoS——总是保留最新值，
+    /// 不丢新帧）。返回被覆盖的旧值（若满且覆盖发生）。
+    pub fn force_push(&mut self, m: M) -> Option<M> {
+        if self.count == CAP {
+            // 覆盖最旧（tail 位置），原地替换并前移 tail 到下一最旧。
+            let old = self.buf[self.tail].replace(m);
+            self.tail = (self.tail + 1) % CAP;
+            old
+        } else {
+            self.buf[self.head] = Some(m);
+            self.head = (self.head + 1) % CAP;
+            self.count += 1;
+            None
+        }
+    }
 }
 
 impl<M: Copy, const CAP: usize> Default for Ring<M, CAP> {
     fn default() -> Self { Self::new() }
+}
+
+/// 服务质量策略（编译期关联到主题）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QosKind {
+    /// 可靠投递：满则拒绝新帧（不覆盖旧数据），调用方据 `Err` 背压/丢帧。
+    /// 适合命令/健康这类"宁可丢新也不污染"的流。
+    Reliable,
+    /// 最新值覆盖：满时覆盖最旧元素，总是保留最新一帧。
+    /// 适合高频遥测/状态估计这类"旧值无意义"的流。
+    Latest,
 }
 
 /// 飞行系统消息总线：聚合固定主题通道，并提供 est/imu 扇出与便捷访问。
@@ -103,29 +147,32 @@ impl<M: Copy, const CAP: usize> Default for Ring<M, CAP> {
 /// 每段通道是独立的 `Ring`：生产者段（`*_in`，由 `publish` 写入、`pump` 读出）
 /// 与消费者段（`*_out`/`*_to_*`，由 `pump` 写入、由 `subscribe` 读出）。
 pub struct Bus {
+    /// 总线单调时钟（秒），由 `tick` 推进；发布/泵出时据此盖时间戳。
+    now: Second,
+
     // 生产者段（仅 publish 写入；pump 读出）。
-    imu_in: Ring<ImuSample, 8>,
-    gps_in: Ring<PosSample, 4>,
-    est_in: Ring<VehicleState, 4>,
-    sp_in: Ring<Setpoint, 4>,
-    act_in: Ring<ActuatorCmd, 4>,
-    mode_in: Ring<(FlightMode, Health), 4>,
-    health_in: Ring<Health, 4>,
-    neighbor_in: Ring<NeighborState, 4>,
+    imu_in: Ring<Stamped<ImuSample>, 8>,
+    gps_in: Ring<Stamped<PosSample>, 4>,
+    est_in: Ring<Stamped<VehicleState>, 4>,
+    sp_in: Ring<Stamped<Setpoint>, 4>,
+    act_in: Ring<Stamped<ActuatorCmd>, 4>,
+    mode_in: Ring<Stamped<(FlightMode, Health)>, 4>,
+    health_in: Ring<Stamped<Health>, 4>,
+    neighbor_in: Ring<Stamped<NeighborState>, 4>,
 
     // 消费者段（pump 写入；subscribe 读出）。
-    gps_out: Ring<PosSample, 4>,
-    sp_out: Ring<Setpoint, 4>,
-    act_out: Ring<ActuatorCmd, 4>,
-    mode_out: Ring<(FlightMode, Health), 4>,
-    health_out: Ring<Health, 4>,
-    neighbor_out: Ring<NeighborState, 4>,
-    imu_to_est: Ring<ImuSample, 8>,
-    imu_to_fdir: Ring<ImuSample, 8>,
-    est_to_ctrl: Ring<VehicleState, 4>,
-    est_to_fdir: Ring<VehicleState, 4>,
-    est_to_mission: Ring<VehicleState, 4>,
-    est_to_formation: Ring<VehicleState, 4>,
+    gps_out: Ring<Stamped<PosSample>, 4>,
+    sp_out: Ring<Stamped<Setpoint>, 4>,
+    act_out: Ring<Stamped<ActuatorCmd>, 4>,
+    mode_out: Ring<Stamped<(FlightMode, Health)>, 4>,
+    health_out: Ring<Stamped<Health>, 4>,
+    neighbor_out: Ring<Stamped<NeighborState>, 4>,
+    imu_to_est: Ring<Stamped<ImuSample>, 8>,
+    imu_to_fdir: Ring<Stamped<ImuSample>, 8>,
+    est_to_ctrl: Ring<Stamped<VehicleState>, 4>,
+    est_to_fdir: Ring<Stamped<VehicleState>, 4>,
+    est_to_mission: Ring<Stamped<VehicleState>, 4>,
+    est_to_formation: Ring<Stamped<VehicleState>, 4>,
 }
 
 /// 定义总线主题注册表（编译期单一事实来源）。
@@ -139,52 +186,53 @@ pub struct Bus {
 /// 新增主题只需在此宏的扁平列表里加一行（变体名, 标记名, 角色, 载荷类型, 容量, 字段）；
 /// 遗漏任一主题的 pub/sub 实现会被编译器拒绝。
 macro_rules! define_topics {
-    ( $( ($var:ident, $mark:ident, $role:ident, $pty:ty, $cap:expr, $field:ident) ),* $(,)? ) => {
+    ( $( ($var:ident, $mark:ident, $role:ident, $pty:ty, $cap:expr, $qos:ident, $field:ident) ),* $(,)? ) => {
         /// 主题注册表：编译期已知的所有总线主题（用于遍历/文档/测试）。
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
         pub enum TopicId { $( $var ),* }
 
-        /// 主题契约：关联载荷类型与容量。
-        pub trait Topic { type Payload: Copy; const CAP: usize; }
+        /// 主题契约：关联载荷类型、容量与服务质量策略。
+        pub trait Topic {
+            type Payload: Copy;
+            const CAP: usize;
+            const QOS: QosKind;
+        }
 
         /// 可发布主题（生产者端点）。
         pub trait PubTopic: Topic {
-            fn push(bus: &mut Bus, m: Self::Payload) -> Result<(), Self::Payload>;
+            fn push(bus: &mut Bus, m: Self::Payload, ts: Second) -> Result<(), Self::Payload>;
         }
 
         /// 可订阅主题（消费者端点）。
         pub trait SubTopic: Topic {
-            fn pop(bus: &mut Bus) -> Option<Self::Payload>;
+            fn pop(bus: &mut Bus) -> Option<Stamped<Self::Payload>>;
         }
 
         // 角色门控：仅生产者实现 PubTopic，仅消费者实现 SubTopic。
-        macro_rules! impl_pub {
-            ($m:ident, prod, $t:ty, $f:ident) => {
-                impl PubTopic for $m {
-                    fn push(bus: &mut Bus, m: Self::Payload) -> Result<(), Self::Payload> {
-                        bus.$f.try_push(m)
-                    }
-                }
-            };
-            ($m:ident, sub, $t:ty, $f:ident) => {};
-        }
-        macro_rules! impl_sub {
-            ($m:ident, sub, $t:ty, $f:ident) => {
-                impl SubTopic for $m {
-                    fn pop(bus: &mut Bus) -> Option<Self::Payload> {
-                        bus.$f.try_pop()
-                    }
-                }
-            };
-            ($m:ident, prod, $t:ty, $f:ident) => {};
-        }
-
+        // 注意：嵌套宏重复变量（$qos 来自外层 $(...)*）不能在被调宏的臂参数里
+        // "解包"，故此处直接内联角色分支，不调用子宏。
         $(
             #[doc = "总线主题标记类型（编译期类型安全门面的键）。"]
             pub struct $mark;
-            impl Topic for $mark { type Payload = $pty; const CAP: usize = $cap; }
-            impl_pub!($mark, $role, $pty, $field);
-            impl_sub!($mark, $role, $pty, $field);
+            impl Topic for $mark {
+                type Payload = $pty;
+                const CAP: usize = $cap;
+                const QOS: QosKind = QosKind::$qos;
+            }
+            impl PubTopic for $mark {
+                fn push(bus: &mut Bus, m: Self::Payload, ts: Second) -> Result<(), Self::Payload> {
+                    let stamped = Stamped::new(m, ts);
+                    match QosKind::$qos {
+                        QosKind::Reliable => bus.$field.try_push(stamped).map_err(|s| s.into_inner()),
+                        QosKind::Latest => { bus.$field.force_push(stamped); Ok(()) }
+                    }
+                }
+            }
+            impl SubTopic for $mark {
+                fn pop(bus: &mut Bus) -> Option<Stamped<Self::Payload>> {
+                    bus.$field.try_pop()
+                }
+            }
         )*
 
         impl TopicId {
@@ -197,33 +245,36 @@ macro_rules! define_topics {
 }
 
 define_topics! {
-    // 变体名, 标记名, 角色, 载荷类型, 容量, 字段
-    (Imu,         ImuTopic,         prod, ImuSample,     8, imu_in),
-    (Gps,         GpsTopic,         prod, PosSample,     4, gps_in),
-    (Est,         EstTopic,         prod, VehicleState,  4, est_in),
-    (Setpoint,    SetpointTopic,    prod, Setpoint,      4, sp_in),
-    (Actuator,    ActuatorTopic,    prod, ActuatorCmd,   4, act_in),
-    (Mode,        ModeTopic,        prod, (FlightMode, Health), 4, mode_in),
-    (Health,      HealthTopic,      prod, Health,        4, health_in),
-    (Neighbor,    NeighborTopic,    prod, NeighborState, 4, neighbor_in),
-    (ImuToEst,    ImuToEstTopic,    sub, ImuSample,     8, imu_to_est),
-    (ImuToFdir,   ImuToFdirTopic,   sub, ImuSample,     8, imu_to_fdir),
-    (EstToCtrl,   EstToCtrlTopic,   sub, VehicleState,  4, est_to_ctrl),
-    (EstToFdir,   EstToFdirTopic,   sub, VehicleState,  4, est_to_fdir),
-    (EstToMission,EstToMissionTopic,sub, VehicleState,  4, est_to_mission),
-    (EstToFormation,EstToFormationTopic,sub,VehicleState,4, est_to_formation),
-    (GpsOut,      GpsOutTopic,      sub, PosSample,     4, gps_out),
-    (SpOut,       SpOutTopic,       sub, Setpoint,      4, sp_out),
-    (ActOut,      ActOutTopic,      sub, ActuatorCmd,   4, act_out),
-    (ModeOut,     ModeOutTopic,     sub, (FlightMode, Health), 4, mode_out),
-    (HealthOut,   HealthOutTopic,   sub, Health,        4, health_out),
-    (NeighborOut, NeighborOutTopic, sub, NeighborState, 4, neighbor_out),
+    // 变体名, 标记名, 角色, 载荷类型, 容量, QoS, 字段
+    // 高频遥测/状态估计 → Latest（旧值无意义，满则覆盖最旧）；
+    // 命令/健康/模式/邻居 → Reliable（宁可丢新也不污染）。
+    (Imu,         ImuTopic,         prod, ImuSample,     8, Latest,    imu_in),
+    (Gps,         GpsTopic,         prod, PosSample,     4, Latest,    gps_in),
+    (Est,         EstTopic,         prod, VehicleState,  4, Latest,    est_in),
+    (Setpoint,    SetpointTopic,    prod, Setpoint,      4, Reliable,  sp_in),
+    (Actuator,    ActuatorTopic,    prod, ActuatorCmd,   4, Reliable,  act_in),
+    (Mode,        ModeTopic,        prod, (FlightMode, Health), 4, Reliable, mode_in),
+    (Health,      HealthTopic,      prod, Health,        4, Reliable,  health_in),
+    (Neighbor,    NeighborTopic,    prod, NeighborState, 4, Latest,    neighbor_in),
+    (ImuToEst,    ImuToEstTopic,    sub, ImuSample,     8, Latest,    imu_to_est),
+    (ImuToFdir,   ImuToFdirTopic,   sub, ImuSample,     8, Latest,    imu_to_fdir),
+    (EstToCtrl,   EstToCtrlTopic,   sub, VehicleState,  4, Latest,    est_to_ctrl),
+    (EstToFdir,   EstToFdirTopic,   sub, VehicleState,  4, Latest,    est_to_fdir),
+    (EstToMission,EstToMissionTopic,sub, VehicleState,  4, Latest,    est_to_mission),
+    (EstToFormation,EstToFormationTopic,sub,VehicleState,4, Latest,   est_to_formation),
+    (GpsOut,      GpsOutTopic,      sub, PosSample,     4, Latest,    gps_out),
+    (SpOut,       SpOutTopic,       sub, Setpoint,      4, Reliable,  sp_out),
+    (ActOut,      ActOutTopic,      sub, ActuatorCmd,   4, Reliable,  act_out),
+    (ModeOut,     ModeOutTopic,     sub, (FlightMode, Health), 4, Reliable, mode_out),
+    (HealthOut,   HealthOutTopic,   sub, Health,        4, Reliable,  health_out),
+    (NeighborOut, NeighborOutTopic, sub, NeighborState, 4, Latest,    neighbor_out),
 }
 
 impl Bus {
-    /// 构造空总线（各段通道清零）。
+    /// 构造空总线（各段通道清零，时钟从 0 起）。
     pub fn new() -> Self {
         Self {
+            now: Second::ZERO,
             imu_in: Ring::new(), gps_in: Ring::new(), est_in: Ring::new(),
             sp_in: Ring::new(), act_in: Ring::new(), mode_in: Ring::new(),
             health_in: Ring::new(), neighbor_in: Ring::new(),
@@ -236,19 +287,28 @@ impl Bus {
         }
     }
 
-    /// 类型安全发布：载荷类型由主题 `T` 唯一确定。
+    /// 类型安全发布：载荷类型由主题 `T` 唯一确定；以总线当前时钟盖时间戳。
     ///
     /// 例：`bus.publish::<Imu>(sample)`——`sample` 必须是 `ImuSample`，否则编译失败。
+    /// 主题 `QOS` 决定满时行为：`Reliable` 拒收返回 `Err`，`Latest` 覆盖最旧。
     pub fn publish<T: PubTopic>(&mut self, m: T::Payload) -> Result<(), T::Payload> {
-        T::push(self, m)
+        T::push(self, m, self.now)
     }
 
-    /// 类型安全订阅：返回类型由主题 `T` 唯一确定。
+    /// 类型安全订阅：返回带时间戳的 `Stamped<Payload>`，类型由主题 `T` 唯一确定。
     ///
-    /// 例：`bus.subscribe::<ImuToEst>()` 返回 `Option<ImuSample>`。
-    pub fn subscribe<T: SubTopic>(&mut self) -> Option<T::Payload> {
+    /// 例：`bus.subscribe::<ImuToEst>()` 返回 `Option<Stamped<ImuSample>>`。
+    pub fn subscribe<T: SubTopic>(&mut self) -> Option<Stamped<T::Payload>> {
         T::pop(self)
     }
+
+    /// 推进总线单调时钟（每控制周期调用一次，dt 为周期时长）。
+    pub fn tick(&mut self, dt: Second) {
+        self.now.0 += dt.0;
+    }
+
+    /// 当前总线时钟（秒）。
+    pub fn now(&self) -> Second { self.now }
 
     // ---- 具名便捷方法（委托到类型安全 API，向后兼容） ----
     pub fn publish_imu(&mut self, m: ImuSample) -> Result<(), ImuSample> { self.publish::<ImuTopic>(m) }
@@ -262,18 +322,24 @@ impl Bus {
     pub fn publish_health(&mut self, m: Health) -> Result<(), Health> { self.publish::<HealthTopic>(m) }
     pub fn publish_neighbor(&mut self, m: NeighborState) -> Result<(), NeighborState> { self.publish::<NeighborTopic>(m) }
 
-    pub fn recv_imu_est(&mut self) -> Option<ImuSample> { self.subscribe::<ImuToEstTopic>() }
-    pub fn recv_imu_fdir(&mut self) -> Option<ImuSample> { self.subscribe::<ImuToFdirTopic>() }
-    pub fn recv_gps(&mut self) -> Option<PosSample> { self.subscribe::<GpsOutTopic>() }
-    pub fn recv_est_ctrl(&mut self) -> Option<VehicleState> { self.subscribe::<EstToCtrlTopic>() }
-    pub fn recv_est_fdir(&mut self) -> Option<VehicleState> { self.subscribe::<EstToFdirTopic>() }
-    pub fn recv_est_mission(&mut self) -> Option<VehicleState> { self.subscribe::<EstToMissionTopic>() }
-    pub fn recv_est_formation(&mut self) -> Option<VehicleState> { self.subscribe::<EstToFormationTopic>() }
-    pub fn recv_setpoint(&mut self) -> Option<Setpoint> { self.subscribe::<SpOutTopic>() }
-    pub fn recv_actuator(&mut self) -> Option<ActuatorCmd> { self.subscribe::<ActOutTopic>() }
-    pub fn recv_mode(&mut self) -> Option<(FlightMode, Health)> { self.subscribe::<ModeOutTopic>() }
-    pub fn recv_health(&mut self) -> Option<Health> { self.subscribe::<HealthOutTopic>() }
-    pub fn recv_neighbor(&mut self) -> Option<NeighborState> { self.subscribe::<NeighborOutTopic>() }
+    // 具名订阅：返回裸载荷（向后兼容），时间戳版本见 `recv_*_stamped`。
+    pub fn recv_imu_est(&mut self) -> Option<ImuSample> { self.subscribe::<ImuToEstTopic>().map(|s| s.into_inner()) }
+    pub fn recv_imu_fdir(&mut self) -> Option<ImuSample> { self.subscribe::<ImuToFdirTopic>().map(|s| s.into_inner()) }
+    pub fn recv_gps(&mut self) -> Option<PosSample> { self.subscribe::<GpsOutTopic>().map(|s| s.into_inner()) }
+    pub fn recv_est_ctrl(&mut self) -> Option<VehicleState> { self.subscribe::<EstToCtrlTopic>().map(|s| s.into_inner()) }
+    pub fn recv_est_fdir(&mut self) -> Option<VehicleState> { self.subscribe::<EstToFdirTopic>().map(|s| s.into_inner()) }
+    pub fn recv_est_mission(&mut self) -> Option<VehicleState> { self.subscribe::<EstToMissionTopic>().map(|s| s.into_inner()) }
+    pub fn recv_est_formation(&mut self) -> Option<VehicleState> { self.subscribe::<EstToFormationTopic>().map(|s| s.into_inner()) }
+    pub fn recv_setpoint(&mut self) -> Option<Setpoint> { self.subscribe::<SpOutTopic>().map(|s| s.into_inner()) }
+    pub fn recv_actuator(&mut self) -> Option<ActuatorCmd> { self.subscribe::<ActOutTopic>().map(|s| s.into_inner()) }
+    pub fn recv_mode(&mut self) -> Option<(FlightMode, Health)> { self.subscribe::<ModeOutTopic>().map(|s| s.into_inner()) }
+    pub fn recv_health(&mut self) -> Option<Health> { self.subscribe::<HealthOutTopic>().map(|s| s.into_inner()) }
+    pub fn recv_neighbor(&mut self) -> Option<NeighborState> { self.subscribe::<NeighborOutTopic>().map(|s| s.into_inner()) }
+
+    // 带时间戳订阅（QoS/老化判定用）。
+    pub fn recv_imu_est_stamped(&mut self) -> Option<Stamped<ImuSample>> { self.subscribe::<ImuToEstTopic>() }
+    pub fn recv_est_ctrl_stamped(&mut self) -> Option<Stamped<VehicleState>> { self.subscribe::<EstToCtrlTopic>() }
+    pub fn recv_health_stamped(&mut self) -> Option<Stamped<Health>> { self.subscribe::<HealthOutTopic>() }
 
     /// 扇出泵：把各生产者段的最新数据复制到对应消费者段。
     ///
@@ -284,6 +350,7 @@ impl Bus {
     /// 返回本次搬运的元素总数（用于诊断背压/丢帧）。
     pub fn pump(&mut self) -> usize {
         let mut moved = 0usize;
+        // 通道已存 Stamped<M>；泵出时保留生产者原始时间戳（不改戳）。
         if let Some(m) = self.imu_in.try_pop() {
             if self.imu_to_est.try_push(m).is_ok() { moved += 1; }
             if self.imu_to_fdir.try_push(m).is_ok() { moved += 1; }
@@ -338,8 +405,11 @@ impl Bus {
         lock.with(|| self.publish::<T>(m))
     }
 
-    /// IRQ 安全订阅：中断锁内执行 [`subscribe`]，供 ISR 取走消费数据。
-    pub fn subscribe_locked<T: SubTopic, L: IrqLock>(&mut self, lock: &L) -> Option<T::Payload> {
+    /// IRQ 安全订阅：中断锁内执行 [`subscribe`]，供 ISR 取走消费数据（带时间戳）。
+    pub fn subscribe_locked<T: SubTopic, L: IrqLock>(
+        &mut self,
+        lock: &L,
+    ) -> Option<Stamped<T::Payload>> {
         lock.with(|| self.subscribe::<T>())
     }
 }
@@ -433,16 +503,16 @@ mod tests {
     }
 
     #[test]
-    fn bus_full_rejects_no_overwrite() {
-        // imu 容量 8：塞满后第 9 个被拒，已存数据不变（不覆盖最旧）。
+    fn bus_qos_latest_overwrites_oldest() {
+        // Imu 是 Latest QoS（cap 8）：塞满后第 9 个**覆盖最旧**，不拒收、不丢新帧。
         let mut bus = Bus::new();
         for k in 0..8 {
             bus.publish_imu(ImuSample { accel: [MeterPerSecondSquared(k as f32), MeterPerSecondSquared(0.0), MeterPerSecondSquared(0.0)], gyro: [RadianPerSecond(0.0); 3] });
         }
-        let overflow = ImuSample { accel: [MeterPerSecondSquared(999.0), MeterPerSecondSquared(0.0), MeterPerSecondSquared(0.0)], gyro: [RadianPerSecond(0.0); 3] };
-        assert_eq!(bus.publish_imu(overflow), Err(overflow));
-        // pump 每次每主题最多搬运 1 个（但扇出到 2 个消费者段 → 计 2）；
-        // 循环至清空。imu 8 个 × 2 段 = 16 次搬运。
+        let newest = ImuSample { accel: [MeterPerSecondSquared(999.0), MeterPerSecondSquared(0.0), MeterPerSecondSquared(0.0)], gyro: [RadianPerSecond(0.0); 3] };
+        // Latest：第 9 个成功（覆盖最旧 k=0），返回 Ok。
+        assert!(bus.publish_imu(newest).is_ok());
+        // pump：8 个 × 2 段 = 16 次搬运（覆盖那帧也在内）。
         let mut total = 0;
         loop {
             let m = bus.pump();
@@ -450,9 +520,29 @@ mod tests {
             total += m;
         }
         assert_eq!(total, 16);
-        // 读出顺序仍是最先写入的（未被覆盖）
+        // 读出顺序：最旧(k=0)已被覆盖，第一个是 k=1。
         let first = bus.recv_imu_est().unwrap();
-        assert_eq!(first.accel[0].0, 0.0);
+        assert_eq!(first.accel[0].0, 1.0);
+        // 最后一个是最新值 999。
+        let mut last = first;
+        while let Some(s) = bus.recv_imu_est() { last = s; }
+        assert_eq!(last.accel[0].0, 999.0);
+    }
+
+    #[test]
+    fn bus_qos_reliable_rejects_when_full() {
+        // Setpoint 是 Reliable QoS（cap 4）：塞满后第 5 个被拒（Err），已存不变。
+        let mut bus = Bus::new();
+        for k in 0..4 {
+            assert!(bus.publish_setpoint(Setpoint::hover([Meter(k as f32); 3], Radian(0.0))).is_ok());
+        }
+        let overflow = Setpoint::hover([Meter(777.0); 3], Radian(0.0));
+        assert!(bus.publish_setpoint(overflow).is_err());
+        // pump 1 次：setpoint 单播到 sp_out（计 1）。
+        assert_eq!(bus.pump(), 1);
+        // 读出顺序仍是最先写入的（未被覆盖）
+        let first = bus.recv_setpoint().unwrap();
+        assert_eq!(first.pos[0].0, 0.0);
     }
 
     // ---- 编译期主题注册表测试 ----
@@ -470,8 +560,8 @@ mod tests {
         let imu = ImuSample { accel: [MeterPerSecondSquared(2.0), MeterPerSecondSquared(0.0), MeterPerSecondSquared(0.0)], gyro: [RadianPerSecond(0.0); 3] };
         assert!(bus.publish::<ImuTopic>(imu).is_ok());
         bus.pump();
-        // 订阅 ImuToEst 得到 ImuSample（类型由主题绑定）
-        let got: ImuSample = bus.subscribe::<ImuToEstTopic>().unwrap();
+        // 订阅 ImuToEst 得到 Stamped<ImuSample>（类型由主题绑定）
+        let got: ImuSample = bus.subscribe::<ImuToEstTopic>().unwrap().into_inner();
         assert_eq!(got.accel[0].0, 2.0);
 
         // Est 主题只接受 VehicleState
@@ -479,7 +569,7 @@ mod tests {
         st.pos[2] = Meter(-5.0);
         assert!(bus.publish::<EstTopic>(st).is_ok());
         bus.pump();
-        let got_est: VehicleState = bus.subscribe::<EstToCtrlTopic>().unwrap();
+        let got_est: VehicleState = bus.subscribe::<EstToCtrlTopic>().unwrap().into_inner();
         assert_eq!(got_est.pos[2].0, -5.0);
 
         // 类型错误会在编译期被拒（以下仅为注释说明，不执行）：
@@ -499,7 +589,7 @@ mod tests {
         // ISR 内扇出泵
         assert_eq!(bus.pump_locked(&lock), 2); // imu 扇出到 2 段
         // ISR 内订阅（消费者端点）
-        let got: ImuSample = bus.subscribe_locked::<ImuToEstTopic, _>(&lock).unwrap();
+        let got: ImuSample = bus.subscribe_locked::<ImuToEstTopic, _>(&lock).unwrap().into_inner();
         assert_eq!(got.accel[0].0, 3.0);
 
         // 多主题：est 发布 + 泵（扇出 4 段）
@@ -507,7 +597,7 @@ mod tests {
         st.pos[2] = Meter(-7.0);
         assert!(bus.publish_locked::<EstTopic, _>(&lock, st).is_ok());
         assert_eq!(bus.pump_locked(&lock), 4);
-        let got_est: VehicleState = bus.subscribe_locked::<EstToCtrlTopic, _>(&lock).unwrap();
+        let got_est: VehicleState = bus.subscribe_locked::<EstToCtrlTopic, _>(&lock).unwrap().into_inner();
         assert_eq!(got_est.pos[2].0, -7.0);
     }
 }
