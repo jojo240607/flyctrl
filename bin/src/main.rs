@@ -205,6 +205,7 @@ fn main() {
     let mut indi_demo = false;
     let mut swarm_demo = false;
     let mut mission_demo = false;
+    let mut bus_demo = false;
 
     let mut i = 1;
     while i < args.len() {
@@ -286,6 +287,10 @@ fn main() {
                 mission_demo = true;
                 i += 1;
             }
+            "--bus" => {
+                bus_demo = true;
+                i += 1;
+            }
             _ => i += 1,
         }
     }
@@ -361,6 +366,12 @@ fn main() {
     if mission_demo {
         // M9 任务层演示：多航点任务 + 飞行模式治理，闭环 SIL。
         run_mission_demo(seconds);
+        return;
+    }
+
+    if bus_demo {
+        // M10 消息总线演示：控制环全程经总线解耦（sensor→est→setpoint→ctrl→actuator）。
+        run_bus_demo(seconds);
         return;
     }
 
@@ -1078,6 +1089,117 @@ fn run_mission_demo(seconds: f32) {
     println!("  最终模式       = {:?}", gov.mode());
     let ok = !nan && all_reached && runner.complete();
     println!("  verdict         = {}", if ok { "OK (全部航点到达且闭环无 NaN)" } else { "PARTIAL" });
+}
+
+/// M10 消息总线演示：控制环全程经 `Bus` 解耦。
+///
+/// 把飞控栈拆成若干"节点"，彼此只通过总线通信、不互相持有引用：
+/// - 传感器注入节点：`world.sense` → `publish_imu` / `publish_gps`。
+/// - 设定点节点：`publish_setpoint`（定点悬停）。
+/// - 估计节点：`recv_imu`+`recv_gps` → `EkfEstimator` → `publish_est`（扇出到 ctrl/fdir）。
+/// - 控制节点：`recv_est_ctrl`+`recv_setpoint` → `PidController` → `publish_actuator`。
+/// - 执行器节点：`recv_actuator` → `phys.step`。
+/// 每步 `bus.pump()` 一次完成扇出。证明中间件层可实现完全解耦的同构闭环。
+fn run_bus_demo(seconds: f32) {
+    use flyctrl_core::bus::Bus;
+    use flyctrl_core::controller::pid::PidController as Pid;
+    use flyctrl_core::controller::Controller;
+    use flyctrl_core::controller::Setpoint;
+    use flyctrl_core::estimator::ekf::EkfEstimator as Ekf;
+    use flyctrl_core::estimator::Estimator;
+    use flyctrl_core::invariants::{actuator_bounded, state_finite};
+    use flyctrl_core::units::*;
+    use flyctrl_core::vehicle::{ActuatorCmd, ImuSample, PosSample, VehicleState};
+
+    let cfg = VehicleConfig::default_quad();
+    let dt = Second(0.01);
+    let steps = (seconds / dt.0) as usize;
+
+    let wp = WorldParams::default();
+    let wind = wp.wind;
+    let mut phys = Physics::new(cfg.dyn_params().into());
+    let mut world = World::new(wp);
+    phys.set_wind(wind);
+
+    let mut pid = Pid::from_config(&cfg.ctrl_params());
+    pid.reset();
+    let mut ekf = Ekf::default_quad();
+    let mut bus = Bus::new();
+
+    // 设定点：原点悬停（由"设定点节点"发布一次，之后每步重发以维持总线新鲜）。
+    let sp = Setpoint::hover([Meter(0.0), Meter(0.0), Meter(-10.0)], Radian(0.0));
+
+    let mut nan = false;
+    let mut last_est = VehicleState::zero();
+    let mut bus_moves = 0usize;
+    let mut actuator_drops = 0usize; // 执行器通道满（背压）丢弃计数
+    // 执行器节点持有"最近命令"；总线尚未到达命令时以悬停默认值推进物理，
+    // 避免冷启动死锁（控制环先有传感器数据才能产出命令）。
+    let mut last_cmd = ActuatorCmd { motor: [0.5; 4] };
+
+    println!("flyctrl SITL — 消息总线解耦闭环演示 (T={}s)", seconds);
+    println!("{}", "-".repeat(54));
+
+    for i in 0..steps {
+        // ① 执行器节点：消费总线上的执行器命令（若无则保持上一拍命令/悬停默认），
+        //    推进物理并注入传感器测量到总线。
+        if let Some(cmd) = bus.recv_actuator() {
+            last_cmd = cmd;
+        }
+        let ideal = phys.step(dt, last_cmd);
+        let (imu, gps) = world.sense(dt, ideal, phys.state().pos);
+        let _ = bus.publish_imu(imu);
+        if let Some(g) = gps {
+            let _ = bus.publish_gps(g);
+        }
+        // ② 设定点节点
+        let _ = bus.publish_setpoint(sp);
+
+        // ③ 泵：把生产者段数据扇出到消费者段
+        bus_moves += bus.pump();
+
+        // ④ 估计节点：消费 imu/gps，运行 EKF，发布 est
+        let imu = bus.recv_imu();
+        let gps = bus.recv_gps();
+        if let (Some(imu), gps) = (imu, gps) {
+            let est = ekf.step(dt, imu, gps);
+            last_est = est;
+            if !state_finite(&est) { nan = true; break; }
+            let _ = bus.publish_est(est);
+        }
+        // ④b 泵：把刚发布的 est 扇出到 est_to_ctrl / est_to_fdir（供本拍 ⑤ 读取）
+        bus_moves += bus.pump();
+        // ⑤ 控制节点：消费 est + setpoint，运行 PID，发布 actuator
+        if let (Some(est), Some(sp)) = (bus.recv_est_ctrl(), bus.recv_setpoint()) {
+            let cmd = pid.control(dt, &sp, &est);
+            if actuator_bounded(&cmd) {
+                // 发布；若执行器段满（背压）则记一次丢弃
+                if bus.publish_actuator(cmd).is_err() {
+                    actuator_drops += 1;
+                }
+            }
+        }
+        // ⑥ 再泵一次，把 actuator 扇出到 act_out（供下一拍 ① 消费）
+        bus_moves += bus.pump();
+
+        if i % 100 == 0 {
+            println!(
+                "[bus] t={:.1}s pos=({:.1},{:.1},{:.1}) bus_moves={} act_drops={}",
+                i as f32 * dt.0,
+                last_est.pos[0].0, last_est.pos[1].0, last_est.pos[2].0,
+                bus_moves, actuator_drops
+            );
+        }
+    }
+
+    println!("{}", "-".repeat(54));
+    println!("  末位置估计     = [{:6.2}, {:6.2}, {:6.2}]", last_est.pos[0].0, last_est.pos[1].0, last_est.pos[2].0);
+    println!("  出现 NaN       = {}", nan);
+    println!("  总线搬运总数   = {}", bus_moves);
+    println!("  执行器背压丢弃 = {}", actuator_drops);
+    let horiz = (last_est.pos[0].0.powi(2) + last_est.pos[1].0.powi(2)).sqrt();
+    let ok = !nan && horiz < 3.0 && (last_est.pos[2].0 + 10.0).abs() < 4.0;
+    println!("  verdict         = {}", if ok { "OK (总线解耦闭环稳定悬停)" } else { "PARTIAL" });
 }
 
 /// 详细打印 PID+Complementary 的时间序列（对齐 PLAN 的 M1 验收）。

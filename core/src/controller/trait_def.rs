@@ -6,6 +6,7 @@
 use crate::units::*;
 pub use crate::vehicle::{ActuatorCmd, VehicleState};
 
+#[derive(Debug, Clone, Copy)]
 pub struct Setpoint {
     pub pos: [Meter; 3],       // 期望 NED 位置（D 向下为正，悬停通常为负高度）
     pub yaw: Radian,           // 期望偏航

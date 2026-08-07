@@ -16,6 +16,7 @@ pub mod config;
 pub mod estimator;
 pub mod controller;
 pub mod fdir;
+pub mod bus;
 pub mod flightmode;
 pub mod hil;
 pub mod invariants;
