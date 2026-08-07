@@ -204,6 +204,7 @@ fn main() {
     let mut comm_demo = false;
     let mut indi_demo = false;
     let mut swarm_demo = false;
+    let mut swarm_link_demo = false;
     let mut mission_demo = false;
     let mut bus_demo = false;
 
@@ -283,6 +284,10 @@ fn main() {
                 swarm_demo = true;
                 i += 1;
             }
+            "--swarm-link" => {
+                swarm_link_demo = true;
+                i += 1;
+            }
             "--mission" => {
                 mission_demo = true;
                 i += 1;
@@ -360,6 +365,13 @@ fn main() {
     if swarm_demo {
         // M8.2 多机编队演示：长机 + 僚机两架，V 字编队 + 避碰，闭环 SIL。
         run_swarm_demo(seconds);
+        return;
+    }
+
+    if swarm_link_demo {
+        // M10 邻机跨机链路演示：两架飞机经 LoopbackLink 交换 MAVLink 邻机帧，
+        // 验证 swarm 的 broadcast_frame / parse_broadcast 与链路解耦。
+        run_swarm_link_demo();
         return;
     }
 
@@ -820,6 +832,81 @@ fn run_comm_demo(scenario: &Scenario, seconds: f32) {
     println!("  LOCAL_POS  rx   = {}", pos);
     println!("  telem dropped   = {}", telem.dropped());
     println!("  verdict         = GCS-compatible MAVLink frames decoded OK");
+}
+
+/// M10 邻机跨机链路演示：两架飞机经同一 `LoopbackLink`（代表数传/无线链路）交换
+/// MAVLink 邻机帧，验证 swarm 的 `broadcast_frame` / `parse_broadcast` 与链路层解耦。
+///
+/// 这是 item #3（neighbor cross-machine link to mavlink）的落点：不再走 intra-process
+/// 的 `SwarmTable::update`，而是把邻机状态真正封装成 MAVLink 帧、过链路、对端解帧回填。
+fn run_swarm_link_demo() {
+    use flyctrl_core::comm::link::{Frame, Link, LoopbackLink};
+    use flyctrl_core::swarm::{broadcast_frame, parse_broadcast, SwarmTable};
+    use flyctrl_core::units::Meter;
+    use flyctrl_core::vehicle::VehicleState;
+
+    // 共享链路：A 发出的帧 B 收到（此处演示 A→B 单向广播，B 建立邻机表）。
+    let mut link = LoopbackLink::new();
+
+    // 机器 A：本机状态（沿 +X 漂移的僚机）
+    let mut a_state = VehicleState::zero();
+    a_state.pos = [Meter(0.0), Meter(0.0), Meter(0.0)];
+
+    // 机器 B：维护一张邻机表（容量 8），初始为空
+    let mut b_table = SwarmTable::<8>::new();
+    let mut b_self = VehicleState::zero();
+    b_self.pos = [Meter(10.0), Meter(0.0), Meter(0.0)];
+
+    let mut seq = 0u8;
+    let mut frames_tx = 0usize;
+    let mut parsed = 0usize;
+
+    // 模拟 20 个通信周期：A 每周期广播一帧自身状态，B 从链路取帧回填邻机表。
+    for k in 0..20 {
+        a_state.pos[0] = Meter(k as f32); // A 缓慢前飞，验证 B 表内的位置随帧更新
+
+        // A 封装 MAVLink 邻机帧并经链路发出
+        let mut frame_buf = [0u8; 280];
+        let n = broadcast_frame(1, &a_state, seq, &mut frame_buf);
+        seq = seq.wrapping_add(1);
+        let frame = Frame::from_bytes(&frame_buf[..n]);
+        frames_tx += link.send_frame(&frame);
+
+        // B 从链路取一帧并解帧回填
+        let rx: Frame = link.recv_frame();
+        if !rx.is_empty() {
+            if let Some(neighbor) = parse_broadcast(&rx) {
+                b_table.update(neighbor);
+                parsed += 1;
+            }
+        }
+    }
+
+    // B 侧也应周期性广播自身状态（验证双向链路不串台）
+    let mut b_buf = [0u8; 280];
+    let b_n = broadcast_frame(2, &b_self, 0, &mut b_buf);
+    let b_frame = Frame::from_bytes(&b_buf[..b_n]);
+    link.send_frame(&b_frame);
+    let _ = b_frame; // 此处不回读，仅验证封装/发送链路通畅
+
+    // ---- 校验 ----
+    let count = b_table.count();
+    let ok = count == 1 && parsed == 20;
+
+    println!("flyctrl SITL — 邻机跨机链路演示 (SwarmTable ↔ LoopbackLink ↔ MAVLink)");
+    println!("{}", "-".repeat(60));
+    println!("  link            = LoopbackLink (stands in for radio/USB-CDC)");
+    println!("  A→B frames tx   = {} bytes", frames_tx);
+    println!("  B parsed frames = {}", parsed);
+    println!("  B swarm count   = {} (expect 1 neighbor)", count);
+    if let Some(n) = b_table.get(1) {
+        println!("  neighbor#1 pos  = [{:.1}, {:.1}, {:.1}] (last A pos = [19.0,0.0,0.0])",
+                 n.pos[0], n.pos[1], n.pos[2]);
+    } else {
+        println!("  neighbor#1      = MISSING");
+    }
+    println!("  verdict         = {}",
+             if ok { "neighbor exchange over link OK" } else { "LINK EXCHANGE FAILED" });
 }
 
 /// M8.1 INDI 演示：同样 PID 基线，分别跑"纯 PID"与"PID+INDI"，

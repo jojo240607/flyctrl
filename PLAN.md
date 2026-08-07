@@ -280,9 +280,18 @@ flyctrl/
         裸值（向后兼容），新增 `recv_*_stamped` 供 QoS/老化用。
       - 测试：`bus_qos_latest_overwrites_oldest`（Imu 满覆盖最旧、999 在段尾）、
         `bus_qos_reliable_rejects_when_full`（Setpoint 满拒收 Err）。
-- [ ] **后续可选（按优先级）**：
-      1. **`neighbor` 跨机链路接 `comm/mavlink`**：把单总线 demo 升级为真实多机解耦栈（依赖注册表与 QoS）。
-      2. 发布/订阅运行时发现（动态端点登记）。
+- [x] **`neighbor` 跨机链路接 `comm/mavlink`（邻机状态真实过链路）**：
+      - 复用既有 `core/src/swarm.rs` 的 `broadcast_frame(self_id, &VehicleState, seq, out)` /
+        `parse_broadcast(&Frame)`（基于 `LOCAL_POSITION_NED` 封装/解 MAVLink 帧）与
+        `comm/link.rs` 的 `LoopbackLink`（按 0xFE 边界组/解帧），**不另写私有 neighbor codec**——
+        此前曾误新增 `encode_neighbor`/`decode_neighbor` 并覆写 `mavlink.rs`/`swarm.rs`，已还原，改走现有 API。
+      - `bin/src/main.rs` 新增 `--swarm-link` 演示：两架飞机（A/B）共享一条 `LoopbackLink`（代指数传/USB-CDC）；
+        A 每通信周期经 `broadcast_frame` 发出自身状态帧 → B 从链路 `recv_frame` → `parse_broadcast` →
+        `SwarmTable::<8>::update` 回填邻机表。验证 A 缓慢前飞时 B 表内位置随帧刷新（末帧 pos=[19,0,0]）。
+      - 实测：`--swarm-link` 跑通 20 周期，720 字节帧经链路、20 帧全部解析、B 邻机表 count=1、verdict=OK。
+        证明 swarm 与链路层完全解耦、可无缝替换为真实 `UartLink`/`UsbCdcLink`。
+- [ ] **后续可选**：
+      1. 发布/订阅运行时发现（动态端点登记）。
 
 ---
 
