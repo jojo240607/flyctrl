@@ -26,6 +26,7 @@
 use crate::controller::trait_def::{ActuatorCmd, Setpoint};
 use crate::fdir::Health;
 use crate::flightmode::FlightMode;
+use crate::hal::irq::IrqLock;
 use crate::swarm::NeighborState;
 use crate::vehicle::{ImuSample, PosSample, VehicleState};
 
@@ -313,6 +314,34 @@ impl Bus {
         }
         moved
     }
+
+    /// IRQ 安全扇出泵：在中断锁内执行 [`pump`]，供**中断上下文**调用。
+    ///
+    /// 真实 MCU 上，传感器 DMA 完成 ISR / 控制周期定时器 ISR 可能与主循环并发
+    /// 读写总线通道。`pump_locked` 借由 `lock`（`IrqLock` 实现）在搬运期间屏蔽
+    /// 可抢占的中断，避免通道 `head`/`tail`/`count` 撕裂。host 端 `HostIrqLock`
+    /// 为 no-op，MCU 端 `BasepriLock` 用 BASEPRI 阈值临界区。
+    ///
+    /// 例（ISR 内）：`let n = bus.pump_locked(&HostIrqLock);`
+    pub fn pump_locked<L: IrqLock>(&mut self, lock: &L) -> usize {
+        lock.with(|| self.pump())
+    }
+
+    /// IRQ 安全发布：中断锁内执行 [`publish`]，供 ISR 发布传感器样本等。
+    ///
+    /// 载荷类型由主题 `T` 唯一确定（与 `publish` 同款编译期类型安全）。
+    pub fn publish_locked<T: PubTopic, L: IrqLock>(
+        &mut self,
+        lock: &L,
+        m: T::Payload,
+    ) -> Result<(), T::Payload> {
+        lock.with(|| self.publish::<T>(m))
+    }
+
+    /// IRQ 安全订阅：中断锁内执行 [`subscribe`]，供 ISR 取走消费数据。
+    pub fn subscribe_locked<T: SubTopic, L: IrqLock>(&mut self, lock: &L) -> Option<T::Payload> {
+        lock.with(|| self.subscribe::<T>())
+    }
 }
 
 impl Default for Bus {
@@ -455,5 +484,30 @@ mod tests {
 
         // 类型错误会在编译期被拒（以下仅为注释说明，不执行）：
         // bus.publish::<Imu>(Meter(1.0)); // 编译失败：Imu 载荷是 ImuSample，不是 Meter
+    }
+
+    #[test]
+    fn bus_irq_locked_publish_pump_subscribe() {
+        // IRQ 安全 API 行为须与裸 API 一致（host 端 HostIrqLock 为 no-op）。
+        use crate::hal::irq::HostIrqLock;
+        let lock = HostIrqLock;
+        let mut bus = Bus::new();
+
+        let imu = ImuSample { accel: [MeterPerSecondSquared(3.0), MeterPerSecondSquared(0.0), MeterPerSecondSquared(0.0)], gyro: [RadianPerSecond(0.0); 3] };
+        // ISR 内发布（类型安全门面）
+        assert!(bus.publish_locked::<ImuTopic, _>(&lock, imu).is_ok());
+        // ISR 内扇出泵
+        assert_eq!(bus.pump_locked(&lock), 2); // imu 扇出到 2 段
+        // ISR 内订阅（消费者端点）
+        let got: ImuSample = bus.subscribe_locked::<ImuToEstTopic, _>(&lock).unwrap();
+        assert_eq!(got.accel[0].0, 3.0);
+
+        // 多主题：est 发布 + 泵（扇出 4 段）
+        let mut st = VehicleState::zero();
+        st.pos[2] = Meter(-7.0);
+        assert!(bus.publish_locked::<EstTopic, _>(&lock, st).is_ok());
+        assert_eq!(bus.pump_locked(&lock), 4);
+        let got_est: VehicleState = bus.subscribe_locked::<EstToCtrlTopic, _>(&lock).unwrap();
+        assert_eq!(got_est.pos[2].0, -7.0);
     }
 }

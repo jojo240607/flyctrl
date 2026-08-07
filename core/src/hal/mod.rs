@@ -8,3 +8,4 @@
 pub mod sensor;
 pub mod actuator;
 pub mod rtos;
+pub mod irq;

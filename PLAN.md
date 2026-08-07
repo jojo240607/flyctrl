@@ -259,12 +259,20 @@ flyctrl/
       上层用类型安全门面 `bus.publish::<ImuTopic>(sample)` / `bus.subscribe::<EstToCtrlTopic>()`——**载荷类型由主题
       唯一确定，写错类型编译器拒绝**（如 `bus.publish::<ImuTopic>(Meter(1.0))` 编译失败）。具名便捷方法
       `publish_imu`/`recv_est_ctrl` 等保留并委托到泛型门面，向后兼容。新增主题只改宏一行。
+- [x] **IRQ 上下文 `irq_lock` 包裹（贴近真实 MCU 部署，HAL 落地前置）**：新增
+      `core/src/hal/irq.rs` 提供 `IrqLock` trait + `HostIrqLock`（SIL no-op）+
+      `stm32f407::BasepriLock`（`target_arch="arm"` 下用 BASEPRI 阈值临界区，
+      屏蔽前保存掩码、退出原样恢复，与 joc-base RTOS `rtos_crit_enter/exit` 同语义；
+      panic 安全：drop guard 保证恢复，避免永久关中断）。`Bus` 增加泛型安全包装
+      `pump_locked::<L:IrqLock>` / `publish_locked::<T,L>` / `subscribe_locked::<T,L>`，
+      供 ISR 内调用。`--features stm32f407` 干净编译（非 arm 退化为 no-op 占位，
+      与既有 stm32f407 模块风格一致）。新增测试 `bus_irq_locked_publish_pump_subscribe`
+      验证 IRQ 安全 API 与裸 API 行为一致（host）。
 - [ ] **后续可选（按优先级）**：
-      1. **IRQ 上下文 `irq_lock` 包裹示例**：在中断里安全 `pump`/发布（贴近真实 MCU 部署，HAL 落地前置）。
-      2. **消息时间标签 + QoS**：`publish` 带 `Timestamp`，订阅支持"最新值覆盖"(`latest`)与"可靠投递"(`reliable`)，
+      1. **消息时间标签 + QoS**：`publish` 带 `Timestamp`，订阅支持"最新值覆盖"(`latest`)与"可靠投递"(`reliable`)，
          基于注册表的 `CAP` 与 `Ring` 语义扩展。
-      3. **`neighbor` 跨机链路接 `comm/mavlink`**：把单总线 demo 升级为真实多机解耦栈（依赖注册表与 QoS）。
-      4. 发布/订阅运行时发现（动态端点登记）。
+      2. **`neighbor` 跨机链路接 `comm/mavlink`**：把单总线 demo 升级为真实多机解耦栈（依赖注册表与 QoS）。
+      3. 发布/订阅运行时发现（动态端点登记）。
 
 ---
 
