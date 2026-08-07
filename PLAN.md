@@ -290,8 +290,26 @@ flyctrl/
         `SwarmTable::<8>::update` 回填邻机表。验证 A 缓慢前飞时 B 表内位置随帧刷新（末帧 pos=[19,0,0]）。
       - 实测：`--swarm-link` 跑通 20 周期，720 字节帧经链路、20 帧全部解析、B 邻机表 count=1、verdict=OK。
         证明 swarm 与链路层完全解耦、可无缝替换为真实 `UartLink`/`UsbCdcLink`。
-- [ ] **后续可选**：
-      1. 发布/订阅运行时发现（动态端点登记）。
+- [x] **发布/订阅运行时发现（动态端点登记，零分配）**：
+      - `core/src/bus.rs` 新增 `EndpointKind{Producer,Consumer}`、`EndpointName`（16B 定长、
+        NUL 结尾、无堆）、`Endpoint{topic,kind,component}`，以及定容零分配 `Registry<const N>`：
+        `register`（幂等、满则 `Err` 不覆盖）、`count`、`endpoints_of`(按主题)、
+        `endpoints_of_component`(按组件)、`for_each`。
+      - `define_topics!` 把角色提升为类型信息：`Topic` trait 新增 `const ID: TopicId` 与
+        `const ROLE: EndpointKind`（由 `prod`/`sub` token 经 `role_to_kind!` 映射）；`TopicId`
+        新增 `const COUNT`、`role()`、`name()`，使主题角色可在运行时枚举。
+      - `Bus::discover() -> Registry<{TopicId::COUNT + 44}>` 返回**静态拓扑表**（每主题一条端点，
+        component 留空），组件启动后 `register(topic, kind, "name")` 把身份补登，使拓扑从
+        "通道契约"升级为"组件 ↔ 角色"可枚举图——无需把全部组件硬编码进调用方。
+      - `bin/src/main.rs` 新增 `--discovery` 演示：10 个组件（imu_sensor/gps_sensor/estimator/
+        mission/controller/mode_mgr/fdir/swarm/formation/actuator）登记后枚举拓扑、并做
+        estimator→controller→actuator 连通性自检。实测：20 静态 + 20 运行时 = 40 端点，
+        拓扑清晰、chain present、verdict=OK。
+      - 测试：`registry_static_topology_full`(8 prod+12 sub=20)、`registry_role_matches_topic`、
+        `registry_runtime_registration`(幂等/按组件/按主题枚举)、`registry_capacity_full_rejects`
+        （定容溢出 Err）。`cargo test` 全绿。
+- [x] **M10 全部完成**：自 SPSC 环形缓冲 → 类型安全总线 → 编译期主题注册表 → IRQ 安全 API →
+      时间戳/QoS → 邻机跨机链路 → 运行时发现，中间件层骨干闭环。
 
 ---
 

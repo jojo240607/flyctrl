@@ -136,6 +136,165 @@ pub enum QosKind {
     Latest,
 }
 
+/// 端点角色（编译期关联到主题，运行时可枚举）。
+///
+/// 用于"发布/订阅运行时发现"：一个节点可枚举总线上的主题以及每个主题的角色，
+/// 进而知道"谁可以发布 / 谁应该订阅"，无需在编译期把全部组件硬编码进调用方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EndpointKind {
+    /// 生产者端点：只有它能 `publish` 该主题。
+    Producer,
+    /// 消费者端点：订阅该主题以读取数据。
+    Consumer,
+}
+
+impl EndpointKind {
+    /// 由 `define_topics!` 的 `prod`/`sub` 角色 token 构造（非 const，运行时用）。
+    pub fn from_role(s: &str) -> Self {
+        if s == "prod" { EndpointKind::Producer } else { EndpointKind::Consumer }
+    }
+}
+
+/// 把 `define_topics!` 的 `prod`/`sub` 角色 token 映射到 `EndpointKind` 变体。
+macro_rules! role_to_kind {
+    (prod) => { EndpointKind::Producer };
+    (sub)  => { EndpointKind::Consumer };
+}
+
+/// 固定大小端点名（无堆、零分配）。以 NUL 结尾的 ASCII 标签，最多 15 字符。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EndpointName {
+    bytes: [u8; 16],
+}
+
+impl EndpointName {
+    /// 由字符串构造；超长截断，不足补 NUL。非 ASCII 字符按字节拷贝（不校验）。
+    pub fn new(s: &str) -> Self {
+        let mut bytes = [0u8; 16];
+        let n = s.len().min(15);
+        bytes[..n].copy_from_slice(&s.as_bytes()[..n]);
+        Self { bytes }
+    }
+
+    /// 取回为 `&str`（截到首个 NUL）。
+    pub fn as_str(&self) -> &str {
+        let mut end = 0;
+        while end < self.bytes.len() && self.bytes[end] != 0 {
+            end += 1;
+        }
+        // 字节均为构造时拷贝的 ASCII/UTF-8 前缀，安全转 str。
+        core::str::from_utf8(&self.bytes[..end]).unwrap_or("")
+    }
+}
+
+/// 一个已登记的发布/订阅端点（运行时发现的单位）。
+///
+/// 与编译期主题注册表（`TopicId`）正交：**主题**描述"通道的静态类型契约"，
+/// **端点**描述"某个具名组件在某个主题上扮演的角色"。同一主题可有多个消费者端点
+/// （如 `est` 被 ctrl/fdir/mission/formation 四个组件订阅），运行时发现据此呈现拓扑。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Endpoint {
+    /// 所属主题（编译期注册表中的一项）。
+    pub topic: TopicId,
+    /// 端点角色（生产/消费）。
+    pub kind: EndpointKind,
+    /// 登记组件名（如 `"estimator"`、`"controller"`、`"fdir"`）。
+    pub component: EndpointName,
+}
+
+impl Endpoint {
+    /// 占位空端点（component 为空），用于缓冲初始化。
+    pub const fn empty() -> Self {
+        Self { topic: TopicId::Imu, kind: EndpointKind::Producer, component: EndpointName { bytes: [0u8; 16] } }
+    }
+}
+
+/// 运行时发布/订阅发现表（定容、零堆、无动态分配）。
+///
+/// 用法：
+/// - `Bus::discover()` 返回一张**静态拓扑**表——来自编译期 `TopicId::all()`，
+///   每个主题的 `topic`/`kind` 由注册表确定，`component` 暂置空（编译期未知组件身份）。
+/// - 组件启动时调用 [`Registry::register`] 登记自己的身份（如
+///   `reg.register(EstTopic::ID, EndpointKind::Producer, "estimator")`），
+///   把"主题 ↔ 组件角色"运行时化，供运维/自省/连通性检查枚举。
+#[derive(Debug, Clone, Copy)]
+pub struct Registry<const N: usize> {
+    slots: [Option<Endpoint>; N],
+}
+
+impl<const N: usize> Registry<N> {
+    /// 空表。
+    pub fn new() -> Self {
+        Self { slots: [None; N] }
+    }
+
+    /// 登记一个端点；同 (topic, kind, component) 重复登记被忽略（幂等）。
+    /// 容量耗尽返回 `Err(endpoint)`（不覆盖既有端点——发现表宁可丢新也不串台）。
+    pub fn register(&mut self, topic: TopicId, kind: EndpointKind, component: &str) -> Result<(), Endpoint> {
+        let ep = Endpoint { topic, kind, component: EndpointName::new(component) };
+        // 已存在则忽略（幂等）。
+        for s in self.slots.iter() {
+            if let Some(x) = s {
+                if *x == ep { return Ok(()); }
+            }
+        }
+        // 找空位。
+        for s in self.slots.iter_mut() {
+            if s.is_none() {
+                *s = Some(ep);
+                return Ok(());
+            }
+        }
+        Err(ep)
+    }
+
+    /// 已登记端点数。
+    pub fn count(&self) -> usize {
+        self.slots.iter().filter(|s| s.is_some()).count()
+    }
+
+    /// 某主题的全部端点（按槽位顺序，调用方提供缓冲或闭包遍历）。
+    /// 返回匹配数；`out` 不足则截断（不报错，发现表以"有界"为先）。
+    pub fn endpoints_of(&self, topic: TopicId, out: &mut [Endpoint]) -> usize {
+        let mut n = 0;
+        for s in self.slots.iter() {
+            if let Some(x) = s {
+                if x.topic == topic && n < out.len() {
+                    out[n] = *x;
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// 某组件登记的全部端点。
+    pub fn endpoints_of_component(&self, component: &str, out: &mut [Endpoint]) -> usize {
+        let name = EndpointName::new(component);
+        let mut n = 0;
+        for s in self.slots.iter() {
+            if let Some(x) = s {
+                if x.component == name && n < out.len() {
+                    out[n] = *x;
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    /// 遍历全部已登记端点（闭包）。
+    pub fn for_each(&self, mut f: impl FnMut(&Endpoint)) {
+        for s in self.slots.iter().flatten() {
+            f(s);
+        }
+    }
+}
+
+impl<const N: usize> Default for Registry<N> {
+    fn default() -> Self { Self::new() }
+}
+
 /// 飞行系统消息总线：聚合固定主题通道，并提供 est/imu 扇出与便捷访问。
 ///
 /// 主题（及容量）：
@@ -196,6 +355,10 @@ macro_rules! define_topics {
             type Payload: Copy;
             const CAP: usize;
             const QOS: QosKind;
+            /// 该主题在 `TopicId` 注册表中的枚举值（运行时发现用）。
+            const ID: TopicId;
+            /// 该主题的角色（生产/消费），来自宏的 `prod`/`sub` token。
+            const ROLE: EndpointKind;
         }
 
         /// 可发布主题（生产者端点）。
@@ -218,6 +381,8 @@ macro_rules! define_topics {
                 type Payload = $pty;
                 const CAP: usize = $cap;
                 const QOS: QosKind = QosKind::$qos;
+                const ID: TopicId = TopicId::$var;
+                const ROLE: EndpointKind = role_to_kind!($role);
             }
             impl PubTopic for $mark {
                 fn push(bus: &mut Bus, m: Self::Payload, ts: Second) -> Result<(), Self::Payload> {
@@ -236,9 +401,26 @@ macro_rules! define_topics {
         )*
 
         impl TopicId {
+            /// 主题总数（编译期常量），供 `Registry` 容量等定容结构使用。
+            pub const COUNT: usize = 0 $(+ { let _ = stringify!($var); 1 })*;
+
             /// 注册表全集（静态），用于计数/遍历/测试覆盖。
             pub fn all() -> &'static [TopicId] {
                 &[ $( TopicId::$var ),* ]
+            }
+
+            /// 该主题的静态角色（生产/消费），来自宏的 `prod`/`sub` token。
+            pub fn role(&self) -> EndpointKind {
+                match self {
+                    $( TopicId::$var => role_to_kind!($role), )*
+                }
+            }
+
+            /// 该主题的名字（变体标识），用于发现表的文本呈现（无堆）。
+            pub fn name(&self) -> &'static str {
+                match self {
+                    $( TopicId::$var => stringify!($var), )*
+                }
             }
         }
     };
@@ -285,6 +467,23 @@ impl Bus {
             est_to_ctrl: Ring::new(), est_to_fdir: Ring::new(),
             est_to_mission: Ring::new(), est_to_formation: Ring::new(),
         }
+    }
+
+    /// 发布/订阅运行时发现入口：返回一张**静态拓扑**表。
+    ///
+    /// 每个编译期主题登记为一个 `Endpoint`（`topic`/`kind` 来自注册表，`component` 暂置空——
+    /// 编译期无法得知"哪个具名组件"承担该角色）。组件启动后应调用 [`Registry::register`]
+    /// 把自己的身份补登，使拓扑从"通道契约"升级为"组件 ↔ 角色"的可枚举图。
+    ///
+    /// 返回容量 = 主题数 + 运行期余量（44 个槽），供组件启动后 `register` 补登身份
+    /// （同一主题可有多个消费者端点，如 `est` 被 ctrl/fdir/mission/formation 订阅）。
+    pub fn discover() -> Registry<{ TopicId::COUNT + 44 }> {
+        let mut reg = Registry::new();
+        for &t in TopicId::all() {
+            // 静态拓扑：component 留空（运行期由各组件 register 补全）。
+            let _ = reg.register(t, t.role(), "");
+        }
+        reg
     }
 
     /// 类型安全发布：载荷类型由主题 `T` 唯一确定；以总线当前时钟盖时间戳。
@@ -599,5 +798,77 @@ mod tests {
         assert_eq!(bus.pump_locked(&lock), 4);
         let got_est: VehicleState = bus.subscribe_locked::<EstToCtrlTopic, _>(&lock).unwrap().into_inner();
         assert_eq!(got_est.pos[2].0, -7.0);
+    }
+
+    // ---- 发布/订阅运行时发现 ----
+    #[test]
+    fn registry_static_topology_full() {
+        // Bus::discover 应覆盖全部主题（每个一条端点，component 留空）。
+        let reg = Bus::discover();
+        assert_eq!(reg.count(), TopicId::all().len());
+        assert_eq!(reg.count(), 20);
+
+        // 生产者/消费者角色应正确反映宏定义（8 prod + 12 sub）。
+        let mut prod = 0;
+        let mut sub = 0;
+        reg.for_each(|e| match e.kind {
+            EndpointKind::Producer => prod += 1,
+            EndpointKind::Consumer => sub += 1,
+        });
+        assert_eq!(prod, 8);
+        assert_eq!(sub, 12);
+    }
+
+    #[test]
+    fn registry_role_matches_topic() {
+        // 任一主题的端点角色须等于 TopicId::role()。
+        let reg = Bus::discover();
+        let mut buf = [Endpoint::empty(); 4];
+        for &t in TopicId::all() {
+            let n = reg.endpoints_of(t, &mut buf);
+            assert_eq!(n, 1);
+            assert_eq!(buf[0].kind, t.role());
+            assert_eq!(buf[0].topic, t);
+        }
+    }
+
+    #[test]
+    fn registry_runtime_registration() {
+        // 组件启动后补登身份：把"编译期角色"升级为"组件 ↔ 角色"图。
+        let mut reg = Bus::discover();
+        let cap_before = reg.count();
+        assert!(reg.register(TopicId::Est, EndpointKind::Producer, "estimator").is_ok());
+        assert!(reg.register(TopicId::EstToCtrl, EndpointKind::Consumer, "controller").is_ok());
+        assert!(reg.register(TopicId::EstToFdir, EndpointKind::Consumer, "fdir").is_ok());
+        assert!(reg.register(TopicId::EstToMission, EndpointKind::Consumer, "mission").is_ok());
+        // 幂等：重复登记同一条被忽略（计数不变）。
+        assert!(reg.register(TopicId::Est, EndpointKind::Producer, "estimator").is_ok());
+        assert_eq!(reg.count(), cap_before + 4);
+
+        // 按组件枚举：estimator 应只挂了 Est 这一条生产端点。
+        let mut buf = [Endpoint::empty(); 8];
+        let n = reg.endpoints_of_component("estimator", &mut buf);
+        assert_eq!(n, 1);
+        assert_eq!(buf[0].topic, TopicId::Est);
+        assert_eq!(buf[0].component.as_str(), "estimator");
+
+        // 按主题枚举：Est 现在应有 2 条端点——静态拓扑那条（component 空）+ 运行时 estimator 那条。
+        let n2 = reg.endpoints_of(TopicId::Est, &mut buf);
+        assert_eq!(n2, 2);
+        let has_estimator = buf[..n2].iter().any(|e| e.component.as_str() == "estimator" && e.kind == EndpointKind::Producer);
+        assert!(has_estimator);
+        assert_eq!(reg.count(), cap_before + 4);
+    }
+
+    #[test]
+    fn registry_capacity_full_rejects() {
+        // 定容 registry：超过容量后 register 返回 Err（不覆盖既有端点）。
+        let mut reg: Registry<2> = Registry::new();
+        assert!(reg.register(TopicId::Est, EndpointKind::Producer, "a").is_ok());
+        assert!(reg.register(TopicId::Imu, EndpointKind::Producer, "b").is_ok());
+        // 第 3 条溢出 → Err，且原两条不变。
+        let r = reg.register(TopicId::Gps, EndpointKind::Producer, "c");
+        assert!(r.is_err());
+        assert_eq!(reg.count(), 2);
     }
 }

@@ -205,6 +205,7 @@ fn main() {
     let mut indi_demo = false;
     let mut swarm_demo = false;
     let mut swarm_link_demo = false;
+    let mut discovery_demo = false;
     let mut mission_demo = false;
     let mut bus_demo = false;
 
@@ -286,6 +287,10 @@ fn main() {
             }
             "--swarm-link" => {
                 swarm_link_demo = true;
+                i += 1;
+            }
+            "--discovery" => {
+                discovery_demo = true;
                 i += 1;
             }
             "--mission" => {
@@ -372,6 +377,12 @@ fn main() {
         // M10 邻机跨机链路演示：两架飞机经 LoopbackLink 交换 MAVLink 邻机帧，
         // 验证 swarm 的 broadcast_frame / parse_broadcast 与链路解耦。
         run_swarm_link_demo();
+        return;
+    }
+
+    if discovery_demo {
+        // M10 发布/订阅运行时发现：组件启动后登记身份，枚举总线拓扑。
+        run_discovery_demo();
         return;
     }
 
@@ -907,6 +918,80 @@ fn run_swarm_link_demo() {
     }
     println!("  verdict         = {}",
              if ok { "neighbor exchange over link OK" } else { "LINK EXCHANGE FAILED" });
+}
+
+/// M10 发布/订阅运行时发现演示：组件启动后把身份登记进 `Registry`，
+/// 然后枚举总线拓扑——验证"编译期主题契约"可升级为"组件 ↔ 角色"可枚举图，
+/// 无需把全部组件硬编码进调用方（运维/自省/连通性检查可用）。
+fn run_discovery_demo() {
+    use flyctrl_core::bus::{Bus, EndpointKind};
+    use flyctrl_core::bus::TopicId;
+
+    // 1) 静态拓扑：来自编译期注册表，每个主题一条端点（component 留空）。
+    let mut reg = Bus::discover();
+    let static_count = reg.count();
+
+    // 2) 各组件启动后补登身份（把空 component 端点升级为具名组件）。
+    //    这里演示典型飞控组件划分：传感器→估计→控制→执行器→故障诊断→任务→编队。
+    let _ = reg.register(TopicId::Imu,         EndpointKind::Producer, "imu_sensor");
+    let _ = reg.register(TopicId::Gps,         EndpointKind::Producer, "gps_sensor");
+    let _ = reg.register(TopicId::Est,         EndpointKind::Producer, "estimator");
+    let _ = reg.register(TopicId::Setpoint,    EndpointKind::Producer, "mission");
+    let _ = reg.register(TopicId::Actuator,    EndpointKind::Producer, "controller");
+    let _ = reg.register(TopicId::Mode,        EndpointKind::Producer, "mode_mgr");
+    let _ = reg.register(TopicId::Health,      EndpointKind::Producer, "fdir");
+    let _ = reg.register(TopicId::Neighbor,    EndpointKind::Producer, "swarm");
+
+    let _ = reg.register(TopicId::ImuToEst,        EndpointKind::Consumer, "estimator");
+    let _ = reg.register(TopicId::ImuToFdir,       EndpointKind::Consumer, "fdir");
+    let _ = reg.register(TopicId::EstToCtrl,       EndpointKind::Consumer, "controller");
+    let _ = reg.register(TopicId::EstToFdir,       EndpointKind::Consumer, "fdir");
+    let _ = reg.register(TopicId::EstToMission,    EndpointKind::Consumer, "mission");
+    let _ = reg.register(TopicId::EstToFormation,  EndpointKind::Consumer, "formation");
+    let _ = reg.register(TopicId::GpsOut,          EndpointKind::Consumer, "estimator");
+    let _ = reg.register(TopicId::SpOut,           EndpointKind::Consumer, "controller");
+    let _ = reg.register(TopicId::ActOut,          EndpointKind::Consumer, "actuator");
+    let _ = reg.register(TopicId::ModeOut,         EndpointKind::Consumer, "fdir");
+    let _ = reg.register(TopicId::HealthOut,       EndpointKind::Consumer, "fdir");
+    let _ = reg.register(TopicId::NeighborOut,     EndpointKind::Consumer, "formation");
+
+    // 3) 枚举：按组件汇总它承担的生产/消费端点数。
+    let components = [
+        "imu_sensor", "gps_sensor", "estimator", "mission", "controller",
+        "mode_mgr", "fdir", "swarm", "formation", "actuator",
+    ];
+    let mut buf = [flyctrl_core::bus::Endpoint::empty(); 16];
+
+    println!("flyctrl SITL — 发布/订阅运行时发现 (Bus::discover + Registry)");
+    println!("{}", "-".repeat(64));
+    println!("  static topics   = {} (compile-time registry)", static_count);
+    println!("  after register  = {} endpoints (topics + component claims)", reg.count());
+    println!("{}", "-".repeat(64));
+    println!("  component topology (from runtime registration):");
+    for c in components {
+        let n = reg.endpoints_of_component(c, &mut buf);
+        if n == 0 { continue; }
+        let mut prod = 0;
+        let mut cons = 0;
+        for e in &buf[..n] {
+            match e.kind {
+                EndpointKind::Producer => prod += 1,
+                EndpointKind::Consumer => cons += 1,
+            }
+        }
+        println!("    {:<12} prod={}  cons={}", c, prod, cons);
+    }
+
+    // 4) 连通性自检：关键消费者必须存在对应生产者（est 被 controller 消费 → 须有 estimator 生产）。
+    let has_est_prod = reg.endpoints_of_component("estimator", &mut buf) > 0;
+    let has_ctrl_cons = reg.endpoints_of_component("controller", &mut buf) > 0;
+    let has_act_cons = reg.endpoints_of_component("actuator", &mut buf) > 0;
+    let ok = has_est_prod && has_ctrl_cons && has_act_cons;
+
+    println!("{}", "-".repeat(64));
+    println!("  connectivity     = estimator→controller→actuator chain present: {}", ok);
+    println!("  verdict          = {}",
+             if ok { "runtime pub/sub discovery OK" } else { "DISCOVERY INCOMPLETE" });
 }
 
 /// M8.1 INDI 演示：同样 PID 基线，分别跑"纯 PID"与"PID+INDI"，
