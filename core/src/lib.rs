@@ -16,5 +16,7 @@ pub mod config;
 pub mod estimator;
 pub mod controller;
 pub mod fdir;
+pub mod hil;
+pub mod invariants;
 pub mod hal;
 pub mod comm;

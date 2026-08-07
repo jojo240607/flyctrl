@@ -105,6 +105,11 @@ impl EkfEstimator {
     pub fn gyro_bias(&self) -> [f32; 3] {
         [self.x[6], self.x[7], self.x[8]]
     }
+
+    /// 当前协方差矩阵（9x9 行主序）引用，供不变量校验（对称半正定）使用。
+    pub fn cov(&self) -> &[f32; N * N] {
+        &self.p
+    }
 }
 
 impl Estimator for EkfEstimator {
@@ -178,6 +183,17 @@ impl Estimator for EkfEstimator {
         for i in 6..9 {
             p_pred[i * N + i] += qb;
         }
+        // 对称化 + 对角线下限夹取（预测步也需保持 PSD）。
+        for i in 0..N {
+            for j in (i + 1)..N {
+                let avg = 0.5 * (p_pred[i * N + j] + p_pred[j * N + i]);
+                p_pred[i * N + j] = avg;
+                p_pred[j * N + i] = avg;
+            }
+            if p_pred[i * N + i] < 1e-6 {
+                p_pred[i * N + i] = 1e-6;
+            }
+        }
         self.p = p_pred;
 
         // 观测更新（位置）：H = [I3 0 0]
@@ -230,21 +246,48 @@ impl Estimator for EkfEstimator {
                 self.x[i] += corr;
             }
 
-            // P = (I - K H) P = P - K*(H P)
-            let mut hp = [0.0f32; 27]; // 3 x 9
-            for i in 0..3 {
+            // P 更新用 Joseph 形式：P = (I - K H) P (I - K H)^T + K R K^T
+            // Joseph 形式在浮点下保持对称半正定（<=> 真实方差），
+            // 避免朴素 P = (I-KH)P 在数值误差下出现负对角元/非对称。
+            // 1) A = I - K H （9x9，H 仅前三行非零）
+            let mut a = [0.0f32; N * N];
+            for i in 0..N {
                 for j in 0..N {
-                    hp[i * N + j] = self.p[i * N + j];
+                    let kh = if j < 3 { k[i * 3 + j] } else { 0.0 }; // (K H)[i][j] = K[i][j] (j<3)
+                    a[i * N + j] = if i == j { 1.0 - kh } else { -kh };
                 }
             }
-            let mut khp = [0.0f32; N * N];
-            mat_mul(&k, &hp, &mut khp, N, 3, N);
-            let mut p_new = [0.0f32; N * N];
-            mat_add(&self.p, &khp, &mut p_new, N * N);
-            for i in 0..(N * N) {
-                p_new[i] = self.p[i] - khp[i];
+            // 2) A P A^T
+            let mut ap = [0.0f32; N * N];
+            mat_mul(&a, &self.p, &mut ap, N, N, N);
+            let mut apat = [0.0f32; N * N];
+            mat_mul_at(&ap, &a, &mut apat, N, N, N);
+            // 3) K R K^T （R = r_pos * I3）
+            let mut krkt = [0.0f32; N * N];
+            for i in 0..N {
+                for j in 0..N {
+                    let mut acc = 0.0;
+                    for l in 0..3 {
+                        acc += k[i * 3 + l] * k[j * 3 + l];
+                    }
+                    krkt[i * N + j] = acc * self.r_pos;
+                }
             }
-            self.p = p_new;
+            // 4) P = A P A^T + K R K^T，并对称化（消除尾差）
+            for i in 0..(N * N) {
+                self.p[i] = apat[i] + krkt[i];
+            }
+            for i in 0..N {
+                for j in (i + 1)..N {
+                    let avg = 0.5 * (self.p[i * N + j] + self.p[j * N + i]);
+                    self.p[i * N + j] = avg;
+                    self.p[j * N + i] = avg;
+                }
+                // 对角线下限夹取，杜绝负方差。
+                if self.p[i * N + i] < 1e-6 {
+                    self.p[i * N + i] = 1e-6;
+                }
+            }
         }
 
         VehicleState {

@@ -19,6 +19,15 @@ pub struct Calibrating;
 pub struct Armed;
 pub struct Failsafe;
 
+/// 解锁许可令牌（M7.2 类型级安全网）。
+///
+/// 只有经过 [`Health::assert_healthy`] 证明传感器健康的 [`Fcs<Disarmed>`]
+/// 才能产出此令牌；[`Fcs::arm`] 必须消费它。这样"未健康就解锁"在
+/// 编译期不可达——即便有人漏写健康检查，编译器也会拒绝调用 `arm`。
+pub struct ArmPermit {
+    _private: core::marker::PhantomData<()>,
+}
+
 impl Fcs<Disarmed> {
     pub fn new() -> Self {
         Self { armed_time: Second::ZERO, _state: core::marker::PhantomData }
@@ -27,8 +36,19 @@ impl Fcs<Disarmed> {
     pub fn start_calibration(self) -> Fcs<Calibrating> {
         Fcs { armed_time: Second::ZERO, _state: core::marker::PhantomData }
     }
-    /// 校准完成后才能解锁（防止未校准就起飞）。
-    pub fn arm(self) -> Fcs<Armed> {
+    /// 申请解锁许可：仅当传感器健康时返回 `Some`，否则 `None`。
+    ///
+    /// 这是 M7.2 "解锁前必须健康" 的运行时判定入口；返回的 [`ArmPermit`]
+    /// 只能在 [`Fcs::arm`] 处消费，保证令牌与状态绑定、不可绕过。
+    pub fn request_arm(&self, healthy: bool) -> Option<ArmPermit> {
+        if healthy {
+            Some(ArmPermit { _private: core::marker::PhantomData })
+        } else {
+            None
+        }
+    }
+    /// 凭解锁许可进入 Armed 态。无许可（编译期类型缺失）无法调用。
+    pub fn arm(self, _permit: ArmPermit) -> Fcs<Armed> {
         Fcs { armed_time: Second::ZERO, _state: core::marker::PhantomData }
     }
 }

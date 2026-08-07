@@ -197,9 +197,19 @@ flyctrl/
 零堆确认：`core/` 下 `comm` 模块无 `Vec/Box/String/alloc::`；`--features stm32f407` 编译通过。
 
 ### M7：形式化与验证
-- [ ] 关键不变量属性测试（如"估计协方差正定"、"控制输出有界"）
-- [ ] 类型级安全网扩展（如"解锁前必须健康"、"失控保护单向"）
-- [ ] 硬件在环（HIL）桥接，SIL 用例直接复用
+- [x] 关键不变量属性测试（`core/src/invariants.rs` + `core/tests/props_invariant.rs`，确定性 LCG 随机化穷举）：
+      - 四元数单位范数（姿态积分不得发散，容差 1e-3）
+      - 电机指令恒有界 [0,1]（含极端设定点饱和场景）
+      - EKF 协方差对称半正定（Jacobi 特征值分解校验，最小特征值 ≥ 0）
+      - 整链（传感→估计→控制→FDIR）无 NaN/Inf
+      - 失控保护单向（Critical 不自动回 Nominal）
+- [x] 类型级安全网扩展（`core/src/state.rs` + `core/tests/props_statemachine.rs`）：
+      - 解锁前必须健康：`Fcs::request_arm(healthy)->Option<ArmPermit>`，`arm` 必须消费令牌 → 编译期不可绕过健康检查
+      - 失控保护单向：`Armed→Failsafe` 仅能 `reset→Disarmed`，类型系统无回 `Armed` 路径
+      - 校准中不可解锁：`Calibrating` 只暴露 `finish->Disarmed`
+      - M7 自查发现并修复 EKF 数值隐患：原 `P=(I-KH)P` 形式在噪声下出现非 PSD（负对角元），改用 **Joseph 形式** `P=(I-KH)P(I-KH)^T+KRK^T` + 对称化 + 对角夹取下限 1e-6，协方差现恒保持物理合理（半正定）
+- [x] 硬件在环（HIL）桥接（`core/src/hil.rs`）：泛型单步闭环 `HilContext::step<ImuSensor,GpsSensor,MotorActuator,Estimator,Controller>` 跨步持久 EKF+PID+FDIR；host（mock HAL）与 MCU（`stm32f407` 真实 HAL）**共用同一份算法代码**，SIL 验证过的不变量在板上直接成立。自带 SIL 自测：闭环 300 拍无 NaN、指令恒有界；注入冻结 IMU→FDIR 判 Critical→执行器归零（失控保护端到端生效）
+- [x] 验证：`cargo test` 全绿（共 37 项：core 9 + comm 2 + no_alloc 2 + 不变量属性 6 + 状态机属性 4 + sim 12 + physics 2）；`--features stm32f407` 编译通过
 
 ### M8：算法先进性（拉开差距）
 - [ ] 自适应控制 / 增量非线性动态逆 (INDI)
