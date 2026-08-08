@@ -214,7 +214,7 @@ fn prop_fdir_critical_is_one_way() {
     };
     let mut saw_critical = false;
     for _ in 0..100 {
-        let h = fdir.update(&frozen, true); // 位置可用但 IMU 冻结
+        let h = fdir.update(&frozen, true, true, true); // 位置可用但 IMU 冻结
         if h == flyctrl_core::fdir::Health::Critical {
             saw_critical = true;
         }

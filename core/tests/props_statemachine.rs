@@ -65,7 +65,7 @@ fn prop_fdir_health_gates_permit() {
     let mut healthy = false;
     for step in 0..50 {
         imu.accel[0] = MeterPerSecondSquared((step as f32) * 1e-4); // 让 IMU 不冻结
-        let h = fdir.update(&imu, true);
+        let h = fdir.update(&imu, true, true, true);
         if h == flyctrl_core::fdir::Health::Nominal {
             healthy = true;
         }

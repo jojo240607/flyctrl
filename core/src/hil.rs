@@ -77,7 +77,7 @@ where
         let est_state = self.est.step(self.dt, sample, pos);
 
         // 3) FDIR 健康监控（基于 IMU 冻结 + GPS dropout）。
-        let health = self.fdir.update(&sample, pos_available);
+        let health = self.fdir.update(&sample, pos_available, true, true);
 
         // 4) 控制。
         let raw_cmd = self.ctrl.control(self.dt, setpoint, &est_state);
@@ -161,11 +161,11 @@ mod tests {
         };
         // 直接喂固定帧（绕过 mock 振荡）以触发冻结检测。
         for _ in 0..30 {
-            let _ = ctx.fdir.update(&frozen, true);
+            let _ = ctx.fdir.update(&frozen, true, true, true);
             // 用冻结样本走一步（mock 已 unhealthy，read 仍返回振荡；这里单独验证裁决）。
         }
         // 走一步并确认：若 FDIR 已 Critical，motors 应被 disarm。
-        ctx.fdir.update(&frozen, true);
+        ctx.fdir.update(&frozen, true, true, true);
         // 手动复现裁决逻辑（与 step 内一致）。
         use crate::fdir::Health;
         if ctx.fdir.health() == Health::Critical {

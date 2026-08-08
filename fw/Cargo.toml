@@ -16,6 +16,8 @@ cortex-m = "0.7"
 cortex-m-rt = "0.7"
 # 提供临界区实现（PRIMASK 开关），供 `Peripherals::take()` / interrupt::free 使用。
 critical-section = { version = "1", features = ["restore-state-u8"] }
+# 数学函数（sinf/cosf），供板载主循环占位 IMU 注入等使用。
+libm = "0.2"
 
 [profile.release]
 opt-level = "z"

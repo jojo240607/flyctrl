@@ -103,6 +103,7 @@ dependencies = [
  "cortex-m-rt",
  "critical-section",
  "flyctrl-core",
+ "libm",
  "stm32f4",
 ]
 

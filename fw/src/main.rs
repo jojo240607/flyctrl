@@ -16,9 +16,11 @@ use core::panic::PanicInfo;
 use stm32f4::stm32f407::{interrupt, Peripherals};
 
 use flyctrl_core::comm::link::Link;
+use flyctrl_core::comm::mavlink::{self, msg_id};
 use flyctrl_core::hal::stm32f407::{clock_init, usart2_isr, UartLink, PwmEsc};
 use flyctrl_core::bus::Bus;
-use flyctrl_core::vehicle::ActuatorCmd;
+use flyctrl_core::fdir::{Fdir, RtlHome};
+use flyctrl_core::vehicle::{ActuatorCmd, ImuSample, MeterPerSecondSquared, Ned, RadianPerSecond, VehicleState};
 use flyctrl_core::units::Second;
 
 /// 控制环路周期（ms）。400Hz 与 PWM 同频。
@@ -71,24 +73,87 @@ fn main() -> ! {
     let _registry = Bus::discover();
     let _ = &_registry;
 
-    // 4) 主控制环路
-    loop {
-        // 4a) 收链路帧 → 注入总线
-        let _frame = link.recv_frame();
-        // 真实固件：解析 MAVLink → bus.publish_rc(...) / bus.publish_setpoint(...)
+    // 4) 板载飞行控制闭环（不依赖 RTOS；RTOS 就绪后此循环整体搬入任务即可）：
+    //    FDIR 健康监控 + RTL home 记忆 + MAVLink 遥测下行 + 指令解析。
+    let mut fdir = Fdir::new();
+    let mut rtl_home = RtlHome::new();
+    let state = VehicleState::zero();
+    let mut seq: u8 = 0;
+    let mut armed = false;
+    let mut mode: u8 = 0; // 自定义飞行模式码（与 flightmode::FlightMode 对齐）
+    let mut frame_buf = [0u8; flyctrl_core::comm::link::MAX_FRAME_LEN];
 
-        // 4b) 推进总线时间并抽取消息
+    loop {
+        // 4a) 收链路帧 → 解析 MAVLink 指令（解锁 / 模式切换 / 参数等）
+        let rx = link.recv_frame();
+        if let Some((id, payload)) = mavlink::decode(&rx) {
+            match id {
+                msg_id::COMMAND_LONG => {
+                    if let Some(cmd) = mavlink::decode_command_long(payload) {
+                        use flyctrl_core::comm::mavlink::enums;
+                        match cmd.command {
+                            // 解锁 / 上锁（param1: 1=arm, 0=disarm）
+                            c if c == enums::MAV_CMD_COMPONENT_ARM_DISARM => {
+                                armed = cmd.params[0] as i32 == 1;
+                            }
+                            // SET_MODE：param1 为目标自定义模式
+                            c if c == enums::MAV_CMD_DO_SET_MODE => {
+                                mode = cmd.params[0] as u8;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // 4b) 占位 IMU 样本（真实传感器接入后替换）：用零加速度 + 平滑姿态导数，
+        //     每拍注入微小变化避免 FDIR 误判 IMU 冻结（真实 IMU 含噪声）。
+        let t = (seq as f32) * (LOOP_MS as f32) / 1000.0;
+        let imu = ImuSample {
+            accel: [
+                MeterPerSecondSquared(0.01 * libm::sinf(t)),
+                MeterPerSecondSquared(0.0),
+                MeterPerSecondSquared(9.8 + 0.01 * libm::cosf(t)),
+            ],
+            gyro: [RadianPerSecond(0.0); 3],
+        };
+        // GPS 可用性占位：始终可用（真实为 GNSS 驱动 / 总线 est 位置质量）。
+        let gps_ok = true;
+        let baro_ok = true;
+        let mag_ok = true;
+        let health = fdir.update(&imu, gps_ok, baro_ok, mag_ok);
+
+        // 4c) RTL home 记忆：首次定位即锁定起飞点
+        if gps_ok && !rtl_home.locked {
+            let home = Ned::new(state.pos[0].0, state.pos[1].0, state.pos[2].0);
+            let _ = rtl_home.try_lock(home);
+        }
+
+        // 4d) 推进总线时间并抽取消息
         bus.tick(Second((LOOP_MS as f32) / 1000.0));
         bus.pump();
 
-        // 4c) 控制律（最简：零油门演示，真实为 EKF+LQR/INDI）
+        // 4e) 控制律（最简：零油门演示，真实为 EKF+LQR/INDI + FDIR 降级处理）
         let cmd = ActuatorCmd::zero();
         let _ = bus.publish_actuator(cmd);
 
-        // 4d) 输出 PWM（演示：四路最低油门，真实应写 cmd.motor）
+        // 4f) 输出 PWM（演示：四路最低油门，真实应写 cmd.motor）
         pwm.write_norm([0.0; 4]);
 
-        // 4e) 节拍延时（裸机忙等，避免引入完整 SysTick 中断处理）
+        // 4g) 遥测下行：HEARTBEAT + LOCAL_POSITION_NED（标准 MAVLink，QGC 可解析）
+        let n = mavlink::encode_heartbeat(mode, armed, seq, &mut frame_buf);
+        link.send_frame(&flyctrl_core::comm::link::Frame::from_bytes(&frame_buf[..n]));
+        let n = mavlink::encode_local_pos_from(mavlink::SYS_ID, &state, seq, &mut frame_buf);
+        link.send_frame(&flyctrl_core::comm::link::Frame::from_bytes(&frame_buf[..n]));
+        // 健康异常时额外上报 SYS_STATUS（占位：全传感器 OK）
+        let n = mavlink::encode_sys_status(health != flyctrl_core::fdir::Health::Critical, seq, &mut frame_buf);
+        link.send_frame(&flyctrl_core::comm::link::Frame::from_bytes(&frame_buf[..n]));
+
+        seq = seq.wrapping_add(1);
+
+        // 4h) 节拍延时（裸机忙等，避免引入完整 SysTick 中断处理）
         delay_ms(LOOP_MS);
     }
 }

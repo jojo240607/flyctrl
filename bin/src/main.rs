@@ -127,7 +127,7 @@ fn run_combo(
             Some((t0, t1)) => !(t >= t0 && t < t1),
             None => true,
         };
-        let health = fdir_state.update(&imu, gps_available);
+        let health = fdir_state.update(&imu, gps_available, true, true);
         // 降级（GPS 丢失）或无 GPS 可用性时，估计器忽略位置测量
         let gps = if gps_available { gps_true } else { None };
 
@@ -810,7 +810,7 @@ fn run_comm_demo(scenario: &Scenario, seconds: f32) {
         let (imu, gps_true) = world.sense(dt, ideal, s.pos);
         let est = ekf.step(dt, imu, gps_true);
         cmd = mpc.control(dt, &sp, &est);
-        let _h = fdir.update(&imu, gps_true.is_some());
+        let _h = fdir.update(&imu, gps_true.is_some(), true, true);
 
         // 组帧 → 经链路发出
         telem.update((dt.0 * 1000.0) as u32, &est, fdir.health() == flyctrl_core::fdir::Health::Nominal);
@@ -1358,7 +1358,7 @@ fn run_bus_demo(seconds: f32) {
         // ④ FDIR 节点：消费 est_fdir + imu + GPS 可用性 → 发布 health
         if let (Some(est_f), Some(imu_f)) = (bus.recv_est_fdir(), bus.recv_imu_fdir()) {
             let _ = imu_f; // 冻结检测在 Fdir::update 内部比对加速度
-            let h = fdir.update(&imu, gps_avail);
+            let h = fdir.update(&imu, gps_avail, true, true);
             let _ = bus.publish_health(h);
             let _ = est_f;
         }

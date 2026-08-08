@@ -81,6 +81,27 @@ impl VehicleState {
     }
 }
 
+/// NED 位置（北-X，东-Y，下-Z，右手系），单位 m。
+///
+/// 封装 `[Meter; 3]` 以明确 NED 语义，供估计器、FDIR、RTL 等模块统一使用。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Ned(pub [Meter; 3]);
+
+impl Ned {
+    pub fn origin() -> Self {
+        Ned([Meter::ZERO, Meter::ZERO, Meter::ZERO])
+    }
+    pub fn new(n: f32, e: f32, d: f32) -> Self {
+        Ned([Meter(n), Meter(e), Meter(d)])
+    }
+    /// 水平距离（忽略 D 分量），单位 m。
+    pub fn horizontal(&self, other: Ned) -> f32 {
+        let dn = self.0[0].0 - other.0[0].0;
+        let de = self.0[1].0 - other.0[1].0;
+        libm::sqrtf(dn * dn + de * de)
+    }
+}
+
 /// IMU 原始测量（含噪声由 world 层注入，这里只描述"干净值"语义）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ImuSample {

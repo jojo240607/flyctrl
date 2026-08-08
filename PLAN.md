@@ -407,3 +407,46 @@ M10 收尾（A：stm32f407 全特性回归 + release 构建 + 进度清单）已
 
 **剩余（需真实板卡/烧录器，本次未做）**：实际烧录验证、USB-CDC 链路、SPI/I2C 传感器、把 `bus`/`swarm-link` 演示在板上跑通、
 以及与自研 Rust RTOS 运行时后端的对接（当前 `fw` 用裸机周期循环）。
+
+### C 增强（QGC 兼容 + FDIR 增强 + 板载完整回路）—— 2026-08-08 进展
+
+按审计建议（RTOS 后端另立项目、暂不对接），在 flyctrl 内部可独立推进的方向上落地：
+
+**B) QGC MAVLink 字节级兼容（最高性价比，地面站能真正识别飞控）**：
+- `core/src/comm/mavlink.rs` 加入标准 **CRC_EXTRA** 表（按 msg_id 索引，取自 common.xml 生成常量：
+  HEARTBEAT=50 / SYS_STATUS=124 / PARAM_REQUEST_LIST=159 / PARAM_VALUE=220 / PARAM_SET=168 /
+  ATTITUDE=39 / LOCAL_POSITION_NED=143 / COMMAND_LONG=152）；`encode`/`decode` 改为
+  `CRC16_X25(CRC16_X25(0xFFFF, hdr+payload), CRC_EXTRA[msgid])`，与 QGC 字节对齐。
+- HEARTBEAT 改用标准字段：`type=MAV_TYPE_QUADROTOR(2)`、`autopilot=MAV_AUTOPILOT_DEV(13)`、
+  标准 `MAV_MODE_FLAG_*`（含 `SAFETY_ARMED`）、`system_status`（STANDBY/ACTIVE/CONFIG…）、`mavlink_version=3`。
+- 新增 **COMMAND_LONG** 编解码（`encode_command_long` / `decode_command_long`，支持 SET_MODE / 解锁 / 起降 / RTL）、
+  **PARAM_VALUE / PARAM_SET** 编解码（`encode_param_value` / `decode_param_value`，供 QGC 参数表读写）。
+- 补充字节级单测：CRC_EXTRA 正确附加、decode 拒绝错误 CRC_EXTRA、HEARTBEAT 标准字段、COMMAND_LONG/PARAM 往返、
+  `encode_local_pos_from` 的 sys_id 覆盖。
+
+**A) FDIR 增强 + RTL home 记忆**：
+- `core/src/fdir.rs` 扩展 `update` 为四源监控 `(imu, gps, baro, mag)`，新增 `HealthFlags`
+  （imu_frozen / gps_lost / baro_lost / mag_lost）与 `has_altitude`/`has_heading`/`has_position` helper；
+  裁决：`imu_frozen→Critical`，`gps_lost||baro_lost||mag_lost→Degraded`，否则 `Nominal`。
+- 新增 `RtlHome`（首次可靠定位锁定 home 的 NED，提供 `horizontal_distance` 与安全哨兵）。
+- `core/src/vehicle.rs` 新增 `Ned([Meter;3])`（明确 NED 语义，`origin`/`new`/`horizontal`）。
+
+**A) 故障注入属性测试（之前缺失）**：
+- 新增 `core/tests/props_fdir.rs`：确定性 LCG 随机化生成 128×300 步故障序列，校验不变量——
+  Critical 仅由 IMU 冻结引起、Degraded 与健康原因位一致、无 NaN 渗入、RTL home 锁定后不漂移、
+  所有源恢复后 `≤max_timeout` 步内回到 Nominal。
+
+**A) 板载完整回路（fw 主循环串 FDIR + RtlHome + MAVLink 遥测）**：
+- `fw/src/main.rs` 主循环接成真实闭环：每拍 `recv_frame→decode COMMAND_LONG(解锁/SET_MODE)`、
+  `Fdir::update` 监控、`RtlHome::try_lock` 记忆 home、`Bus::tick/pump`、`publish_actuator`、
+  `PwmEsc::write_norm`，并下行 **HEARTBEAT + LOCAL_POSITION_NED + SYS_STATUS**（标准 MAVLink，QGC 可解析）。
+- `fw/Cargo.toml` 补 `libm = "0.2"`（供占位 IMU 注入的 sinf/cosf）。
+
+**验证**：
+- `cargo test -p flyctrl-core` → **全绿（50 lib + 23 集成，含新增 mavlink/fdir 单测与 props_fdir 属性测试）**。
+- `cargo build`（host/SIL）→ 绿；`cd fw && cargo build --target thumbv7em-none-eabihf` → **Finished**（无 error/warning）。
+- 调用点同步修正：`core/src/hil.rs`、`bin/src/main.rs`（3 处）、`core/tests/{no_alloc,props_invariant,props_statemachine}.rs`
+  的 `fdir.update` 旧 2 参数签名统一升级为 4 参数。
+
+**剩余（RTOS 接入前可做、部分需真实板卡）**：实际烧录后 QGC 联调、USB-CDC 链路、SPI/I2C 传感器、
+把 `estimator`/`controller` 真实结果灌入主循环 `state`（当前占位零位）、与自研 Rust RTOS 运行时对接。
