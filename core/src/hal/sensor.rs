@@ -9,7 +9,7 @@
 //!   真实 PAC 接入时替换内部寄存器访问即可，算法层零改动）。
 
 use crate::units::*;
-use crate::vehicle::{ImuSample, PosSample};
+use crate::vehicle::{ImuSample, PosSample, RcInput};
 
 /// IMU（陀螺 + 加速度计）传感器。
 pub trait ImuSensor {
@@ -38,6 +38,14 @@ pub trait BaroSensor {
 pub trait MagSensor {
     /// 读取机体系磁场向量（任意单位，归一化用）。
     fn read(&mut self) -> [f32; 3];
+    fn healthy(&self) -> bool;
+}
+
+/// 遥控接收机（SBUS / PPM / CRSF 等）。输出已归一化的 [`RcInput`]。
+pub trait RcReceiver {
+    /// 读取最新一帧遥控指令；链路丢帧时 `RcInput.fresh` 为 false。
+    fn read(&mut self) -> RcInput;
+    /// 自检测。
     fn healthy(&self) -> bool;
 }
 

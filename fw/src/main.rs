@@ -139,8 +139,13 @@ fn main() -> ! {
         let cmd = ActuatorCmd::zero();
         let _ = bus.publish_actuator(cmd);
 
-        // 4f) 输出 PWM（演示：四路最低油门，真实应写 cmd.motor）
-        pwm.write_norm([0.0; 4]);
+        // 4f) 输出 PWM：未解锁时强制最低油门（安全），解锁后映射控制律推力。
+        //     控制律将真实推力写入 cmd.motor（0.0..=1.0），此处直接落到 TIM3 四路。
+        if armed {
+            pwm.write_norm(cmd.motor);
+        } else {
+            pwm.write_norm([0.0; 4]);
+        }
 
         // 4g) 遥测下行：HEARTBEAT + LOCAL_POSITION_NED（标准 MAVLink，QGC 可解析）
         let n = mavlink::encode_heartbeat(mode, armed, seq, &mut frame_buf);

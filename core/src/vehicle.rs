@@ -126,6 +126,43 @@ impl ActuatorCmd {
     pub fn zero() -> Self { Self { motor: [0.0; 4] } }
 }
 
+/// 遥控接收机解算后的归一化指令。
+///
+/// 所有通道已归一化到 `[-1, 1]`（油门 `[0, 1]`），摇杆中位为 0。
+/// 由 Rust 应用层的 RC 驱动（SBUS/PPM/CRSF 等）解析后产出，控制律直接消费。
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct RcInput {
+    /// 副翼（右移为正，roll）。
+    pub roll: f32,
+    /// 升降（后拉为正，pitch）。
+    pub pitch: f32,
+    /// 方向舵（右移为正，yaw）。
+    pub yaw: f32,
+    /// 油门（[0,1]，推满为 1）。
+    pub throttle: f32,
+    /// 解锁/上锁（true=armed）。由固定通道的开关位决定。
+    pub armed: bool,
+    /// 模式开关（0/1/2 映射飞行模式槽位，由具体驱动解释）。
+    pub mode: u8,
+    /// 接收机链路健康（最近一帧在超时窗内收到）。
+    pub fresh: bool,
+}
+
+impl RcInput {
+    /// 中位、未解锁、无链路的安全默认值。
+    pub fn neutral() -> Self {
+        Self {
+            roll: 0.0,
+            pitch: 0.0,
+            yaw: 0.0,
+            throttle: 0.0,
+            armed: false,
+            mode: 0,
+            fresh: false,
+        }
+    }
+}
+
 /// 四元数旋转向量 v（q 为机体->世界旋转，返回世界系向量）。
 pub fn rotate_vec_by_quat(q: Quaternion, v: [f32; 3]) -> [f32; 3] {
     let w = q.w; let x = q.x; let y = q.y; let z = q.z;

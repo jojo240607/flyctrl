@@ -41,25 +41,27 @@ impl PwmEsc {
         // 定时器时钟 = APB1 × 2 = 84MHz。预分频到 1MHz（1us 计数）。
         let psc = (APB1_HZ * 2 / 1_000_000) - 1;
         tim.psc().write(|w| unsafe { w.bits(psc) });
-        let period = 1_000_000 / PWM_HZ; // 2500 计数 = 2.5ms
+        let period = 1_000_000 / PWM_HZ; // 400Hz → 2500 计数(1us) = 2.5ms 周期
         tim.arr().write(|w| unsafe { w.bits(period - 1) });
 
         // 每通道：PWM 模式 1（CNT<CCR 时有效），预装载使能，输出使能，极性高。
         // CCMR1/CCMR2 类型不同，必须分两支分别 modify。
+        // CCMR1：CH1(OC1M/OC1PE @bit0) + CH2(OC2M/OC2PE @bit8)
         tim.ccmr1_output().modify(|r, w| unsafe {
             let bits = r.bits();
-            let ocm = 0b110u32 << 4; // CH1 OC1M = 110
-            let ocpe = 1u32 << 3;
-            let field = (ocm | ocpe) << 0;
-            let mask = 0xFFu32 << 0;
+            let ocm = 0b110u32 << 4; // OCxM = 110
+            let ocpe = 1u32 << 3;    // OCxPE = 1
+            let field = ((ocm | ocpe) << 0) | ((ocm | ocpe) << 8); // CH1 + CH2
+            let mask = (0xFFu32 << 0) | (0xFFu32 << 8);
             w.bits((bits & !mask) | (field & mask))
         });
+        // CCMR2：CH3(OC3M/OC3PE @bit0) + CH4(OC4M/OC4PE @bit8)
         tim.ccmr2_output().modify(|r, w| unsafe {
             let bits = r.bits();
-            let ocm = 0b110u32 << 4; // CH3 OC3M = 110
-            let ocpe = 1u32 << 3;
-            let field = (ocm | ocpe) << 0;
-            let mask = 0xFFu32 << 0;
+            let ocm = 0b110u32 << 4; // OCxM = 110
+            let ocpe = 1u32 << 3;    // OCxPE = 1
+            let field = ((ocm | ocpe) << 0) | ((ocm | ocpe) << 8); // CH3 + CH4
+            let mask = (0xFFu32 << 0) | (0xFFu32 << 8);
             w.bits((bits & !mask) | (field & mask))
         });
         // 初始占空比 = 最低油门
