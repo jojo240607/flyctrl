@@ -1,0 +1,23 @@
+[package]
+name = "flyctrl-fw"
+version = "0.1.0"
+edition = "2021"
+authors = ["flyctrl"]
+license = "MIT OR Apache-2.0"
+
+[[bin]]
+name = "flyctrl-fw"
+path = "src/main.rs"
+
+[dependencies]
+flyctrl-core = { path = "../core", features = ["stm32f407"] }
+stm32f4 = { version = "0.16", features = ["stm32f407"] }
+cortex-m = "0.7"
+cortex-m-rt = "0.7"
+# 提供临界区实现（PRIMASK 开关），供 `Peripherals::take()` / interrupt::free 使用。
+critical-section = { version = "1", features = ["restore-state-u8"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+debug = false

@@ -9,3 +9,12 @@ pub mod sensor;
 pub mod actuator;
 pub mod rtos;
 pub mod irq;
+
+/// 真实 STM32F407 寄存器级驱动（仅 `stm32f407` 特性 + arm 目标编译）。
+#[cfg(feature = "stm32f407")]
+pub mod stm32f407;
+
+/// 当启用 `stm32f407` 特性时，把真实驱动提升到 `hal` 顶层命名空间，
+/// 与 `mock` 实现对等，便于算法代码 `use flyctrl_core::hal::UartLink`。
+#[cfg(feature = "stm32f407")]
+pub use stm32f407::{UartLink, PwmEsc, clock_init, SysTick, usart2_isr};

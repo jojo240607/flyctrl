@@ -10,6 +10,12 @@ license.workspace = true
 [dependencies]
 libm = "0.2"
 
+# 真实芯片依赖（仅在启用 stm32f407 特性时编译进固件，host/SIL 不受影响）。
+# 走原始 PAC + cortex-m 裸机运行时，与 joc-base 直接寄存器访问风格一致，零堆、no_std。
+stm32f4 = { version = "0.16", features = ["stm32f407"], optional = true }
+cortex-m = { version = "0.7", optional = true }
+cortex-m-rt = { version = "0.7", optional = true }
+
 [features]
-# 启用具体芯片实现（HAL 的 stm32f407 占位模块）。host/SIL 默认关闭。
-stm32f407 = []
+# 启用具体芯片实现（HAL 的 stm32f407 真实寄存器级驱动）。host/SIL 默认关闭。
+stm32f407 = ["dep:stm32f4", "dep:cortex-m", "dep:cortex-m-rt"]

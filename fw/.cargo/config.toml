@@ -1,0 +1,8 @@
+[build]
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+# cortex-m-rt 的 link.x 会自动把包根目录下的 memory.x 链接进来。
+rustflags = [
+  "-C", "link-arg=-Tlink.x",
+]

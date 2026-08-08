@@ -96,18 +96,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "flyctrl-sim"
+name = "flyctrl-fw"
 version = "0.1.0"
 dependencies = [
+ "cortex-m",
+ "cortex-m-rt",
+ "critical-section",
  "flyctrl-core",
-]
-
-[[package]]
-name = "flyctrl-sitl"
-version = "0.1.0"
-dependencies = [
- "flyctrl-core",
- "flyctrl-sim",
+ "stm32f4",
 ]
 
 [[package]]

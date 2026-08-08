@@ -35,7 +35,8 @@
 | **M10** | 消息总线 / 发布订阅（SPSC→类型总线→注册表→IRQ→QoS→邻机链路→运行时发现） | ✅ 完成 | 全绿：`--bus`（8 节点悬停）、`--swarm-link`、`--discovery` |
 
 > **当前结论（2026-08-08）**：M1–M10 全部闭环。host 端 `cargo test`（含 `--features stm32f407`）全绿、
-> dev/release 双构建干净。下一步方向（见 §8）：A 已并入本收尾核查；待选 B（真实跨节点发现协议）/ C（真实 F407 HAL 驱动落地）。
+> dev/release 双构建干净。A 已并入本收尾核查；**C（真实 F407 HAL 驱动落地）已接上真实寄存器级驱动并产出可链接裸机固件**
+> （见 §8 进展）；B（真实跨节点发现协议）仍为待选。
 
 ---
 
@@ -377,3 +378,32 @@ M10 收尾（A：stm32f407 全特性回归 + release 构建 + 进度清单）已
 
 > 选择原则：B 偏"网络层能力"，C 偏"硬件落地"。C 价值最高但工作量最大且需真实板卡；B 可在 host 端
 > 用 `LoopbackLink` 多实例先行验证。
+
+### C（真实 F407 HAL 驱动落地）—— 2026-08-08 进展
+
+已脱离占位、接上**真实寄存器级驱动**并产出可链接的裸机固件：
+
+- **新增 `core/src/hal/stm32f407/`**（整体 `#[cfg(feature="stm32f407")]`，仅 arm 目标编译）：
+  - `clock.rs`：`clock_init(&RCC)` —— HSE 8MHz → PLL 168MHz（M=8/N=336/P=2/Q=7），FLASH 5WS 等待。
+  - `gpio.rs`：`Port`/`Pin`/`AltFn` + `configure_af` —— APB2 时钟门控 + AFR 复用功能配置（UART AF7、TIM3 PWM AF2）。
+  - `uart.rs`：`UartLink`（实现 `Link` trait）—— USART2 @921600 8N1，`APB1EN` 时钟门、`BRR` 分频、TXE 轮询发送、
+    0xFE 边界收帧、`RXNE` 中断（`usart2_isr` 经 `RingBuffer<256>` 收字节）；`NVIC::unmask(Interrupt::USART2)`。
+  - `pwm.rs`：`PwmEsc`（实现 `MotorActuator` 风格的四路输出）—— TIM3 4 通道 @400Hz，`PSC`/`ARR` 设定周期、
+    `CCMRx_output` PWM 模式1、`CCRx` 油门脉宽 1000–2000µs 映射 `norm∈[0,1]`。
+  - `systick.rs`：`SysTick` 裸机延时循环（基于 `SYSTEM_HZ` 的 nop 校准）。
+- **新增 `fw/` 裸机固件 crate**（非 workspace 默认成员，避免 feature 统一把 `cortex-m-rt` 灌进 host 的 sitl 链接）：
+  - `memory.x`：STM32F407VG 布局（Flash 1MB @0x0800_0000 / SRAM 192KB @0x2000_0000）；`.cargo/config.toml` 注入 `link.x`+`memory.x`。
+  - `src/main.rs`：`#![no_std] #![no_main]`，`static mut PERIPHS` 存 `'static` 外设引用（`addr_of!` 规避 `static_mut_refs`）、
+    自实现 `critical_section::Impl`（PRIMASK cpsid/cpsie，避免 cortex-m 后端版本错配），`#[interrupt] USART2` 转交 `usart2_isr`，
+    主循环 `recv_frame → Bus::tick/pump → publish_actuator → PwmEsc::write_norm → delay_ms`。
+  - `Cargo.toml`：`flyctrl-core` 带 `features=["stm32f407"]`；`critical-section` 选 `restore-state-u8` 后端。
+
+**验证（无实物烧录，交付物=可编译链接的裸机 ELF）**：
+- `cd fw && cargo build --target thumbv7em-none-eabihf` → **`Finished`**（链接通过，仅 benign warning：
+  `_start` 由 cortex-m-rt 向量表提供、linker 提示为无害；`static_mut_refs` 已用 `addr_of!` 消除）。
+- host 端 `cargo build`（core+sim+bin，排除 fw）→ **绿**；`cargo test -p flyctrl-core` 仍全过（占位/sitl 路径不受影响）。
+- 关键陷阱已排：feature 统一导致 `cortex-m-rt` 符号泄漏进 sitl → 将 `fw` 移出 workspace 默认成员单独构建；
+  `critical-section` 后端由 `stm32f407` 的 PAC `Peripherals::take()` 强依赖 → 在 `fw` 内自实现 `Impl` 而非依赖 cortex-m 特性。
+
+**剩余（需真实板卡/烧录器，本次未做）**：实际烧录验证、USB-CDC 链路、SPI/I2C 传感器、把 `bus`/`swarm-link` 演示在板上跑通、
+以及与自研 Rust RTOS 运行时后端的对接（当前 `fw` 用裸机周期循环）。
