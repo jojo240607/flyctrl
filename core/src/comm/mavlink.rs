@@ -1,19 +1,26 @@
-//! MAVLink v1 兼容消息层（M6.2，QGC 可解析）。
+//! MAVLink v2 兼容消息层（M6.2，QGC 可解析）。
 //!
-//! 实现标准 MAVLink v1 帧格式 + CRC16/X25 + **CRC_EXTRA**（地面站识别飞控的硬门槛），
+//! 实现标准 MAVLink v2 帧格式 + CRC16/X25 + **CRC_EXTRA**（地面站识别飞控的硬门槛），
 //! 覆盖 QGC 常用的几条消息：
 //! HEARTBEAT、SYS_STATUS、ATTITUDE、LOCAL_POSITION_NED、COMMAND_LONG、PARAM_*。
 //! 全部固定大小、无堆，可在嵌入式端按 50Hz 周期组帧发出。
 //!
-//! 注意：本协议字节级兼容标准 MAVLink v1（同样 magic/CRC + CRC_EXTRA），可被标准地面站解析；
+//! 与 v1 的差异（本文件实现）：
+//! - magic = `0xFD`（v1 为 `0xFE`）；
+//! - 头部 6 字节扩为 **9 字节**：在 `len,seq,sys,comp` 之后 `msgid` 由 1 字节扩为 **3 字节小端**，
+//!   并新增 `incompat_flags(1) + compat_flags(1)`（本实现均置 0，不用签名）；
+//! - 头部布局：`len(1) incompat(1) compat(1) seq(1) sys(1) comp(1) msgid(3 LE)`；
+//! - payload ≤ 255，CRC16 + CRC_EXTRA（与 v1 同算法，仅头部长度不同）。
+//!
+//! 注意：本协议字节级兼容标准 MAVLink v2（magic/头部/CRC + CRC_EXTRA），可被标准地面站解析；
 //! 为保持核心 `no_std` 且不引入大型代码生成，这里手搓必要子集而非依赖 mavlink 库。
 //! CRC_EXTRA 取自标准 common.xml 生成常量（见 [`CRC_EXTRA`]）。
 
 use crate::comm::link::{Frame, MAX_FRAME_LEN};
 use crate::vehicle::VehicleState;
 
-/// MAVLink 帧起始符（v1）。
-pub const MAVLINK_MAGIC: u8 = 0xFE;
+/// MAVLink v2 帧起始符。
+pub const MAVLINK_MAGIC: u8 = 0xFD;
 
 /// 系统/组件 ID（飞控侧固定）。
 pub const SYS_ID: u8 = 1;
@@ -58,41 +65,48 @@ fn crc16_x25(mut crc: u16, bytes: &[u8]) -> u16 {
     crc
 }
 
-/// 组一帧 MAVLink v1 报文（含 magic/len/seq/sys/comp/msgid/payload/crc + CRC_EXTRA）。
+/// 组一帧 MAVLink v2 报文（含 magic/9 字节头部/payload/crc + CRC_EXTRA）。
 /// `seq` 由调用方维护（跨帧递增）。`payload` 长度必须 ≤ 255。
+/// 头部布局：`len(1) incompat(1) compat(1) seq(1) sys(1) comp(1) msgid(3 LE)`。
 /// 与标准地面站字节级兼容：`crc = CRC16_X25(CRC16_X25(0xFFFF, header+payload), CRC_EXTRA[msgid])`。
 pub fn encode(msgid: u8, seq: u8, payload: &[u8], out: &mut [u8; MAX_FRAME_LEN]) -> usize {
     let plen = payload.len().min(255);
-    let mut frame = [0u8; MAX_FRAME_LEN];
-    frame[0] = MAVLINK_MAGIC;
-    frame[1] = plen as u8;
-    frame[2] = seq;
-    frame[3] = SYS_ID;
-    frame[4] = COMP_ID;
-    frame[5] = msgid;
-    frame[6..6 + plen].copy_from_slice(&payload[..plen]);
-    // 标准 MAVLink CRC：先对 header+payload 算 CRC16，再异或 CRC_EXTRA 字节。
-    let mut crc = crc16_x25(0xFFFF, &frame[1..6 + plen]);
+    // 直接写入 out，避免额外 280 字节中转缓冲（栈敏感场景）。
+    out[0] = MAVLINK_MAGIC;
+    out[1] = plen as u8;
+    out[2] = 0; // incompat_flags（无签名）
+    out[3] = 0; // compat_flags
+    out[4] = seq;
+    out[5] = SYS_ID;
+    out[6] = COMP_ID;
+    // msgid 以小端写入 3 字节（v2 扩展消息 ID）。
+    out[7] = msgid;
+    out[8] = 0;
+    out[9] = 0;
+    out[10..10 + plen].copy_from_slice(&payload[..plen]);
+    // 标准 MAVLink v2 CRC：先对 9 字节头部+payload 算 CRC16，再异或 CRC_EXTRA 字节。
+    let mut crc = crc16_x25(0xFFFF, &out[1..10 + plen]);
     crc = crc16_x25(crc, &[CRC_EXTRA[msgid as usize]]);
-    frame[6 + plen] = (crc & 0xFF) as u8;
-    frame[6 + plen + 1] = (crc >> 8) as u8;
-    let total = 6 + plen + 2;
-    out[..total].copy_from_slice(&frame[..total]);
-    total
+    out[10 + plen] = (crc & 0xFF) as u8;
+    out[10 + plen + 1] = (crc >> 8) as u8;
+    10 + plen + 2
 }
 
-/// 从一帧 `Frame` 解析出 (msgid, payload_slice)；非 MAVLink 帧或 CRC（含 CRC_EXTRA）不通过返回 None。
+/// 从一帧 `Frame` 解析出 (msgid, payload_slice)；非 MAVLink v2 帧或 CRC（含 CRC_EXTRA）不通过返回 None。
 pub fn decode(frame: &Frame) -> Option<(u8, &[u8])> {
     let d = frame.as_slice();
-    if d.len() < 8 || d[0] != MAVLINK_MAGIC { return None; }
+    if d.len() < 12 || d[0] != MAVLINK_MAGIC { return None; }
     let plen = d[1] as usize;
-    if d.len() < 6 + plen + 2 { return None; }
-    let msgid = d[5];
-    let payload = &d[6..6 + plen];
-    // 校验 CRC（含 CRC_EXTRA），与 encode 同算法。
-    let mut crc = crc16_x25(0xFFFF, &d[1..6 + plen]);
+    if d.len() < 10 + plen + 2 { return None; }
+    // v2：msgid 为 3 字节小端（位于头部 [7..10]）。
+    let msgid = d[7] as u32 | (d[8] as u32) << 8 | (d[9] as u32) << 16;
+    if msgid > 255 { return None; } // 本实现仅支持 1 字节消息 ID 空间
+    let msgid = msgid as u8;
+    let payload = &d[10..10 + plen];
+    // 校验 CRC（含 CRC_EXTRA），与 encode 同算法（v2 头部 9 字节）。
+    let mut crc = crc16_x25(0xFFFF, &d[1..10 + plen]);
     crc = crc16_x25(crc, &[CRC_EXTRA[msgid as usize]]);
-    let got = ((d[6 + plen + 1] as u16) << 8) | (d[6 + plen] as u16);
+    let got = ((d[10 + plen + 1] as u16) << 8) | (d[10 + plen] as u16);
     if crc != got { return None; }
     Some((msgid, payload))
 }
@@ -289,22 +303,25 @@ pub fn encode_local_pos_from(sys_id: u8, state: &VehicleState, seq: u8, out: &mu
     put_f32(&mut p, 20, state.vel[1].0);
     put_f32(&mut p, 24, state.vel[2].0);
     let plen = p.len();
-    let mut frame = [0u8; MAX_FRAME_LEN];
-    frame[0] = MAVLINK_MAGIC;
-    frame[1] = plen as u8;
-    frame[2] = seq;
-    frame[3] = sys_id; // 自定义 sys_id
-    frame[4] = COMP_ID;
-    frame[5] = msg_id::LOCAL_POSITION_NED;
-    frame[6..6 + plen].copy_from_slice(&p[..plen]);
-    // 标准 MAVLink CRC（含 CRC_EXTRA），与 encode() 同算法。
-    let mut crc = crc16_x25(0xFFFF, &frame[1..6 + plen]);
+    // 直接构造到 out（避免 280 字节中转栈缓冲）。v2 头部 9 字节。
+    out[0] = MAVLINK_MAGIC;
+    out[1] = plen as u8;
+    out[2] = 0; // incompat_flags
+    out[3] = 0; // compat_flags
+    out[4] = seq;
+    out[5] = sys_id; // 自定义 sys_id
+    out[6] = COMP_ID;
+    // msgid 以小端写入 3 字节（v2 扩展消息 ID）。
+    out[7] = msg_id::LOCAL_POSITION_NED;
+    out[8] = 0;
+    out[9] = 0;
+    out[10..10 + plen].copy_from_slice(&p[..plen]);
+    // 标准 MAVLink v2 CRC（含 CRC_EXTRA），与 encode() 同算法。
+    let mut crc = crc16_x25(0xFFFF, &out[1..10 + plen]);
     crc = crc16_x25(crc, &[CRC_EXTRA[msg_id::LOCAL_POSITION_NED as usize]]);
-    frame[6 + plen] = (crc & 0xFF) as u8;
-    frame[6 + plen + 1] = (crc >> 8) as u8;
-    let total = 6 + plen + 2;
-    out[..total].copy_from_slice(&frame[..total]);
-    total
+    out[10 + plen] = (crc & 0xFF) as u8;
+    out[10 + plen + 1] = (crc >> 8) as u8;
+    10 + plen + 2
 }
 
 /// SYS_STATUS：健康位（取 FDIR 健康；此处仅填传感器位）。
@@ -334,9 +351,9 @@ mod tests {
         let mut out = [0u8; MAX_FRAME_LEN];
         let n = encode_heartbeat(0, false, 7, &mut out);
         assert_eq!(out[0], MAVLINK_MAGIC);
-        assert_eq!(out[5], msg_id::HEARTBEAT);
-        // 帧长应为 6 + 9(payload) + 2(crc) = 17
-        assert_eq!(n, 17);
+        assert_eq!(out[7], msg_id::HEARTBEAT);
+        // v2 帧长应为 10(头部) + 9(payload) + 2(crc) = 21
+        assert_eq!(n, 21);
         // decode 应通过（含 CRC_EXTRA 校验）
         let frame = frame_from_slice(&out[..n]);
         let (id, _pl) = decode(&frame).expect("heartbeat should decode with CRC_EXTRA");
@@ -358,7 +375,7 @@ mod tests {
     fn heartbeat_uses_standard_fields() {
         let mut out = [0u8; MAX_FRAME_LEN];
         encode_heartbeat(5, true, 0, &mut out);
-        let frame = frame_from_slice(&out[..17]);
+        let frame = frame_from_slice(&out[..21]);
         let (_id, pl) = decode(&frame).unwrap();
         // type=QUADROTOR(2), autopilot=DEV(13), base_mode 含 ARM 位
         assert_eq!(pl[0], enums::MAV_TYPE_QUADROTOR);
@@ -407,7 +424,7 @@ mod tests {
         st.pos = [Meter(1.0), Meter(2.0), Meter(3.0)];
         let mut out = [0u8; MAX_FRAME_LEN];
         let n = encode_local_pos_from(7, &st, 0, &mut out);
-        assert_eq!(out[3], 7); // sys_id 覆盖生效
+        assert_eq!(out[5], 7); // v2 头部位置 [5] = sys_id，覆盖生效
         let frame = frame_from_slice(&out[..n]);
         assert!(decode(&frame).is_some());
     }

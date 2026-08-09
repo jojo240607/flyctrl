@@ -4,7 +4,7 @@
 //! 具体实现可以是串口（UART+DMA）、USB-CDC、或是 host 端的回环/文件。
 //! 所有实现无堆、有界耗时。
 
-/// 单帧最大负载 + 头部开销的硬上限（MAVLink v1 最大 263，这里留余量）。
+/// 单帧最大负载 + 头部开销的硬上限（MAVLink v2 最大 279，这里留余量）。
 pub const MAX_FRAME_LEN: usize = 280;
 
 /// 一段已封装的链路帧（含 MAVLink 报文 + 链路层开销）。
@@ -98,14 +98,15 @@ impl Link for LoopbackLink {
     }
 
     fn recv_frame(&mut self) -> Frame {
-        // 读出直到遇到 MAVLink 帧边界：以 0xFE 开头，长度域在 [1]，总长 = 6 + len + 2(crc)。
-        // 简单策略：读到 0xFE 起始，至少收集齐头部+N+CRC 才返回。
+        // 读出直到遇到 MAVLink v2 帧边界：以 0xFD 开头，长度域在 [1]。
+        // v2 头部 9 字节（len,incompat,compat,seq,sys,comp,msgid[3]），总长 = 10 + len + 2(crc)。
+        // 简单策略：读到 0xFD 起始，至少收集齐头部+N+CRC 才返回。
         let mut data = [0u8; MAX_FRAME_LEN];
         let mut len = 0usize;
         // 找到起始符
         while self.count > 0 {
             if let Some(b) = self.pop_byte() {
-                if b == 0xFE {
+                if b == 0xFD {
                     data[0] = b;
                     len = 1;
                     break;
@@ -113,13 +114,13 @@ impl Link for LoopbackLink {
             }
         }
         if len == 0 { return Frame::default(); }
-        // 需要再读 5 字节头部（len, seq, sys, comp, msgid）
-        for _ in 0..5 {
+        // 需要再读 9 字节头部（len, incompat, compat, seq, sys, comp, msgid[3]）
+        for _ in 0..9 {
             if let Some(b) = self.pop_byte() { data[len] = b; len += 1; }
             else { return Frame::default(); }
         }
         let payload_len = data[1] as usize;
-        let total = 6 + payload_len + 2; // magic+len+seq+sys+comp+msgid + payload + 2 crc
+        let total = 10 + payload_len + 2; // magic + 9 字节头部 + payload + 2 crc
         for _ in (len as usize)..total {
             if let Some(b) = self.pop_byte() { data[len] = b; len += 1; }
             else { return Frame::default(); }

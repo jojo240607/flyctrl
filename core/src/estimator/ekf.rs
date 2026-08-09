@@ -165,7 +165,53 @@ impl Estimator for EkfEstimator {
         self.x[4] = vy;
         self.x[5] = vz;
 
-        // 协方差预测：F = I + A*dt, A 仅 [pos][vel]=I
+        // 协方差预测（独立方法，栈数组作用域限于该方法内，返回后栈槽被回收，
+        // 避免与下方观测更新步的栈数组同时存活导致调用方任务栈溢出）。
+        self.predict_cov(dt);
+
+        // 观测更新（位置）：H = [I3 0 0]（独立方法，同上理由拆分）。
+        if let Some(z) = gps {
+            self.update_pos(z);
+        }
+
+        VehicleState {
+            pos: [Meter(self.x[0]), Meter(self.x[1]), Meter(self.x[2])],
+            vel: [MeterPerSecond(self.x[3]), MeterPerSecond(self.x[4]), MeterPerSecond(self.x[5])],
+            att: self.att,
+            omega: [
+                RadianPerSecond(imu.gyro[0].0 - self.x[6]),
+                RadianPerSecond(imu.gyro[1].0 - self.x[7]),
+                RadianPerSecond(imu.gyro[2].0 - self.x[8]),
+            ],
+        }
+    }
+
+    fn reset(&mut self) {
+        self.att = Quaternion::IDENTITY;
+        self.x = [0.0; N];
+        mat_ident(&mut self.p);
+        for i in 0..3 {
+            self.p[i * N + i] = 1.0;
+        }
+        for i in 3..6 {
+            self.p[i * N + i] = 1.0;
+        }
+        for i in 6..9 {
+            self.p[i * N + i] = 1e-4;
+        }
+    }
+}
+
+// ===== 以下为 `EkfEstimator` 自身的非 trait 方法（不是 `Estimator` trait 的一部分）=====
+// 把协方差预测 / 位置观测更新从 `step` 里拆成独立方法，让各自的大栈数组（各 ~1620B）
+// 作用域不重叠：编译器可在两支之间复用同一批栈槽，整体峰值 ≈ max(predict, update)
+// 而非 sum，从而避免控制任务栈（3072B）溢出。
+
+impl EkfEstimator {
+    /// 协方差预测步：F = I + A*dt，P' = F P F^T + Q。
+    /// 栈数组（f/ft/p_pred，各 81 元素）作用域限于本方法，返回后栈槽被回收。
+    fn predict_cov(&mut self, dt: f32) {
+        // F = I + A*dt, A 仅 [pos][vel]=I
         let mut f = [0.0f32; N * N];
         mat_ident(&mut f);
         for i in 0..3 {
@@ -195,125 +241,99 @@ impl Estimator for EkfEstimator {
             }
         }
         self.p = p_pred;
-
-        // 观测更新（位置）：H = [I3 0 0]
-        if let Some(z) = gps {
-            // S = H P H^T + R (3x3)
-            let mut s = [0.0f32; 9];
-            for i in 0..3 {
-                for j in 0..3 {
-                    s[i * 3 + j] = self.p[i * N + j] + if i == j { self.r_pos } else { 0.0 };
-                }
-            }
-            // K = P H^T S^-1 (9x3) ; P H^T 即 P 前三列
-            let mut pht = [0.0f32; 27];
-            for i in 0..N {
-                for j in 0..3 {
-                    pht[i * 3 + j] = self.p[i * N + j];
-                }
-            }
-            // S 3x3 求逆（伴随矩阵）
-            let s00 = s[0]; let s01 = s[1]; let s02 = s[2];
-            let s10 = s[3]; let s11 = s[4]; let s12 = s[5];
-            let s20 = s[6]; let s21 = s[7]; let s22 = s[8];
-            let det = s00 * (s11 * s22 - s12 * s21)
-                - s01 * (s10 * s22 - s12 * s20)
-                + s02 * (s10 * s21 - s11 * s20);
-            let inv = if det.abs() > 1e-9 { 1.0 / det } else { 0.0 };
-            let mut sinv = [0.0f32; 9];
-            sinv[0] = (s11 * s22 - s12 * s21) * inv;
-            sinv[1] = (s02 * s21 - s01 * s22) * inv;
-            sinv[2] = (s01 * s12 - s02 * s11) * inv;
-            sinv[3] = (s12 * s20 - s10 * s22) * inv;
-            sinv[4] = (s00 * s22 - s02 * s20) * inv;
-            sinv[5] = (s02 * s10 - s00 * s12) * inv;
-            sinv[6] = (s10 * s21 - s11 * s20) * inv;
-            sinv[7] = (s01 * s20 - s00 * s21) * inv;
-            sinv[8] = (s00 * s11 - s01 * s10) * inv;
-
-            let mut k = [0.0f32; 27];
-            mat_mul(&pht, &sinv, &mut k, N, 3, 3);
-
-            // 创新 y = z - pos
-            let y = [z.pos[0].0 - self.x[0], z.pos[1].0 - self.x[1], z.pos[2].0 - self.x[2]];
-
-            // x += K y
-            for i in 0..N {
-                let mut corr = 0.0;
-                for j in 0..3 {
-                    corr += k[i * 3 + j] * y[j];
-                }
-                self.x[i] += corr;
-            }
-
-            // P 更新用 Joseph 形式：P = (I - K H) P (I - K H)^T + K R K^T
-            // Joseph 形式在浮点下保持对称半正定（<=> 真实方差），
-            // 避免朴素 P = (I-KH)P 在数值误差下出现负对角元/非对称。
-            // 1) A = I - K H （9x9，H 仅前三行非零）
-            let mut a = [0.0f32; N * N];
-            for i in 0..N {
-                for j in 0..N {
-                    let kh = if j < 3 { k[i * 3 + j] } else { 0.0 }; // (K H)[i][j] = K[i][j] (j<3)
-                    a[i * N + j] = if i == j { 1.0 - kh } else { -kh };
-                }
-            }
-            // 2) A P A^T
-            let mut ap = [0.0f32; N * N];
-            mat_mul(&a, &self.p, &mut ap, N, N, N);
-            let mut apat = [0.0f32; N * N];
-            mat_mul_at(&ap, &a, &mut apat, N, N, N);
-            // 3) K R K^T （R = r_pos * I3）
-            let mut krkt = [0.0f32; N * N];
-            for i in 0..N {
-                for j in 0..N {
-                    let mut acc = 0.0;
-                    for l in 0..3 {
-                        acc += k[i * 3 + l] * k[j * 3 + l];
-                    }
-                    krkt[i * N + j] = acc * self.r_pos;
-                }
-            }
-            // 4) P = A P A^T + K R K^T，并对称化（消除尾差）
-            for i in 0..(N * N) {
-                self.p[i] = apat[i] + krkt[i];
-            }
-            for i in 0..N {
-                for j in (i + 1)..N {
-                    let avg = 0.5 * (self.p[i * N + j] + self.p[j * N + i]);
-                    self.p[i * N + j] = avg;
-                    self.p[j * N + i] = avg;
-                }
-                // 对角线下限夹取，杜绝负方差。
-                if self.p[i * N + i] < 1e-6 {
-                    self.p[i * N + i] = 1e-6;
-                }
-            }
-        }
-
-        VehicleState {
-            pos: [Meter(self.x[0]), Meter(self.x[1]), Meter(self.x[2])],
-            vel: [MeterPerSecond(self.x[3]), MeterPerSecond(self.x[4]), MeterPerSecond(self.x[5])],
-            att: self.att,
-            omega: [
-                RadianPerSecond(imu.gyro[0].0 - self.x[6]),
-                RadianPerSecond(imu.gyro[1].0 - self.x[7]),
-                RadianPerSecond(imu.gyro[2].0 - self.x[8]),
-            ],
-        }
     }
 
-    fn reset(&mut self) {
-        self.att = Quaternion::IDENTITY;
-        self.x = [0.0; N];
-        mat_ident(&mut self.p);
+    /// 位置观测更新步（Joseph 形式）：S = HPH^T+R、K = P H^T S^-1、x += K y、
+    /// P = (I-KH)P(I-KH)^T + K R K^T。
+    /// 栈数组（s/pht/k/sinv/a/ap/apat/krkt）作用域限于本方法，返回后栈槽被回收。
+    fn update_pos(&mut self, z: PosSample) {
+        // S = H P H^T + R (3x3)
+        let mut s = [0.0f32; 9];
         for i in 0..3 {
-            self.p[i * N + i] = 1.0;
+            for j in 0..3 {
+                s[i * 3 + j] = self.p[i * N + j] + if i == j { self.r_pos } else { 0.0 };
+            }
         }
-        for i in 3..6 {
-            self.p[i * N + i] = 1.0;
+        // K = P H^T S^-1 (9x3) ; P H^T 即 P 前三列
+        let mut pht = [0.0f32; 27];
+        for i in 0..N {
+            for j in 0..3 {
+                pht[i * 3 + j] = self.p[i * N + j];
+            }
         }
-        for i in 6..9 {
-            self.p[i * N + i] = 1e-4;
+        // S 3x3 求逆（伴随矩阵）
+        let s00 = s[0]; let s01 = s[1]; let s02 = s[2];
+        let s10 = s[3]; let s11 = s[4]; let s12 = s[5];
+        let s20 = s[6]; let s21 = s[7]; let s22 = s[8];
+        let det = s00 * (s11 * s22 - s12 * s21)
+            - s01 * (s10 * s22 - s12 * s20)
+            + s02 * (s10 * s21 - s11 * s20);
+        let inv = if det.abs() > 1e-9 { 1.0 / det } else { 0.0 };
+        let mut sinv = [0.0f32; 9];
+        sinv[0] = (s11 * s22 - s12 * s21) * inv;
+        sinv[1] = (s02 * s21 - s01 * s22) * inv;
+        sinv[2] = (s01 * s12 - s02 * s11) * inv;
+        sinv[3] = (s12 * s20 - s10 * s22) * inv;
+        sinv[4] = (s00 * s22 - s02 * s20) * inv;
+        sinv[5] = (s02 * s10 - s00 * s12) * inv;
+        sinv[6] = (s10 * s21 - s11 * s20) * inv;
+        sinv[7] = (s01 * s20 - s00 * s21) * inv;
+        sinv[8] = (s00 * s11 - s01 * s10) * inv;
+
+        let mut k = [0.0f32; 27];
+        mat_mul(&pht, &sinv, &mut k, N, 3, 3);
+
+        // 创新 y = z - pos
+        let y = [z.pos[0].0 - self.x[0], z.pos[1].0 - self.x[1], z.pos[2].0 - self.x[2]];
+
+        // x += K y
+        for i in 0..N {
+            let mut corr = 0.0;
+            for j in 0..3 {
+                corr += k[i * 3 + j] * y[j];
+            }
+            self.x[i] += corr;
+        }
+
+        // P 更新用 Joseph 形式：P = (I - K H) P (I - K H)^T + K R K^T
+        // 1) A = I - K H （9x9，H 仅前三行非零）
+        let mut a = [0.0f32; N * N];
+        for i in 0..N {
+            for j in 0..N {
+                let kh = if j < 3 { k[i * 3 + j] } else { 0.0 }; // (K H)[i][j] = K[i][j] (j<3)
+                a[i * N + j] = if i == j { 1.0 - kh } else { -kh };
+            }
+        }
+        // 2) A P A^T
+        let mut ap = [0.0f32; N * N];
+        mat_mul(&a, &self.p, &mut ap, N, N, N);
+        let mut apat = [0.0f32; N * N];
+        mat_mul_at(&ap, &a, &mut apat, N, N, N);
+        // 3) K R K^T （R = r_pos * I3）
+        let mut krkt = [0.0f32; N * N];
+        for i in 0..N {
+            for j in 0..N {
+                let mut acc = 0.0;
+                for l in 0..3 {
+                    acc += k[i * 3 + l] * k[j * 3 + l];
+                }
+                krkt[i * N + j] = acc * self.r_pos;
+            }
+        }
+        // 4) P = A P A^T + K R K^T，并对称化（消除尾差）
+        for i in 0..(N * N) {
+            self.p[i] = apat[i] + krkt[i];
+        }
+        for i in 0..N {
+            for j in (i + 1)..N {
+                let avg = 0.5 * (self.p[i * N + j] + self.p[j * N + i]);
+                self.p[i * N + j] = avg;
+                self.p[j * N + i] = avg;
+            }
+            // 对角线下限夹取，杜绝负方差。
+            if self.p[i * N + i] < 1e-6 {
+                self.p[i * N + i] = 1e-6;
+            }
         }
     }
 }

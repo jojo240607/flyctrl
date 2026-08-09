@@ -1,7 +1,7 @@
 //! USART2 真实驱动 + 帧化链路 `UartLink`（实现 `comm::Link`）。
 //!
 //! 引脚：PA2(TX, AF7) / PA3(RX, AF7)。波特率默认 921600，8N1。
-//! RX 用中断填充一个小环形缓冲；`recv_frame` 从中按 MAVLink 0xFE 边界解帧（与 host 端
+//! RX 用中断填充一个小环形缓冲；`recv_frame` 从中按 MAVLink v2 (0xFD) 边界解帧（与 host 端
 //! `LoopbackLink` 同款逻辑，保证 host/SIL 与 MCU 共用同一帧语义）。
 //! TX 采用阻塞发送（飞控下行遥测量小，且避免在 ISR 里做复杂状态机）。
 
@@ -119,13 +119,13 @@ impl Link for UartLink {
     }
 
     fn recv_frame(&mut self) -> Frame {
-        // 与 LoopbackLink 同款：找 0xFE 起始，读齐 MAVLink 帧（6 + len + 2）。
+        // 与 LoopbackLink 同款：找 0xFD 起始，读齐 MAVLink v2 帧（10 + len + 2）。
         let mut data = [0u8; MAX_FRAME_LEN];
         let mut len = 0usize;
 
-        // 找到起始符 0xFE
+        // 找到起始符 0xFD（MAVLink v2 magic）
         while let Some(b) = Self::pop_byte() {
-            if b == 0xFE {
+            if b == 0xFD {
                 data[0] = b;
                 len = 1;
                 break;
@@ -134,8 +134,8 @@ impl Link for UartLink {
         if len == 0 {
             return Frame::default();
         }
-        // 头部 5 字节（len, seq, sys, comp, msgid）
-        for _ in 0..5 {
+        // v2 头部 9 字节（len, incompat, compat, seq, sys, comp, msgid[3]）
+        for _ in 0..9 {
             if let Some(b) = Self::pop_byte() {
                 data[len] = b;
                 len += 1;
@@ -143,11 +143,11 @@ impl Link for UartLink {
                 return Frame::default();
             }
         }
-        if len < 6 {
+        if len < 10 {
             return Frame::default();
         }
         let payload = data[1] as usize; // MAVLink len 域
-        let total = 6 + payload + 2;
+        let total = 10 + payload + 2;
         while len < total {
             if let Some(b) = Self::pop_byte() {
                 if len < MAX_FRAME_LEN {
