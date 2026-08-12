@@ -8,6 +8,7 @@
 //!
 //! 全部 `no_std`、无堆分配、执行时间有界。
 
+pub mod bridge;
 pub mod link;
 pub mod mavlink;
 pub mod telemetry;

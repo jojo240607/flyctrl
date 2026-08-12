@@ -49,6 +49,14 @@ pub struct VehicleConfig {
     /// 最大速度（m/s），位置外环输出限幅。
     pub vmax_xy: f32,
     pub vmax_z: f32,
+    /// 姿态内环比例增益（四元数误差 -> 期望机体角速度）。
+    pub att_kp: f32,
+    /// 姿态内环角速度阻尼增益。
+    pub att_kd: f32,
+    /// 位置外环比例增益（位置误差 -> 期望速度）。
+    pub kp_xy: f32,
+    /// 速度中环比例增益（速度误差 -> 期望加速度）。
+    pub kv_xy: f32,
 }
 
 impl VehicleConfig {
@@ -83,6 +91,10 @@ impl VehicleConfig {
             hover_thrust: 0.5,
             vmax_xy: 2.0,
             vmax_z: 2.0,
+            att_kp: 3.0,
+            att_kd: 0.3,
+            kp_xy: 0.5,
+            kv_xy: 0.8,
         }
     }
 
@@ -118,7 +130,22 @@ impl VehicleConfig {
             hover_thrust: self.hover_thrust,
             vmax_xy: self.vmax_xy,
             vmax_z: self.vmax_z,
+            att_kp: self.att_kp,
+            att_kd: self.att_kd,
+            kp_xy: self.kp_xy,
+            kv_xy: self.kv_xy,
         }
+    }
+}
+
+/// 便捷构造：用给定姿态/位置环增益覆盖默认机型配置（调试/调参用）。
+impl VehicleConfig {
+    pub fn with_gains(mut self, att_kp: f32, att_kd: f32, kp_xy: f32, kv_xy: f32) -> Self {
+        self.att_kp = att_kp;
+        self.att_kd = att_kd;
+        self.kp_xy = kp_xy;
+        self.kv_xy = kv_xy;
+        self
     }
 }
 
@@ -166,6 +193,14 @@ pub struct CtrlParams {
     pub hover_thrust: f32,
     pub vmax_xy: f32,
     pub vmax_z: f32,
+    /// 姿态内环比例增益（四元数误差 -> 期望机体角速度）。
+    pub att_kp: f32,
+    /// 姿态内环角速度阻尼增益。
+    pub att_kd: f32,
+    /// 位置外环比例增益（位置误差 -> 期望速度）。
+    pub kp_xy: f32,
+    /// 速度中环比例增益（速度误差 -> 期望加速度）。
+    pub kv_xy: f32,
 }
 
 impl Default for CtrlParams {

@@ -50,19 +50,24 @@ pub const CRC_EXTRA: [u8; 256] = {
     t[msg_id::PARAM_VALUE as usize] = 220;
     t[msg_id::PARAM_SET as usize] = 168;
     t[msg_id::ATTITUDE as usize] = 39;
-    t[msg_id::LOCAL_POSITION_NED as usize] = 143;
+    t[msg_id::LOCAL_POSITION_NED as usize] = 185; // 标准 common.xml CRC_EXTRA (v2.0)
     t[msg_id::COMMAND_LONG as usize] = 152;
-    t[msg_id::COMMAND_ACK as usize] = 208; // 标准 common.xml CRC_EXTRA
+    t[msg_id::COMMAND_ACK as usize] = 143; // 标准 common.xml CRC_EXTRA
     t
 };
 
-/// CRC16/X25（MAVLink 用于帧校验的核心多项式）。
+/// CRC16/MCRF4XX（标准 MAVLink v2 帧校验多项式，与 pymavlink/fastcrc 一致）。
+/// 参数 `crc` 为初始值（标准用 0xFFFF），逐字节累积后返回。
 fn crc16_x25(mut crc: u16, bytes: &[u8]) -> u16 {
     for &b in bytes {
-        let x0 = ((b as u16) ^ (crc & 0xFF)) as u32;
-        let x = x0 ^ (x0 << 4);
-        let x25 = (x ^ (x << 1) ^ (x << 2) ^ (x << 8) ^ (x << 16) ^ (x >> 4) ^ (x >> 7) ^ (x >> 11)) & 0xFFFF;
-        crc = ((crc >> 8) ^ (x25 as u16)) & 0xFFFF;
+        crc ^= b as u16;
+        for _ in 0..8 {
+            if crc & 1 != 0 {
+                crc = (crc >> 1) ^ 0x8408;
+            } else {
+                crc >>= 1;
+            }
+        }
     }
     crc
 }
@@ -158,6 +163,7 @@ pub mod enums {
     pub const MAV_CMD_NAV_RETURN_TO_LAUNCH: u16 = 20;
     pub const MAV_CMD_COMPONENT_ARM_DISARM: u16 = 400;
     pub const MAV_CMD_DO_SET_MODE: u16 = 176;
+    pub const MAV_CMD_MISSION_START: u16 = 300;
     pub const MAV_CMD_REQUEST_AUTOPILOT_CAPABILITIES: u16 = 520;
     /// MAV_PARAM_TYPE（PARAM_VALUE/PARAM_SET.param_type）。
     pub const MAV_PARAM_TYPE_REAL32: u8 = 9;
@@ -284,6 +290,22 @@ pub fn decode_param_value(payload: &[u8]) -> Option<ParamValue> {
 /// 该消息无 payload 字段（仅头部），只需识别 msg_id 即可。
 pub fn decode_param_request_list(_payload: &[u8]) -> Option<()> {
     Some(())
+}
+
+/// PARAM_REQUEST_LIST：飞控向地面站广播“开始参数表流水”（本实现由桥接层在收到请求后自动触发，
+/// 该编码函数主要用于测试/对称实现）。payload 为 `target_system(1) + target_component(1)`。
+pub fn encode_param_request_list(
+    target_system: u8,
+    target_component: u8,
+    req_comp_id: u8,
+    seq: u8,
+    out: &mut [u8; MAX_FRAME_LEN],
+) -> usize {
+    let mut p = [0u8; 2];
+    p[0] = target_system;
+    p[1] = target_component;
+    let _ = req_comp_id; // 保留位，标准里该消息无此字段
+    encode(msg_id::PARAM_REQUEST_LIST, seq, &p, out)
 }
 
 /// PARAM_SET 解码（地面站 -> 飞控，写入单个参数）。
