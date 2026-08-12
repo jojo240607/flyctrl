@@ -31,7 +31,9 @@ pub mod msg_id {
     pub const HEARTBEAT: u8 = 0;
     pub const SYS_STATUS: u8 = 1;
     pub const ATTITUDE: u8 = 30;
+    pub const GLOBAL_POSITION_INT: u8 = 33;
     pub const LOCAL_POSITION_NED: u8 = 32;
+    pub const VFR_HUD: u8 = 74;
     pub const COMMAND_LONG: u8 = 76;
     pub const COMMAND_ACK: u8 = 77;
     pub const PARAM_REQUEST_LIST: u8 = 21;
@@ -50,7 +52,9 @@ pub const CRC_EXTRA: [u8; 256] = {
     t[msg_id::PARAM_VALUE as usize] = 220;
     t[msg_id::PARAM_SET as usize] = 168;
     t[msg_id::ATTITUDE as usize] = 39;
+    t[msg_id::GLOBAL_POSITION_INT as usize] = 104; // 标准 common.xml CRC_EXTRA
     t[msg_id::LOCAL_POSITION_NED as usize] = 185; // 标准 common.xml CRC_EXTRA (v2.0)
+    t[msg_id::VFR_HUD as usize] = 20; // 标准 common.xml CRC_EXTRA
     t[msg_id::COMMAND_LONG as usize] = 152;
     t[msg_id::COMMAND_ACK as usize] = 143; // 标准 common.xml CRC_EXTRA
     t
@@ -129,19 +133,25 @@ fn put_i32(buf: &mut [u8], off: usize, v: i32) {
     let b = v.to_le_bytes();
     buf[off..off + 4].copy_from_slice(&b);
 }
+fn put_i16(buf: &mut [u8], off: usize, v: i16) {
+    let b = v.to_le_bytes();
+    buf[off..off + 2].copy_from_slice(&b);
+}
+fn put_u16(buf: &mut [u8], off: usize, v: u16) {
+    let b = v.to_le_bytes();
+    buf[off..off + 2].copy_from_slice(&b);
+}
 
 /// 标准 MAVLink 枚举常量（与 common.xml 对齐，供 QGC 正确识别）。
 pub mod enums {
     /// MAV_TYPE：飞行器类型（HEARTBEAT.type）。
     pub const MAV_TYPE_QUADROTOR: u8 = 2;
     /// MAV_AUTOPILOT：自驾仪类型（HEARTBEAT.autopilot）。
-    /// 用 14 = MAV_AUTOPILOT_INVALID 之外的有效值；为兼容 QGC 显示为通用自驾仪，取 12(PX4) 以外的自定义位。
-    /// 这里选 14（MAV_AUTOPILOT_INVALID）会让 QGC 不识别；选用 12(PX4) 触发 PX4 参数表（不推荐），
-    /// 故采用预留自定义值 13 之外的 0x?? —— 实测选 14 之外取 `MAV_AUTOPILOT_GENERIC ?` 不存在。
-    /// 折中：用 12(PX4) 会让 QGC 套用 PX 参数表导致参数请求风暴；这里用 14 之外的自定义 13(MAV_AUTOPILOT_DEVELOPMENT)。
+    /// 选 ARDUPILOTMEGA(3) 使地面站（QGC/groundctrl）按 ArduCopter 自定义模式码解析模式名（STABILIZE/ALT_HOLD/LOITER/RTL/LAND…）。
     pub const MAV_AUTOPILOT_DEV: u8 = 13;
-    /// MAV_MODE_FLAG 位（HEARTBEAT.base_mode）。
-    pub const MAV_MODE_FLAG_CUSTOM_MODE_ENABLED: u8 = 0x01;
+    pub const MAV_AUTOPILOT_ARDUPILOTMEGA: u8 = 3;
+    /// MAV_MODE_FLAG 位（HEARTBEAT.base_mode）。注意 CUSTOM_MODE_ENABLED 是 bit7 = 0x80（标准值，不是 0x01）。
+    pub const MAV_MODE_FLAG_CUSTOM_MODE_ENABLED: u8 = 0x80;
     pub const MAV_MODE_FLAG_TEST_ENABLED: u8 = 0x02;
     pub const MAV_MODE_FLAG_AUTO_ENABLED: u8 = 0x10;
     pub const MAV_MODE_FLAG_GUIDED_ENABLED: u8 = 0x08;
@@ -165,6 +175,13 @@ pub mod enums {
     pub const MAV_CMD_DO_SET_MODE: u16 = 176;
     pub const MAV_CMD_MISSION_START: u16 = 300;
     pub const MAV_CMD_REQUEST_AUTOPILOT_CAPABILITIES: u16 = 520;
+    /// ArduCopter 自定义模式码（custom_mode 字段），地面站据此显示模式名（STABILIZE/ALT_HOLD/...）。
+    pub const COPTER_MODE_STABILIZE: u16 = 0;
+    pub const COPTER_MODE_ALT_HOLD: u16 = 2;
+    pub const COPTER_MODE_LOITER: u16 = 5;
+    pub const COPTER_MODE_RTL: u16 = 6;
+    pub const COPTER_MODE_LAND: u16 = 9;
+    pub const COPTER_MODE_GUIDED: u16 = 4;
     /// MAV_PARAM_TYPE（PARAM_VALUE/PARAM_SET.param_type）。
     pub const MAV_PARAM_TYPE_REAL32: u8 = 9;
     /// MAV_RESULT（COMMAND_ACK.result）。
@@ -178,15 +195,30 @@ pub mod enums {
 /// HEARTBEAT：声明飞控存活 + 当前模式（标准字段，QGC 可识别）。
 /// `mode` 为自定义飞行模式自定义码（与 `flightmode::FlightMode` 映射），`armed` 反映解锁态。
 pub fn encode_heartbeat(mode: u8, armed: bool, seq: u8, out: &mut [u8; MAX_FRAME_LEN]) -> usize {
+    // 默认 autopilot 用 ARDUPILOT，使地面站（QGC/groundctrl）按 ArduCopter 自定义模式解码模式名。
+    encode_heartbeat_ap(mode, enums::MAV_AUTOPILOT_ARDUPILOTMEGA, armed, enums::MAV_STATE_ACTIVE, enums::MAV_STATE_STANDBY, seq, out)
+}
+
+/// 完整版心跳：允许指定 autopilot 与 system_status（激活/待命）。
+pub fn encode_heartbeat_ap(
+    mode: u8,
+    autopilot: u8,
+    armed: bool,
+    state_active: u8,
+    state_standby: u8,
+    seq: u8,
+    out: &mut [u8; MAX_FRAME_LEN],
+) -> usize {
     use enums::*;
     let mut payload = [0u8; 9];
     payload[0] = MAV_TYPE_QUADROTOR; // type
-    payload[1] = MAV_AUTOPILOT_DEV;   // autopilot (development / 自定义)
+    payload[1] = autopilot;          // autopilot
     payload[2] = MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
         | if armed { MAV_MODE_FLAG_SAFETY_ARMED } else { 0 };
-    payload[3..5].copy_from_slice(&(mode as u16).to_le_bytes()); // custom_mode
-    payload[5] = if armed { MAV_STATE_ACTIVE } else { MAV_STATE_STANDBY }; // system_status
-    payload[6] = 3; // mavlink_version (v3)
+    // custom_mode 是 uint32（标准 common.xml），占 [3..7]。
+    payload[3..7].copy_from_slice(&(mode as u32).to_le_bytes());
+    payload[7] = if armed { state_active } else { state_standby }; // system_status
+    payload[8] = 3; // mavlink_version (v3)
     encode(msg_id::HEARTBEAT, seq, &payload, out)
 }
 
@@ -358,17 +390,18 @@ pub fn decode_command_ack(payload: &[u8]) -> Option<(u16, u8)> {
     Some((command, payload[2]))
 }
 
-/// ATTITUDE：四元数 + 角速度（rad/s）。
+/// ATTITUDE：姿态欧拉角 + 角速度（rad/s）。
+/// 标准布局（28B）：time_boot_ms i32, roll f32, pitch f32, yaw f32,
+/// rollspeed f32, pitchspeed f32, yawspeed f32。
 pub fn encode_attitude(state: &VehicleState, seq: u8, out: &mut [u8; MAX_FRAME_LEN]) -> usize {
     let mut p = [0u8; 28];
-    // time_boot_ms (i32) + q[4] f32 + rollspeed/pitchspeed/yawspeed f32
-    put_i32(&mut p, 0, 0);
-    put_f32(&mut p, 4, state.att.w);
-    put_f32(&mut p, 8, state.att.x);
-    put_f32(&mut p, 12, state.att.y);
-    put_f32(&mut p, 16, state.att.z);
-    put_f32(&mut p, 20, state.omega[0].0); // rollspeed (p)
-    put_f32(&mut p, 24, state.omega[1].0); // pitchspeed (q)
+    put_i32(&mut p, 0, state.time_boot_ms);
+    put_f32(&mut p, 4, state.att.roll());
+    put_f32(&mut p, 8, state.att.pitch());
+    put_f32(&mut p, 12, state.att.yaw());
+    put_f32(&mut p, 16, state.omega[0].0); // rollspeed (p)
+    put_f32(&mut p, 20, state.omega[1].0); // pitchspeed (q)
+    put_f32(&mut p, 24, state.omega[2].0); // yawspeed (r)
     encode(msg_id::ATTITUDE, seq, &p, out)
 }
 
@@ -381,7 +414,7 @@ pub fn encode_local_pos(state: &VehicleState, seq: u8, out: &mut [u8; MAX_FRAME_
 /// 内部 helper：构造完整帧（含标准 CRC_EXTRA）后覆盖 sys_id 并重算头部 CRC。
 pub fn encode_local_pos_from(sys_id: u8, state: &VehicleState, seq: u8, out: &mut [u8; MAX_FRAME_LEN]) -> usize {
     let mut p = [0u8; 28];
-    put_i32(&mut p, 0, 0);
+    put_i32(&mut p, 0, state.time_boot_ms);
     put_f32(&mut p, 4, state.pos[0].0);
     put_f32(&mut p, 8, state.pos[1].0);
     put_f32(&mut p, 12, state.pos[2].0);
@@ -413,13 +446,52 @@ pub fn encode_local_pos_from(sys_id: u8, state: &VehicleState, seq: u8, out: &mu
 /// SYS_STATUS：健康位（取 FDIR 健康；此处仅填传感器位）。
 pub fn encode_sys_status(sensors_ok: bool, seq: u8, out: &mut [u8; MAX_FRAME_LEN]) -> usize {
     let mut p = [0u8; 31];
-    put_i32(&mut p, 0, if sensors_ok { 0x1F } else { 0 }); // onboard_control_sensors_present
-    put_i32(&mut p, 4, if sensors_ok { 0x1F } else { 0 }); // enabled
-    put_i32(&mut p, 8, if sensors_ok { 0x1F } else { 0 }); // health
-    // load (u16), voltage (u16), current, comms drop/errors...
-    p[12..14].copy_from_slice(&100u16.to_le_bytes()); // 10% CPU load placeholder
-    p[20..22].copy_from_slice(&0u16.to_le_bytes()); // battery
+    let sensor_bits: i32 = if sensors_ok { 0x1F } else { 0 };
+    put_i32(&mut p, 0, sensor_bits); // onboard_control_sensors_present
+    put_i32(&mut p, 4, sensor_bits); // enabled
+    put_i32(&mut p, 8, sensor_bits); // health
+    // load (u16), voltage_battery (i16 mV/1000), current_battery (i16 cA), battery_remaining (i8 %)
+    put_u16(&mut p, 12, 100); // 10% CPU load placeholder
+    put_i16(&mut p, 14, 12000); // 12.0V battery (mV/1000)
+    put_i16(&mut p, 16, 0); // 0 cA current
+    p[18] = 80; // 80% remaining
     encode(msg_id::SYS_STATUS, seq, &p, out)
+}
+
+/// VFR_HUD：空速/地速/高度/航向/油门（标准 HUD 主盘字段）。
+/// 标准布局（20B）：airspeed f32, groundspeed f32, heading i16 (cdeg),
+/// throttle uint16 (%), alt f32, climb f32。
+/// 本项目无空速计，airspeed=0；groundspeed 取 NED 速度的平面幅值；alt 用本地高度（-pos.z），
+/// heading 由姿态 yaw 导出（厘度 = deg*100）；throttle 由外部控制律写入（0..100）。
+pub fn encode_vfr_hud(state: &VehicleState, throttle_pct: u16, seq: u8, out: &mut [u8; MAX_FRAME_LEN]) -> usize {
+    let mut p = [0u8; 20];
+    let gnd = libm::sqrtf(state.vel[0].0 * state.vel[0].0 + state.vel[1].0 * state.vel[1].0);
+    put_f32(&mut p, 0, 0.0); // airspeed
+    put_f32(&mut p, 4, gnd); // groundspeed
+    let heading_cdeg = (state.att.yaw_deg() * 100.0) as i16;
+    put_i16(&mut p, 8, heading_cdeg); // heading (centidegrees)
+    put_u16(&mut p, 10, throttle_pct); // throttle (%)
+    put_f32(&mut p, 12, -state.pos[2].0); // alt (relative)
+    put_f32(&mut p, 16, state.vel[2].0); // climb rate
+    encode(msg_id::VFR_HUD, seq, &p, out)
+}
+
+/// GLOBAL_POSITION_INT：GPS 全局位置（lat/lon 为 1e7 整数度；无 GPS 时给 0）。
+/// 高度用相对高度（-pos.z * 1000 mm），航向由 yaw 导出。地面站据此在地图上定位（无 GPS 时地图不动，但高度盘正常）。
+pub fn encode_global_position_int(state: &VehicleState, seq: u8, out: &mut [u8; MAX_FRAME_LEN]) -> usize {
+    let mut p = [0u8; 28];
+    // time_boot_ms i32, lat i32 (1e7), lon i32 (1e7), alt int32 (mm, relative), alt_amsl int32,
+    // vx/vy/vz int16 (cm/s), hdg uint16 (cdeg)
+    put_i32(&mut p, 0, state.time_boot_ms);
+    put_i32(&mut p, 4, 0); // lat (no GPS)
+    put_i32(&mut p, 8, 0); // lon
+    put_i32(&mut p, 12, (-state.pos[2].0 * 1000.0) as i32); // relative alt mm
+    put_i32(&mut p, 16, (-state.pos[2].0 * 1000.0) as i32); // alt_amsl mm (no GPS datum)
+    put_i16(&mut p, 20, (state.vel[0].0 * 100.0) as i16);
+    put_i16(&mut p, 22, (state.vel[1].0 * 100.0) as i16);
+    put_i16(&mut p, 24, (state.vel[2].0 * 100.0) as i16);
+    put_u16(&mut p, 26, state.att.yaw_deg() as u16 * 100); // heading cdeg
+    encode(msg_id::GLOBAL_POSITION_INT, seq, &p, out)
 }
 
 #[cfg(test)]
@@ -463,15 +535,15 @@ mod tests {
         encode_heartbeat(5, true, 0, &mut out);
         let frame = frame_from_slice(&out[..21]);
         let (_id, pl) = decode(&frame).unwrap();
-        // type=QUADROTOR(2), autopilot=DEV(13), base_mode 含 ARM 位
+        // type=QUADROTOR(2), autopilot=ARDUPILOT(3), base_mode 含 ARM 位
         assert_eq!(pl[0], enums::MAV_TYPE_QUADROTOR);
-        assert_eq!(pl[1], enums::MAV_AUTOPILOT_DEV);
+        assert_eq!(pl[1], enums::MAV_AUTOPILOT_ARDUPILOTMEGA);
         assert!(pl[2] & enums::MAV_MODE_FLAG_SAFETY_ARMED != 0);
         assert!(pl[2] & enums::MAV_MODE_FLAG_CUSTOM_MODE_ENABLED != 0);
         // custom_mode = 5
         assert_eq!(u16::from_le_bytes([pl[3], pl[4]]), 5);
-        // system_status = ACTIVE(4)
-        assert_eq!(pl[5], enums::MAV_STATE_ACTIVE);
+        // system_status = ACTIVE(4) —— 标准布局位于 payload[7]
+        assert_eq!(pl[7], enums::MAV_STATE_ACTIVE);
     }
 
     #[test]
@@ -513,5 +585,73 @@ mod tests {
         assert_eq!(out[5], 7); // v2 头部位置 [5] = sys_id，覆盖生效
         let frame = frame_from_slice(&out[..n]);
         assert!(decode(&frame).is_some());
+    }
+
+    #[test]
+    fn attitude_uses_euler_layout() {
+        // 标准 ATTITUDE：28B = time_boot_ms i32 + roll/pitch/yaw f32 + 3 rates f32。
+        // 与之前错误的"四元数"布局有本质区别：此处用 euler 角，可被标准地面站解析。
+        let mut st = crate::vehicle::VehicleState::zero();
+        st.time_boot_ms = 1234;
+        st.att = crate::vehicle::Quaternion::from_euler(
+            crate::units::Radian(0.1),
+            crate::units::Radian(0.2),
+            crate::units::Radian(0.3),
+        );
+        st.omega = [
+            crate::units::RadianPerSecond(1.0),
+            crate::units::RadianPerSecond(2.0),
+            crate::units::RadianPerSecond(3.0),
+        ];
+        let mut out = [0u8; MAX_FRAME_LEN];
+        let n = encode_attitude(&st, 0, &mut out);
+        assert_eq!(n, 10 + 28 + 2);
+        let frame = frame_from_slice(&out[..n]);
+        let (_id, pl) = decode(&frame).expect("ATTITUDE should decode (CRC_EXTRA ok)");
+        assert_eq!(pl.len(), 28);
+        assert_eq!(i32::from_le_bytes([pl[0], pl[1], pl[2], pl[3]]), 1234);
+        // roll ~ 0.1 rad（from_euler 构造，应严格等于 roll）
+        assert!((f32::from_le_bytes([pl[4], pl[5], pl[6], pl[7]]) - 0.1).abs() < 1e-3);
+        // yaw ~ 0.3 rad
+        assert!((f32::from_le_bytes([pl[12], pl[13], pl[14], pl[15]]) - 0.3).abs() < 1e-3);
+        // yawspeed = 3.0
+        assert!((f32::from_le_bytes([pl[24], pl[25], pl[26], pl[27]]) - 3.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn vfr_hud_standard_layout() {
+        // 标准 VFR_HUD：20B = airspeed f32, groundspeed f32, heading i16(cdeg),
+        // throttle u16(%), alt f32, climb f32。
+        let mut st = crate::vehicle::VehicleState::zero();
+        st.vel = [
+            crate::units::MeterPerSecond(3.0),
+            crate::units::MeterPerSecond(4.0),
+            crate::units::MeterPerSecond(-1.0),
+        ];
+        st.pos = [crate::units::Meter(0.0), crate::units::Meter(0.0), crate::units::Meter(-50.0)];
+        st.att = crate::vehicle::Quaternion::from_euler(
+            crate::units::Radian(0.0),
+            crate::units::Radian(0.0),
+            crate::units::Radian(0.5),
+        );
+        let mut out = [0u8; MAX_FRAME_LEN];
+        let n = encode_vfr_hud(&st, 42, 0, &mut out);
+        assert_eq!(n, 10 + 20 + 2);
+        let frame = frame_from_slice(&out[..n]);
+        let (_id, pl) = decode(&frame).expect("VFR_HUD should decode (CRC_EXTRA ok)");
+        assert_eq!(pl.len(), 20);
+        // airspeed = 0
+        assert_eq!(f32::from_le_bytes([pl[0], pl[1], pl[2], pl[3]]), 0.0);
+        // groundspeed = 5.0 (sqrt(3^2+4^2))
+        assert!((f32::from_le_bytes([pl[4], pl[5], pl[6], pl[7]]) - 5.0).abs() < 1e-3);
+        // heading cdeg = 0.5*180/pi*100 ~ 2865
+        let heading = i16::from_le_bytes([pl[8], pl[9]]);
+        assert!((heading as f32 - 0.5f32 * 180.0 / core::f32::consts::PI * 100.0).abs() < 2.0);
+        // throttle = 42 (%)
+        assert_eq!(u16::from_le_bytes([pl[10], pl[11]]), 42);
+        // alt = 50.0 (relative = -pos.z)
+        assert!((f32::from_le_bytes([pl[12], pl[13], pl[14], pl[15]]) - 50.0).abs() < 1e-3);
+        // climb = -1.0
+        assert!((f32::from_le_bytes([pl[16], pl[17], pl[18], pl[19]]) - (-1.0)).abs() < 1e-3);
     }
 }

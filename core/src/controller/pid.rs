@@ -118,11 +118,11 @@ impl Controller for PidController {
             0.1, 1.0,
         );
 
-        // 期望姿态四元数：由（roll=tilt_e, pitch=+tilt_n, yaw=sp.yaw）构成。
-        // 飞控机体(前-右-下)：绕+Y 正转 = 机头(+X)向 -Z(下) 转 = 低头，推力前倾→北向加速，
-        // 故北向需 pitch>0；东向需 +roll（右滚，推力东倾）。
+        // 期望姿态四元数：由（roll=tilt_e, pitch=-tilt_n, yaw=sp.yaw）构成。
+        // 飞控机体(经 X-180 实为前-左-下)：推力沿机体 -Z_body。绕 +Y 正转(+pitch) 把推力
+        // 旋到 -X(南)，故北向(+X)加速需 -pitch；东向(+Y)由 +roll(绕+X)正确产生东向推力。
         let yaw = sp.yaw;
-        let q_des = Quaternion::from_euler(Radian(tilt_e), Radian(tilt_n), yaw);
+        let q_des = Quaternion::from_euler(Radian(tilt_e), Radian(-tilt_n), yaw);
 
         // --- 内环：四元数姿态误差 -> 期望机体角速度（标准鲁棒写法，无欧拉角奇点） ---
         // q_err = q_est^-1 ⊗ q_des（机体坐标系下的误差旋转）
@@ -142,17 +142,19 @@ impl Controller for PidController {
         self.dbg_omega = [est.omega[0].0, est.omega[1].0, est.omega[2].0];
 
         // --- 混控：X 型四旋翼（0=前右 1=后左 2=前左 3=后右） ---
-        // 物理引擎 plant.apply_actuators 采用引擎机体(前-右-上)，推力沿 +Z(上)：
-        // 前方电机增推力 -> 绕 Y(右) 负力矩 -> 机头(+X)向 +Z(上) 转 = 抬头。
-        // 但飞控机体(前-右-下)语义期望 +Y(pitch) = 低头(机头前倾、推力北倾)。
-        // 故此处 q 项须取反，使 +Y(pitch) 对应后方增/前方减 -> τ_y>0(低头)。
-        //   +X(roll) ：m0,m2 增 / m1,m3 减
-        //   +Y(pitch)：m1,m3 增 / m0,m2 减（已取反）
-        //   +Z(yaw)  ：CCW(0,2) 增 / CW(1,3) 减
-        let m0 = des_thrust + 0.5 * (p_cmd - q_cmd + r_cmd);
-        let m1 = des_thrust + 0.5 * (-p_cmd + q_cmd + r_cmd);
-        let m2 = des_thrust + 0.5 * (-p_cmd - q_cmd - r_cmd);
-        let m3 = des_thrust + 0.5 * (p_cmd + q_cmd - r_cmd);
+        // 控制器命令 (p_cmd,q_cmd,r_cmd) 在飞控机体轴；quat_up_to_ned 用 X-180 翻转，
+        // 故飞控机体 -> 引擎机体的力矩向量变换为 (τx, τy, τz)_eng = (τx, -τy, -τz)_fc。
+        // 即期望引擎机体力矩 = (p_cmd, -q_cmd, -r_cmd)。由引擎机体电机力矩公式反解
+        // （m0前右/m1后左/m2前左/m3后右，spin 0,1 CCW / 2,3 CW）：
+        //   τx = l(m0+m3-m1-m2)  τy = l(m1+m3-m0-m2)  τz = k(m0+m1-m2-m3)
+        // 代入 (p_cmd,-q_cmd,-r_cmd) 解得如下（K=0.5 吸收臂长/反扭矩系数）：
+        //   +X(roll) ：m0,m3 增 / m1,m2 减
+        //   +Y(pitch)：m1,m3 增 / m0,m2 减
+        //   +Z(yaw)  ：CCW(0,1) 增 / CW(2,3) 减
+        let m0 = des_thrust + 0.5 * (p_cmd + q_cmd - r_cmd);
+        let m1 = des_thrust + 0.5 * (-p_cmd - q_cmd - r_cmd);
+        let m2 = des_thrust + 0.5 * (-p_cmd + q_cmd + r_cmd);
+        let m3 = des_thrust + 0.5 * (p_cmd - q_cmd + r_cmd);
 
         ActuatorCmd {
             motor: [

@@ -19,10 +19,11 @@ impl Quaternion {
     pub const IDENTITY: Self = Self { w: 1.0, x: 0.0, y: 0.0, z: 0.0 };
 
     /// 由 Z-Y-X 欧拉角（roll, pitch, yaw）构造，用于初始/测试。
+    /// 标准公式使用半角：R = Rz(yaw)·Ry(pitch)·Rx(roll)。
     pub fn from_euler(roll: Radian, pitch: Radian, yaw: Radian) -> Self {
-        let (sr, cr) = crate::math::sin_cos(roll.0);
-        let (sp, cp) = crate::math::sin_cos(pitch.0);
-        let (sy, cy) = crate::math::sin_cos(yaw.0);
+        let (sr, cr) = crate::math::sin_cos(roll.0 * 0.5);
+        let (sp, cp) = crate::math::sin_cos(pitch.0 * 0.5);
+        let (sy, cy) = crate::math::sin_cos(yaw.0 * 0.5);
         Self {
             w: cr * cp * cy + sr * sp * sy,
             x: sr * cp * cy - cr * sp * sy,
@@ -52,6 +53,33 @@ impl Quaternion {
         let dz = 0.5 * (w * r + x * q - y * p);
         Self { w: w + dw * dt, x: x + dx * dt, y: y + dy * dt, z: z + dz * dt }.normalize()
     }
+
+    /// 由四元数（机体->世界，Z-Y-X 约定）提取 yaw（航向角，弧度）。
+    /// 公式：yaw = atan2(2*(w*z + x*y), 1 - 2*(y*y + z*z))。
+    pub fn yaw(self) -> f32 {
+        let (w, x, y, z) = (self.w, self.x, self.y, self.z);
+        crate::math::atan2(2.0 * (w * z + x * y), 1.0 - 2.0 * (y * y + z * z))
+    }
+
+    /// yaw 转成度（地面站 heading 字段用）。
+    pub fn yaw_deg(self) -> f32 {
+        self.yaw() * 180.0 / core::f32::consts::PI
+    }
+
+    /// 由四元数（机体->世界，Z-Y-X 约定）提取 roll（横滚角，弧度）。
+    /// 公式：roll = atan2(2*(w*x + y*z), 1 - 2*(x*x + y*y))。
+    pub fn roll(self) -> f32 {
+        let (w, x, y, z) = (self.w, self.x, self.y, self.z);
+        crate::math::atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y))
+    }
+
+    /// 由四元数（机体->世界，Z-Y-X 约定）提取 pitch（俯仰角，弧度）。
+    /// 公式：pitch = asin(2*(w*y - z*x))，夹取到 [-pi/2, pi/2]。
+    pub fn pitch(self) -> f32 {
+        let (w, x, y, z) = (self.w, self.x, self.y, self.z);
+        let v = 2.0 * (w * y - z * x);
+        crate::math::asin(libm::fmaxf(-1.0, libm::fminf(1.0, v)))
+    }
 }
 
 impl core::ops::Mul for Quaternion {
@@ -64,6 +92,8 @@ impl core::ops::Mul for Quaternion {
 /// 飞行器完整运动状态（世界系 NED：北-X，东-Y，下-Z）。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VehicleState {
+    /// 系统启动以来的启动时长（ms），MAVLink 多消息 time_boot_ms 字段共用，便于地面站对齐时序。
+    pub time_boot_ms: i32,
     pub pos: [Meter; 3],          // 位置 (N, E, D)  注意 D 向下为正
     pub vel: [MeterPerSecond; 3], // 速度 (N, E, D)
     pub att: Quaternion,          // 姿态四元数（机体->世界）
@@ -75,6 +105,7 @@ pub struct VehicleState {
 impl VehicleState {
     pub fn zero() -> Self {
         Self {
+            time_boot_ms: 0,
             pos: [Meter::ZERO, Meter::ZERO, Meter::ZERO],
             vel: [MeterPerSecond::ZERO, MeterPerSecond::ZERO, MeterPerSecond::ZERO],
             att: Quaternion::IDENTITY,

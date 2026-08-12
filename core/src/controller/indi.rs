@@ -63,6 +63,11 @@ pub struct IndiController<B: Controller> {
 }
 
 impl<B: Controller> IndiController<B> {
+    /// 取内层基础控制律（调试用）。
+    pub fn inner(&self) -> &B {
+        &self.base
+    }
+
     /// `ctrl_eff` 为三轴控制效能（p,q,r），`gain_scale` 为 INDI 总强度。
     pub fn new(base: B, ctrl_eff: [f32; 3], gain_scale: f32) -> Self {
         Self {

@@ -110,6 +110,11 @@ impl EkfEstimator {
         [self.x[6], self.x[7], self.x[8]]
     }
 
+    /// 当前估计的姿态四元数（调试/诊断用）。
+    pub fn att(&self) -> Quaternion {
+        self.att
+    }
+
     /// 当前协方差矩阵（9x9 行主序）引用，供不变量校验（对称半正定）使用。
     pub fn cov(&self) -> &[f32; N * N] {
         &self.p
@@ -190,6 +195,7 @@ impl Estimator for EkfEstimator {
         }
 
         VehicleState {
+            time_boot_ms: 0,
             pos: [Meter(self.x[0]), Meter(self.x[1]), Meter(self.x[2])],
             vel: [MeterPerSecond(self.x[3]), MeterPerSecond(self.x[4]), MeterPerSecond(self.x[5])],
             att: self.att,

@@ -61,6 +61,7 @@ fn random_att(rng: &mut Lcg) -> Quaternion {
 
 fn random_state(rng: &mut Lcg) -> VehicleState {
     VehicleState {
+        time_boot_ms: 0,
         pos: [
             Meter(rng.spread(50.0)),
             Meter(rng.spread(50.0)),

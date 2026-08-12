@@ -313,6 +313,7 @@ mod tests {
         );
         // 长机广播自身状态 → 僚机入库。
         let leader_state = VehicleState {
+            time_boot_ms: 0,
             pos: [Meter(0.0), Meter(0.0), Meter(-10.0)],
             vel: [MeterPerSecond::ZERO; 3],
             att: crate::vehicle::Quaternion::IDENTITY,
@@ -327,6 +328,7 @@ mod tests {
 
         // 僚机初始在长机正上方 (会撞)，验证避碰+编队把其推离并趋向偏移位。
         let wing_state = VehicleState {
+            time_boot_ms: 0,
             pos: [Meter(0.0), Meter(0.0), Meter(-10.0)],
             vel: [MeterPerSecond::ZERO; 3],
             att: crate::vehicle::Quaternion::IDENTITY,

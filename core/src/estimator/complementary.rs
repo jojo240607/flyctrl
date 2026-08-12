@@ -142,6 +142,7 @@ impl Estimator for ComplementaryEstimator {
         }
 
         VehicleState {
+            time_boot_ms: 0,
             pos: self.pos_out,
             vel: self.vel,
             att: self.att,
