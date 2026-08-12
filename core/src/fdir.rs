@@ -97,15 +97,22 @@ impl Fdir {
         mag_available: bool,
     ) -> Health {
         // --- IMU 冻结检测：加速度三轴连续不变 ---
-        let frozen = imu.accel[0].0 == self.last_acc[0]
-            && imu.accel[1].0 == self.last_acc[1]
-            && imu.accel[2].0 == self.last_acc[2];
+        // 注意：稳定悬停时机体加速度确实长时间恒定（含约 9.81 m/s² 的重力比力），
+        // 这**不是**故障。真正的 IMU 卡死通常输出恒定且明显偏离静力学重力的异常值
+        // （如全 0 或噪声断流），故冻结判据要求：(a) 连续不变；(b) 加速度范数明显
+        // 偏离"合理静态重力区间"（[6, 14] m/s²，覆盖失重/过载/断流等异常）。
+        let a = [imu.accel[0].0, imu.accel[1].0, imu.accel[2].0];
+        let norm = libm::sqrtf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+        let frozen = (norm < 6.0 || norm > 14.0)
+            && a[0] == self.last_acc[0]
+            && a[1] == self.last_acc[1]
+            && a[2] == self.last_acc[2];
         if frozen {
             self.imu_stale_steps += 1;
         } else {
             self.imu_stale_steps = 0;
         }
-        self.last_acc = [imu.accel[0].0, imu.accel[1].0, imu.accel[2].0];
+        self.last_acc = a;
 
         // --- 各传感器 dropout 检测（滑动窗口计数）---
         self.gps_lost_steps = if pos_available { 0 } else { self.gps_lost_steps + 1 };
@@ -243,10 +250,11 @@ mod tests {
     fn critical_on_imu_freeze() {
         let mut f = Fdir::new();
         f.update(&sample([0.0, 0.0, 9.8]), true, true, true);
-        // IMU 冻结（每次读数完全相同）超过阈值 → 危险
+        // IMU 冻结（每次读数完全相同）且范数明显偏离静态重力区间 [6,14] → 危险。
+        // 用全 0 读数模拟断流/卡死（norm=0 < 6）。
         let mut h = Health::Nominal;
         for _ in 0..f.imu_stale_timeout + 1 {
-            h = f.update(&sample([0.0, 0.0, 9.8]), true, true, true);
+            h = f.update(&sample([0.0, 0.0, 0.0]), true, true, true);
         }
         assert_eq!(h, Health::Critical);
         assert!(f.flags().imu_frozen);

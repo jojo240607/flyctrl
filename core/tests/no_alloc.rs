@@ -40,7 +40,7 @@ fn zero_heap_control_loop_runs() {
         let sample = imu.read();
         let pos = gps.read();
         let _health = fdir.update(&sample, pos.is_some(), true, true);
-        let state = est.step(dt, sample, pos);
+        let state = est.step(dt, sample, pos, None);
         let cmd = ctrl.control(dt, &sp, &state);
         act.apply(&cmd);
         last_state = state;

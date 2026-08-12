@@ -68,6 +68,8 @@ pub struct VehicleState {
     pub vel: [MeterPerSecond; 3], // 速度 (N, E, D)
     pub att: Quaternion,          // 姿态四元数（机体->世界）
     pub omega: [RadianPerSecond; 3], // 机体角速度 (p, q, r)
+    /// 估计空速（m/s），由空速计测量（经 EKF 融合）；无空速计时为 0。
+    pub airspeed: MeterPerSecond,
 }
 
 impl VehicleState {
@@ -77,6 +79,7 @@ impl VehicleState {
             vel: [MeterPerSecond::ZERO, MeterPerSecond::ZERO, MeterPerSecond::ZERO],
             att: Quaternion::IDENTITY,
             omega: [RadianPerSecond::ZERO, RadianPerSecond::ZERO, RadianPerSecond::ZERO],
+            airspeed: MeterPerSecond::ZERO,
         }
     }
 }
@@ -113,6 +116,14 @@ pub struct ImuSample {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PosSample {
     pub pos: [Meter; 3], // NED 位置
+}
+
+/// 空速计（皮托管 / 差分气压）单次测量：总压 - 静压差换算的真空速（IAS≈TAS，忽略空气压缩）。
+/// 空速计测的是**气流相对机体的速度大小**，不含风。EKF 用它对水平速度幅值做约束。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AirspeedSample {
+    pub speed: Airspeed,
+    pub timestamp_s: f64,
 }
 
 /// 控制输出：四个电机的归一化推力指令 [0,1]。

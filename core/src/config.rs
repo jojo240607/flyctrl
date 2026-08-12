@@ -18,12 +18,27 @@ pub struct VehicleConfig {
     pub torque_coeff: f32,     // N·m 力矩系数（偏航混控用）
     pub inertia: [f32; 3],     // 主惯量 Ixx Iyy Izz (kg·m^2)
     pub motor_tau: f32,        // 电机一阶响应时间常数 (s)
+    // ---- 阶段 8 动力系统（电池 + 电机 + 螺旋桨）----
+    /// 电池标称电压（V），如 4S LiPo ≈ 14.8。
+    pub battery_v_nom: f32,
+    /// 电池内阻（Ω），决定大电流下电压跌落幅度。
+    pub battery_r: f32,
+    /// 电机转速常数（rad/s per V），由 KV（rpm/V）换算 KV·2π/60。
+    pub motor_kv: f32,
+    /// 电机绕组电阻（Ω），影响电流与发热。
+    pub motor_r: f32,
+    /// 电机+螺旋桨转子绕轴转动惯量（kg·m²），用于陀螺进动效应。
+    pub rotor_inertia: f32,
     /// 机体阻力系数（前/右/下三轴，N/(m/s)^2），描述机身/机臂外露气动阻力。
     pub drag_coeff: [f32; 3],
     /// 诱导阻力系数（无量纲），旋翼向下诱导速度产生的附加阻力。
     pub induced_drag_coeff: f32,
     /// 桨盘面积 (m^2)，动量理论诱导速度计算用。
     pub disk_area: f32,
+    /// 滑流拖曳系数（无量纲），旋翼下洗气流冲击机体产生的附加下拉力。
+    /// 动量理论下洗速度 vi = sqrt(T/(2·ρ·A))，滑流作用在机体投影面积上的
+    /// 下拉力 ≈ slipstream_drag_coeff · 0.5·ρ·A·vi²。
+    pub slipstream_drag_coeff: f32,
     /// 空气密度 (kg/m^3)。
     pub air_density: f32,
     pub gravity: f32,          // m/s^2（NED 下为正）
@@ -47,12 +62,21 @@ impl VehicleConfig {
             torque_coeff: 0.02,
             inertia: [0.02, 0.02, 0.04],
             motor_tau: 0.05,
+            // 动力系统：4S LiPo（~14.8V，内阻 0.015Ω，悬停掉压小、大油门掉压明显）
+            // + 980KV 电机（~102.6 rad/s/V，绕组 0.12Ω）
+            battery_v_nom: 14.8,
+            battery_r: 0.015,
+            motor_kv: 102.6,
+            motor_r: 0.12,
+            rotor_inertia: 1.2e-5, // 小型旋翼+电机转子惯量 ≈ 1.2e-5 kg·m²
             // 机身/机臂外露阻力（前向略大，向下最小）：N/(m/s)^2 × v^2
             drag_coeff: [0.18, 0.18, 0.10],
             // 诱导阻力：与总推力平方根成正比（动量理论），无量纲标定
             induced_drag_coeff: 0.12,
             // 450mm 四旋翼等效桨盘面积（4× 桨盘），约 0.19 m^2
             disk_area: 0.19,
+            // 滑流拖曳：下洗冲击机体，等效约 6% 的桨盘动量通量耦合到机身。
+            slipstream_drag_coeff: 0.06,
             air_density: 1.225,
             gravity: 9.81,
             tilt_max: 0.35,
@@ -75,7 +99,13 @@ impl VehicleConfig {
             drag_coeff: self.drag_coeff,
             induced_drag_coeff: self.induced_drag_coeff,
             disk_area: self.disk_area,
+            slipstream_drag_coeff: self.slipstream_drag_coeff,
             air_density: self.air_density,
+            battery_v_nom: self.battery_v_nom,
+            battery_r: self.battery_r,
+            motor_kv: self.motor_kv,
+            motor_r: self.motor_r,
+            rotor_inertia: self.rotor_inertia,
         }
     }
 
@@ -110,8 +140,21 @@ pub struct DynParams {
     pub induced_drag_coeff: f32,
     /// 桨盘面积 (m^2)，用于诱导速度计算（动量理论）。
     pub disk_area: f32,
+    /// 滑流拖曳系数（无量纲），旋翼下洗气流冲击机体产生的附加下拉力。
+    pub slipstream_drag_coeff: f32,
     /// 空气密度 (kg/m^3)，标准海平面 1.225。
     pub air_density: f32,
+    // ---- 阶段 8 动力系统 ----
+    /// 电池标称电压（V）。
+    pub battery_v_nom: f32,
+    /// 电池内阻（Ω）。
+    pub battery_r: f32,
+    /// 电机转速常数（rad/s per V）。
+    pub motor_kv: f32,
+    /// 电机绕组电阻（Ω）。
+    pub motor_r: f32,
+    /// 电机+螺旋桨转子绕轴转动惯量（kg·m²）。
+    pub rotor_inertia: f32,
 }
 
 /// 控制律共享参数子集（从 [`VehicleConfig`] 派生）。

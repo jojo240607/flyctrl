@@ -190,7 +190,7 @@ mod tests {
             ekf.reset();
             let mut s = VehicleState::zero();
             for _ in 0..4 {
-                s = ekf.step(Second(0.01), imu.read(), gps.read());
+                s = ekf.step(Second(0.01), imu.read(), gps.read(), None);
             }
             let cmd = indi.control(Second(0.01), &sp, &s);
             assert!(actuator_bounded(&cmd), "INDI 输出必须 [0,1]");
@@ -218,7 +218,7 @@ mod tests {
             ekf.reset();
             let mut s = VehicleState::zero();
             for _ in 0..4 {
-                s = ekf.step(Second(0.01), imu.read(), gps.read());
+                s = ekf.step(Second(0.01), imu.read(), gps.read(), None);
             }
             // 两拍之间注入一个突变滚转角速度（模拟外部扰动产生的角加速度）。
             if step % 2 == 0 {

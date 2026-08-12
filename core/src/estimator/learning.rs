@@ -15,7 +15,7 @@
 
 use crate::estimator::Estimator;
 use crate::units::*;
-use crate::vehicle::{ImuSample, PosSample, VehicleState};
+use crate::vehicle::{AirspeedSample, ImuSample, PosSample, VehicleState};
 
 /// 残差补偿模型接口。
 ///
@@ -63,8 +63,8 @@ impl<E: Estimator, R: ResidualModel> LearningEstimator<E, R> {
 }
 
 impl<E: Estimator, R: ResidualModel> Estimator for LearningEstimator<E, R> {
-    fn step(&mut self, dt: Second, imu: ImuSample, gps: Option<PosSample>) -> VehicleState {
-        let mut st = self.base.step(dt, imu, gps);
+    fn step(&mut self, dt: Second, imu: ImuSample, gps: Option<PosSample>, airspeed: Option<AirspeedSample>) -> VehicleState {
+        let mut st = self.base.step(dt, imu, gps, airspeed);
         let (dp, dv) = self.residual.correct(&st, &imu, &gps);
         st.pos[0] = Meter(st.pos[0].0 + dp[0]);
         st.pos[1] = Meter(st.pos[1].0 + dp[1]);
@@ -96,8 +96,8 @@ mod tests {
             gyro: [RadianPerSecond(0.0); 3],
         };
         let gps = Some(PosSample { pos: [Meter(1.0), Meter(2.0), Meter(-5.0)] });
-        let a = ekf.step(Second(0.01), imu, gps);
-        let b = le.step(Second(0.01), imu, gps);
+        let a = ekf.step(Second(0.01), imu, gps, None);
+        let b = le.step(Second(0.01), imu, gps, None);
         assert_eq!(a.pos[0].0, b.pos[0].0);
         assert_eq!(a.vel[1].0, b.vel[1].0);
     }
@@ -112,7 +112,7 @@ mod tests {
             gyro: [RadianPerSecond(0.0); 3],
         };
         let gps = Some(PosSample { pos: [Meter(1.0), Meter(2.0), Meter(-5.0)] });
-        let st = le.step(Second(0.01), imu, gps);
+        let st = le.step(Second(0.01), imu, gps, None);
         // 基底估计应约等于 gps 位置，加偏置后应偏离 0.1/-0.2/0.3。
         assert!((st.pos[0].0 - 1.1).abs() < 0.5, "pos[0] 应含 +0.1 偏置修正，得到 {}", st.pos[0].0);
     }

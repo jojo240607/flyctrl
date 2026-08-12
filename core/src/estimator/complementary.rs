@@ -11,7 +11,7 @@
 //!   - 输出给控制器的位置估计再经一层 EMA 低通（pos_out_alpha），进一步压低噪声。
 
 use crate::units::*;
-use crate::vehicle::{ImuSample, PosSample, Quaternion, VehicleState, rotate_vec_by_quat};
+use crate::vehicle::{AirspeedSample, ImuSample, PosSample, Quaternion, VehicleState, rotate_vec_by_quat};
 use crate::estimator::Estimator;
 
 pub struct ComplementaryEstimator {
@@ -26,6 +26,8 @@ pub struct ComplementaryEstimator {
     obs_v_lpf: [MeterPerSecond; 3],
     /// 上一拍测量位置（用于位置差分）
     prev_raw: [Meter; 3],
+    /// 估计空速（m/s），由空速计测量直接低通获得
+    airspeed: f32,
     /// 陀螺->姿态融合系数（0..1，越大越信任陀螺）
     att_alpha: f32,
     /// 输出位置 EMA 系数（测量位置低通，滤除 GPS 级噪声）
@@ -57,6 +59,7 @@ impl ComplementaryEstimator {
             pos_out: [Meter::ZERO; 3],
             obs_v_lpf: [MeterPerSecond::ZERO; 3],
             prev_raw: [Meter::ZERO; 3],
+            airspeed: 0.0,
             att_alpha,
             pos_out_alpha,
             vel_alpha,
@@ -67,7 +70,7 @@ impl ComplementaryEstimator {
 }
 
 impl Estimator for ComplementaryEstimator {
-    fn step(&mut self, dt: Second, imu: ImuSample, pos: Option<PosSample>) -> VehicleState {
+    fn step(&mut self, dt: Second, imu: ImuSample, pos: Option<PosSample>, airspeed: Option<AirspeedSample>) -> VehicleState {
         // 1) 姿态：陀螺积分 + 加速度计重力参考修正（互补滤波，直接修正姿态，不做零偏估计）。
         //    设计要点（闭环稳定性）：估计姿态必须紧贴真实姿态。真实姿态 = 积分(真实陀螺)；
         //    本估计器同样积分(传感器陀螺)，二者仅在陀螺噪声上有差异。因此陀螺噪声必须
@@ -131,11 +134,19 @@ impl Estimator for ComplementaryEstimator {
             }
         }
 
+        // 3) 空速（互补滤波：直接信任测量，轻低通，时间常数 ~0.5s）
+        if let Some(aspd) = airspeed {
+            let s = aspd.speed.0;
+            let alpha = (dt.0 / (dt.0 + 0.5)).clamp(0.0, 1.0);
+            self.airspeed += alpha * (s - self.airspeed);
+        }
+
         VehicleState {
             pos: self.pos_out,
             vel: self.vel,
             att: self.att,
             omega: self.omega,
+            airspeed: MeterPerSecond(self.airspeed),
         }
     }
 
@@ -164,9 +175,9 @@ mod tests {
             accel: [MeterPerSecondSquared(0.0), MeterPerSecondSquared(0.0), MeterPerSecondSquared(-9.81)],
             gyro: [RadianPerSecond(0.0); 3],
         };
-        let mut last: VehicleState = est.step(Second(0.005), imu, None);
+        let mut last: VehicleState = est.step(Second(0.005), imu, None, None);
         for _ in 0..200 {
-            last = est.step(Second(0.005), imu, None);
+            last = est.step(Second(0.005), imu, None, None);
         }
         assert!(last.att.w > 0.99, "attitude corrupted: w={:.4} x={:.4} y={:.4} z={:.4}",
             last.att.w, last.att.x, last.att.y, last.att.z);

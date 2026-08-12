@@ -33,6 +33,7 @@ pub mod msg_id {
     pub const ATTITUDE: u8 = 30;
     pub const LOCAL_POSITION_NED: u8 = 32;
     pub const COMMAND_LONG: u8 = 76;
+    pub const COMMAND_ACK: u8 = 77;
     pub const PARAM_REQUEST_LIST: u8 = 21;
     pub const PARAM_VALUE: u8 = 22;
     pub const PARAM_SET: u8 = 23;
@@ -51,6 +52,7 @@ pub const CRC_EXTRA: [u8; 256] = {
     t[msg_id::ATTITUDE as usize] = 39;
     t[msg_id::LOCAL_POSITION_NED as usize] = 143;
     t[msg_id::COMMAND_LONG as usize] = 152;
+    t[msg_id::COMMAND_ACK as usize] = 208; // 标准 common.xml CRC_EXTRA
     t
 };
 
@@ -159,6 +161,12 @@ pub mod enums {
     pub const MAV_CMD_REQUEST_AUTOPILOT_CAPABILITIES: u16 = 520;
     /// MAV_PARAM_TYPE（PARAM_VALUE/PARAM_SET.param_type）。
     pub const MAV_PARAM_TYPE_REAL32: u8 = 9;
+    /// MAV_RESULT（COMMAND_ACK.result）。
+    pub const MAV_RESULT_ACCEPTED: u8 = 0;
+    pub const MAV_RESULT_TEMPORARILY_REJECTED: u8 = 1;
+    pub const MAV_RESULT_DENIED: u8 = 2;
+    pub const MAV_RESULT_UNSUPPORTED: u8 = 3;
+    pub const MAV_RESULT_FAILED: u8 = 4;
 }
 
 /// HEARTBEAT：声明飞控存活 + 当前模式（标准字段，QGC 可识别）。
@@ -270,6 +278,62 @@ pub fn decode_param_value(payload: &[u8]) -> Option<ParamValue> {
         param_count: u16::from_le_bytes([payload[21], payload[22]]),
         param_index: u16::from_le_bytes([payload[23], payload[24]]),
     })
+}
+
+/// PARAM_REQUEST_LIST 解码（地面站 -> 飞控，请求参数表全量流水）。
+/// 该消息无 payload 字段（仅头部），只需识别 msg_id 即可。
+pub fn decode_param_request_list(_payload: &[u8]) -> Option<()> {
+    Some(())
+}
+
+/// PARAM_SET 解码（地面站 -> 飞控，写入单个参数）。
+/// `id` 为 16 字节 NUL 结尾参数名；`value` 为 f32；`param_type` 见 [`enums::MAV_PARAM_TYPE_REAL32`]。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ParamSet {
+    pub id: [u8; 16],
+    pub value: f32,
+    pub param_type: u8,
+}
+
+pub fn decode_param_set(payload: &[u8]) -> Option<ParamSet> {
+    if payload.len() < 20 { return None; }
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&payload[0..16]);
+    Some(ParamSet {
+        id,
+        value: f32::from_le_bytes(payload[16..20].try_into().unwrap()),
+        param_type: payload[20],
+    })
+}
+
+/// COMMAND_ACK：飞控对地面站指令的应答（确认/拒绝）。
+/// `command` 为被应答的 MAV_CMD；`result` 见 [`enums::MAV_RESULT_*`]；
+/// `progress` 为完成进度(0-100)，`result_param2` 为附加结果。
+pub fn encode_command_ack(
+    command: u16,
+    result: u8,
+    progress: u8,
+    result_param2: i32,
+    seq: u8,
+    out: &mut [u8; MAX_FRAME_LEN],
+) -> usize {
+    let mut p = [0u8; 11];
+    p[0..2].copy_from_slice(&command.to_le_bytes());
+    p[2] = result;
+    p[3] = progress;
+    p[4..8].copy_from_slice(&result_param2.to_le_bytes());
+    // target_system, target_component（应答回地面站）
+    p[8] = 0; // broadcast
+    p[9] = 0; // broadcast
+    p[10] = 0; // mavlink_version reserved
+    encode(msg_id::COMMAND_ACK, seq, &p, out)
+}
+
+/// COMMAND_ACK 解码（地面站 -> 飞控，用于请求重发/确认链路）。
+pub fn decode_command_ack(payload: &[u8]) -> Option<(u16, u8)> {
+    if payload.len() < 3 { return None; }
+    let command = u16::from_le_bytes([payload[0], payload[1]]);
+    Some((command, payload[2]))
 }
 
 /// ATTITUDE：四元数 + 角速度（rad/s）。

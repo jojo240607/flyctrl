@@ -9,7 +9,7 @@
 //!   真实 PAC 接入时替换内部寄存器访问即可，算法层零改动）。
 
 use crate::units::*;
-use crate::vehicle::{ImuSample, PosSample, RcInput};
+use crate::vehicle::{AirspeedSample, ImuSample, PosSample, RcInput};
 
 /// IMU（陀螺 + 加速度计）传感器。
 pub trait ImuSensor {
@@ -38,6 +38,13 @@ pub trait BaroSensor {
 pub trait MagSensor {
     /// 读取机体系磁场向量（任意单位，归一化用）。
     fn read(&mut self) -> [f32; 3];
+    fn healthy(&self) -> bool;
+}
+
+/// 空速管 / 差分气压（测量总压 - 静压差换算真空速，不含风）。
+pub trait AirspeedSensor {
+    /// 读取一次空速样本；故障/无效时返回 `None`。
+    fn read(&mut self) -> Option<AirspeedSample>;
     fn healthy(&self) -> bool;
 }
 
@@ -133,6 +140,41 @@ impl MagSensor for MockMag {
     fn healthy(&self) -> bool { self.healthy }
 }
 
+/// Mock 空速管：恒定空速 `speed`（m/s），可设故障。
+#[derive(Clone)]
+pub struct MockAirspeed {
+    speed: f32,       // 真空速 m/s（不含风）
+    healthy: bool,
+    t: f32,
+}
+
+impl MockAirspeed {
+    pub fn new(speed: f32) -> Self {
+        Self { speed, healthy: true, t: 0.0 }
+    }
+    /// 设恒定的模拟空速（用于驱动 EKF 融合测试）。
+    pub fn set_speed(&mut self, v: f32) { self.speed = v; }
+    pub fn set_health(&mut self, h: bool) { self.healthy = h; }
+}
+
+impl Default for MockAirspeed {
+    fn default() -> Self { Self::new(0.0) }
+}
+
+impl AirspeedSensor for MockAirspeed {
+    fn read(&mut self) -> Option<AirspeedSample> {
+        if !self.healthy { return None; }
+        self.t += 0.005;
+        // 轻微抖动模拟风噪，量级 ~0.05 m/s。
+        let noise = crate::math::sin(self.t * 50.0) * 0.05;
+        Some(AirspeedSample {
+            speed: Airspeed((self.speed + noise).max(0.0)),
+            timestamp_s: self.t as f64,
+        })
+    }
+    fn healthy(&self) -> bool { self.healthy }
+}
+
 // ─────────────────────────────────────────────────────────────
 // STM32F407 占位实现
 //
@@ -192,6 +234,18 @@ pub mod stm32f407 {
     impl Qmc5883l { pub const fn new() -> Self { Self { ok: true } } }
     impl MagSensor for Qmc5883l {
         fn read(&mut self) -> [f32; 3] { [0.0; 3] }
+        fn healthy(&self) -> bool { self.ok }
+    }
+
+    /// STM32F4 上的 MS4525DO（I2C）差分气压空速管。
+    pub struct PitotMs4525do { ok: bool }
+    impl PitotMs4525do { pub const fn new() -> Self { Self { ok: true } } }
+    impl AirspeedSensor for PitotMs4525do {
+        fn read(&mut self) -> Option<AirspeedSample> {
+            let _ = self.ok;
+            // 占位：读取差分 ADC -> 动压 -> 空速 = sqrt(2·Δp/ρ_air)。
+            None
+        }
         fn healthy(&self) -> bool { self.ok }
     }
 }

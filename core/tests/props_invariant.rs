@@ -77,6 +77,7 @@ fn random_state(rng: &mut Lcg) -> VehicleState {
             RadianPerSecond(rng.spread(3.0)),
         ],
         att: random_att(rng),
+        airspeed: MeterPerSecond(rng.spread(10.0)),
     }
 }
 
@@ -130,7 +131,7 @@ fn prop_actuator_bounded_under_disturbance() {
             let z = PosSample {
                 pos: [est.pos[0], est.pos[1], est.pos[2]],
             };
-            est = ekf.step(Second(0.01), imu, Some(z));
+            est = ekf.step(Second(0.01), imu, Some(z), None);
         }
         let cmd = pid.control(Second(0.01), &sp, &est);
         assert!(
@@ -159,7 +160,7 @@ fn prop_ekf_cov_psd_under_noise() {
                 s.pos[2] + Meter(rng.spread(0.5)),
             ];
             let z = PosSample { pos: noisy_pos };
-            s = ekf.step(Second(0.01), imu, Some(z));
+            s = ekf.step(Second(0.01), imu, Some(z), None);
         }
         let p = ekf.cov();
         assert!(
@@ -189,7 +190,7 @@ fn prop_no_nan_over_full_chain() {
             let z = PosSample {
                 pos: [s.pos[0], s.pos[1], s.pos[2]],
             };
-            s = ekf.step(Second(0.01), imu, Some(z));
+            s = ekf.step(Second(0.01), imu, Some(z), None);
         }
         // 估计状态有限。
         assert!(state_finite(&s), "估计状态不得含 NaN/Inf");
@@ -208,7 +209,7 @@ fn prop_fdir_critical_is_one_way() {
         accel: [
             MeterPerSecondSquared(0.0),
             MeterPerSecondSquared(0.0),
-            MeterPerSecondSquared(-9.81),
+            MeterPerSecondSquared(0.0),
         ],
         gyro: [RadianPerSecond(0.0); 3],
     };

@@ -124,7 +124,7 @@ fn run_fault_sequence(seed: u64, steps: u32) {
     let mut f = Fdir::new();
     let (_gps_to, _baro_to, _mag_to, imu_to) = f.timeouts();
     for _ in 0..(imu_to + 1) {
-        f.update(&sample([0.0, 0.0, 9.8]), true, true, true); // 冻结
+        f.update(&sample([0.0, 0.0, 0.0]), true, true, true); // 冻结（norm=0，断流/卡死）
     }
     assert_eq!(f.health(), Health::Critical);
     let (gps_to, baro_to, mag_to, imu_stale_to) = f.timeouts();

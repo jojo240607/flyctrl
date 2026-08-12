@@ -33,6 +33,7 @@ unit!(Meter, "长度 (m)");
 unit!(Second, "时间 (s)");
 unit!(Radian, "角度 (rad)");
 unit!(MeterPerSecond, "线速度 (m/s)");
+unit!(Airspeed, "空速 (m/s)，皮托管/差分气压测得的总压-静压差换算");
 unit!(RadianPerSecond, "角速度 (rad/s)");
 unit!(MeterPerSecondSquared, "线加速度 (m/s^2)");
 unit!(Newton, "力 (N)");

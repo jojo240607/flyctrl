@@ -14,9 +14,9 @@ use crate::controller::Controller;
 use crate::estimator::Estimator;
 use crate::fdir::{Fdir, Health};
 use crate::hal::actuator::{clamp_thrust, MotorActuator};
-use crate::hal::sensor::{GpsSensor, ImuSensor};
+use crate::hal::sensor::{AirspeedSensor, GpsSensor, ImuSensor};
 use crate::units::{Meter, Second};
-use crate::vehicle::{ActuatorCmd, PosSample};
+use crate::vehicle::ActuatorCmd;
 
 /// 单步闭环上下文（跨步持久状态）。
 pub struct HilContext<E, C>
@@ -55,10 +55,11 @@ where
     /// - `motors`：执行器（泛型）。
     ///
     /// 返回本拍估计状态（供遥测/HIL 回采比对）。
-    pub fn step<I, G, M>(
+    pub fn step<I, G, A, M>(
         &mut self,
         imu: &mut I,
         gps: &mut G,
+        airspeed: &mut A,
         setpoint: &crate::controller::Setpoint,
         motors: &mut M,
         cfg: &VehicleConfig,
@@ -66,15 +67,17 @@ where
     where
         I: ImuSensor,
         G: GpsSensor,
+        A: AirspeedSensor,
         M: MotorActuator,
     {
         // 1) 采集传感器。
         let sample = imu.read();
         let pos = gps.read();
         let pos_available = pos.is_some();
+        let air_sample = airspeed.read();
 
         // 2) 估计。
-        let est_state = self.est.step(self.dt, sample, pos);
+        let est_state = self.est.step(self.dt, sample, pos, air_sample);
 
         // 3) FDIR 健康监控（基于 IMU 冻结 + GPS dropout）。
         let health = self.fdir.update(&sample, pos_available, true, true);
@@ -113,7 +116,7 @@ mod tests {
     use crate::controller::Controller;
     use crate::estimator::ekf::EkfEstimator;
     use crate::hal::actuator::MockMotors;
-    use crate::hal::sensor::{MockBaro, MockGps, MockImu, MockMag};
+    use crate::hal::sensor::{MockAirspeed, MockBaro, MockGps, MockImu, MockMag};
     use crate::invariants::{actuator_bounded, state_finite};
     use crate::units::Second;
     use crate::vehicle::ImuSample;
@@ -125,6 +128,7 @@ mod tests {
         let cfg = VehicleConfig::default_quad();
         let mut imu = MockImu::new();
         let mut gps = MockGps::new();
+        let mut air = MockAirspeed::new(0.0);
         let _baro = MockBaro::new();
         let _mag = MockMag::new();
         let mut motors = MockMotors::new(crate::hal::actuator::OutputProtocol::Pwm);
@@ -133,7 +137,7 @@ mod tests {
         let sp = crate::controller::Setpoint::hover([Meter(0.0), Meter(0.0), Meter(-5.0)], crate::units::Radian(0.0));
 
         for _ in 0..300 {
-            let st = ctx.step(&mut imu, &mut gps, &sp, &mut motors, &cfg);
+            let st = ctx.step(&mut imu, &mut gps, &mut air, &sp, &mut motors, &cfg);
             assert!(state_finite(&st), "HIL 闭环估计不得含 NaN");
             assert!(actuator_bounded(&motors.last_cmd()), "HIL 闭环指令必须 [0,1]");
         }
@@ -145,13 +149,14 @@ mod tests {
         let cfg = VehicleConfig::default_quad();
         let mut imu = MockImu::new();
         let mut gps = MockGps::new();
+        let mut air = MockAirspeed::new(0.0);
         let mut motors = MockMotors::new(crate::hal::actuator::OutputProtocol::Pwm);
         let mut ctx = HilContext::new(EkfEstimator::default_quad(), PidController::from_config(&cfg.ctrl_params()), Second(0.01));
         let sp = crate::controller::Setpoint::hover([Meter(0.0); 3], crate::units::Radian(0.0));
 
         // 先正常跑几拍。
         for _ in 0..5 {
-            let _ = ctx.step(&mut imu, &mut gps, &sp, &mut motors, &cfg);
+            let _ = ctx.step(&mut imu, &mut gps, &mut air, &sp, &mut motors, &cfg);
         }
         // 冻结 IMU。
         imu.set_health(false);

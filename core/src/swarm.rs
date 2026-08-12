@@ -317,6 +317,7 @@ mod tests {
             vel: [MeterPerSecond::ZERO; 3],
             att: crate::vehicle::Quaternion::IDENTITY,
             omega: [RadianPerSecond::ZERO; 3],
+            airspeed: MeterPerSecond::ZERO,
         };
         let mut buf = [0u8; MAX_FRAME_LEN];
         let n = broadcast_frame(0, &leader_state, 0, &mut buf);
@@ -330,6 +331,7 @@ mod tests {
             vel: [MeterPerSecond::ZERO; 3],
             att: crate::vehicle::Quaternion::IDENTITY,
             omega: [RadianPerSecond::ZERO; 3],
+            airspeed: MeterPerSecond::ZERO,
         };
         let sp_hover = Setpoint::hover([Meter(0.0); 3], Radian(0.0));
         for _ in 0..200 {
