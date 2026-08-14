@@ -43,6 +43,18 @@ impl PidController {
         (self.dbg_err, self.dbg_pqr, self.dbg_omega)
     }
 
+    /// 从地面站参数表（[KpXY, KpZ, KvXY, KvZ, HoverThrust]）应用增益。
+    /// 仅覆盖这 5 个字段，其余（vmax/tilt/att_kd/gravity）保持出厂默认，
+    /// 避免地面站误改导致控制律发散。调用方需保证 `g` 长度 ≥ 5。
+    pub fn apply_gains(&mut self, g: &[f32]) {
+        if g.len() < 5 { return; }
+        self.kp_xy = g[0];
+        self.kp_z = g[1];
+        self.kv_xy = g[2];
+        self.kv_z = g[3];
+        self.hover_thrust = g[4];
+    }
+
     /// 典型 450mm X 四旋翼参数（后续可移到机型配置）。
     /// 标准串级：pos_err -> 期望速度(限幅) -> vel_err -> 期望加速度 -> 期望姿态(四元数) -> 角速度。
     pub fn default_quad() -> Self {

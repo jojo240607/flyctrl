@@ -28,29 +28,33 @@ pub const COMP_ID: u8 = 1; // MAV_COMP_ID_AUTOPILOT1
 
 /// 消息 ID 常量（与标准 MAVLink 一致）。
 pub mod msg_id {
-    pub const HEARTBEAT: u8 = 0;
-    pub const SYS_STATUS: u8 = 1;
-    pub const ATTITUDE: u8 = 30;
-    pub const GLOBAL_POSITION_INT: u8 = 33;
-    pub const LOCAL_POSITION_NED: u8 = 32;
-    pub const VFR_HUD: u8 = 74;
-    pub const COMMAND_LONG: u8 = 76;
-    pub const COMMAND_ACK: u8 = 77;
-    pub const PARAM_REQUEST_LIST: u8 = 21;
-    pub const PARAM_VALUE: u8 = 22;
-    pub const PARAM_SET: u8 = 23;
+    pub const HEARTBEAT: u32 = 0;
+    pub const SYS_STATUS: u32 = 1;
+    pub const ATTITUDE: u32 = 30;
+    pub const GLOBAL_POSITION_INT: u32 = 33;
+    pub const LOCAL_POSITION_NED: u32 = 32;
+    pub const VFR_HUD: u32 = 74;
+    pub const COMMAND_LONG: u32 = 76;
+    pub const COMMAND_ACK: u32 = 77;
+    pub const PARAM_REQUEST_LIST: u32 = 21;
+    pub const PARAM_VALUE: u32 = 22;
+    pub const PARAM_SET: u32 = 23;
+    pub const PARAM_REQUEST_READ: u32 = 20;
+    pub const AUTOPILOT_VERSION: u32 = 300;
 }
 
 /// 标准 MAVLink common.xml 的 CRC_EXTRA 值（按 msg_id 索引；无则为 0）。
 /// 这些值由 mavgen 从 common.xml 字段定义 + 类型生成，是地面站校验帧合法性的必备字节。
 /// 来源：标准 `common.xml`（v2.0 方言）。
-pub const CRC_EXTRA: [u8; 256] = {
-    let mut t = [0u8; 256];
+pub const CRC_EXTRA: [u8; 301] = {
+    let mut t = [0u8; 301];
     t[msg_id::HEARTBEAT as usize] = 50;
     t[msg_id::SYS_STATUS as usize] = 124;
     t[msg_id::PARAM_REQUEST_LIST as usize] = 159;
     t[msg_id::PARAM_VALUE as usize] = 220;
     t[msg_id::PARAM_SET as usize] = 168;
+    t[msg_id::PARAM_REQUEST_READ as usize] = 214;
+    t[msg_id::AUTOPILOT_VERSION as usize] = 178;
     t[msg_id::ATTITUDE as usize] = 39;
     t[msg_id::GLOBAL_POSITION_INT as usize] = 104; // 标准 common.xml CRC_EXTRA
     t[msg_id::LOCAL_POSITION_NED as usize] = 185; // 标准 common.xml CRC_EXTRA (v2.0)
@@ -80,7 +84,7 @@ fn crc16_x25(mut crc: u16, bytes: &[u8]) -> u16 {
 /// `seq` 由调用方维护（跨帧递增）。`payload` 长度必须 ≤ 255。
 /// 头部布局：`len(1) incompat(1) compat(1) seq(1) sys(1) comp(1) msgid(3 LE)`。
 /// 与标准地面站字节级兼容：`crc = CRC16_X25(CRC16_X25(0xFFFF, header+payload), CRC_EXTRA[msgid])`。
-pub fn encode(msgid: u8, seq: u8, payload: &[u8], out: &mut [u8; MAX_FRAME_LEN]) -> usize {
+pub fn encode(msgid: u32, seq: u8, payload: &[u8], out: &mut [u8; MAX_FRAME_LEN]) -> usize {
     let plen = payload.len().min(255);
     // 直接写入 out，避免额外 280 字节中转缓冲（栈敏感场景）。
     out[0] = MAVLINK_MAGIC;
@@ -90,10 +94,10 @@ pub fn encode(msgid: u8, seq: u8, payload: &[u8], out: &mut [u8; MAX_FRAME_LEN])
     out[4] = seq;
     out[5] = SYS_ID;
     out[6] = COMP_ID;
-    // msgid 以小端写入 3 字节（v2 扩展消息 ID）。
-    out[7] = msgid;
-    out[8] = 0;
-    out[9] = 0;
+    // msgid 以小端写入 3 字节（v2 扩展消息 ID，支持 ≥256 的标准消息如 AUTOPILOT_VERSION=300）。
+    out[7] = msgid as u8;
+    out[8] = (msgid >> 8) as u8;
+    out[9] = (msgid >> 16) as u8;
     out[10..10 + plen].copy_from_slice(&payload[..plen]);
     // 标准 MAVLink v2 CRC：先对 9 字节头部+payload 算 CRC16，再异或 CRC_EXTRA 字节。
     let mut crc = crc16_x25(0xFFFF, &out[1..10 + plen]);
@@ -104,15 +108,15 @@ pub fn encode(msgid: u8, seq: u8, payload: &[u8], out: &mut [u8; MAX_FRAME_LEN])
 }
 
 /// 从一帧 `Frame` 解析出 (msgid, payload_slice)；非 MAVLink v2 帧或 CRC（含 CRC_EXTRA）不通过返回 None。
-pub fn decode(frame: &Frame) -> Option<(u8, &[u8])> {
+/// msgid 返回 u32（v2 三字节 ID 空间，可支持 ≥256 的标准消息如 AUTOPILOT_VERSION=300）。
+pub fn decode(frame: &Frame) -> Option<(u32, &[u8])> {
     let d = frame.as_slice();
     if d.len() < 12 || d[0] != MAVLINK_MAGIC { return None; }
     let plen = d[1] as usize;
     if d.len() < 10 + plen + 2 { return None; }
     // v2：msgid 为 3 字节小端（位于头部 [7..10]）。
     let msgid = d[7] as u32 | (d[8] as u32) << 8 | (d[9] as u32) << 16;
-    if msgid > 255 { return None; } // 本实现仅支持 1 字节消息 ID 空间
-    let msgid = msgid as u8;
+    if (msgid as usize) >= CRC_EXTRA.len() { return None; } // 超出发射端已知 CRC_EXTRA 表范围
     let payload = &d[10..10 + plen];
     // 校验 CRC（含 CRC_EXTRA），与 encode 同算法（v2 头部 9 字节）。
     let mut crc = crc16_x25(0xFFFF, &d[1..10 + plen]);
@@ -190,6 +194,9 @@ pub mod enums {
     pub const MAV_RESULT_DENIED: u8 = 2;
     pub const MAV_RESULT_UNSUPPORTED: u8 = 3;
     pub const MAV_RESULT_FAILED: u8 = 4;
+    /// MAV_PROTOCOL_CAPABILITY 位（AUTOPILOT_VERSION.capabilities）。
+    pub const MAV_PROTOCOL_CAPABILITY_MAVLINK2: u64 = 1 << 23;
+    pub const MAV_PROTOCOL_CAPABILITY_PARAM_FLOAT: u64 = 1 << 5;
 }
 
 /// HEARTBEAT：声明飞控存活 + 当前模式（标准字段，QGC 可识别）。
@@ -360,6 +367,40 @@ pub fn decode_param_set(payload: &[u8]) -> Option<ParamSet> {
     })
 }
 
+/// PARAM_REQUEST_READ 解码（地面站 -> 飞控，按参数名点读单个参数）。
+/// payload：`param_id[16] + param_index i16`（index=-1 表示按名查找）。
+pub fn decode_param_request_read(payload: &[u8]) -> Option<([u8; 16], i16)> {
+    if payload.len() < 18 { return None; }
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&payload[0..16]);
+    let idx = i16::from_le_bytes([payload[16], payload[17]]);
+    Some((id, idx))
+}
+
+/// AUTOPILOT_VERSION：飞控向地面站上报固件/能力信息（响应 REQUEST_AUTOPILOT_CAPABILITIES）。
+/// 标准布局（60B）：flight_sw_version u32, middleware_sw_version u32, os_sw_version u32,
+/// board_version u32, flight_custom_version[8], middleware_custom_version[8], os_custom_version[8],
+/// vendor_id u16, product_id u16, uid[12], capabilities u64, uid2[8]（MAVLink v2 扩展字段）。
+/// 本实现填最小有效子集 + 能力位（MAV_PROTOCOL_CAPABILITY_MAVLINK2 + PARAM_FLOAT）。
+pub fn encode_autopilot_version(
+    capabilities: u64,
+    seq: u8,
+    out: &mut [u8; MAX_FRAME_LEN],
+) -> usize {
+    let mut p = [0u8; 60];
+    // flight_sw_version = 1.0.0 (0x010000)
+    p[0..4].copy_from_slice(&0x0100_0000u32.to_le_bytes());
+    // board_version = 0x407 (STM32F407)
+    p[12..16].copy_from_slice(&0x0407u32.to_le_bytes());
+    // vendor_id / product_id
+    p[48..50].copy_from_slice(&0x4A4F_u16.to_le_bytes()); // "JO"
+    p[50..52].copy_from_slice(&0x4352_u16.to_le_bytes()); // "CR"
+    // uid[12] = 0（无唯一芯片 ID 来源时留空）
+    // capabilities u64 @ offset 52
+    p[52..60].copy_from_slice(&capabilities.to_le_bytes());
+    encode(msg_id::AUTOPILOT_VERSION, seq, &p, out)
+}
+
 /// COMMAND_ACK：飞控对地面站指令的应答（确认/拒绝）。
 /// `command` 为被应答的 MAV_CMD；`result` 见 [`enums::MAV_RESULT_*`]；
 /// `progress` 为完成进度(0-100)，`result_param2` 为附加结果。
@@ -431,9 +472,9 @@ pub fn encode_local_pos_from(sys_id: u8, state: &VehicleState, seq: u8, out: &mu
     out[5] = sys_id; // 自定义 sys_id
     out[6] = COMP_ID;
     // msgid 以小端写入 3 字节（v2 扩展消息 ID）。
-    out[7] = msg_id::LOCAL_POSITION_NED;
-    out[8] = 0;
-    out[9] = 0;
+    out[7] = msg_id::LOCAL_POSITION_NED as u8;
+    out[8] = (msg_id::LOCAL_POSITION_NED >> 8) as u8;
+    out[9] = (msg_id::LOCAL_POSITION_NED >> 16) as u8;
     out[10..10 + plen].copy_from_slice(&p[..plen]);
     // 标准 MAVLink v2 CRC（含 CRC_EXTRA），与 encode() 同算法。
     let mut crc = crc16_x25(0xFFFF, &out[1..10 + plen]);
@@ -509,7 +550,7 @@ mod tests {
         let mut out = [0u8; MAX_FRAME_LEN];
         let n = encode_heartbeat(0, false, 7, &mut out);
         assert_eq!(out[0], MAVLINK_MAGIC);
-        assert_eq!(out[7], msg_id::HEARTBEAT);
+        assert_eq!(u32::from(out[7]), msg_id::HEARTBEAT);
         // v2 帧长应为 10(头部) + 9(payload) + 2(crc) = 21
         assert_eq!(n, 21);
         // decode 应通过（含 CRC_EXTRA 校验）
