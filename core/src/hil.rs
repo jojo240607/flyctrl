@@ -16,7 +16,7 @@ use crate::fdir::{Fdir, Health};
 use crate::hal::actuator::{clamp_thrust, MotorActuator};
 use crate::hal::sensor::{AirspeedSensor, GpsSensor, ImuSensor};
 use crate::units::{Meter, Second};
-use crate::vehicle::ActuatorCmd;
+use crate::vehicle::{ActuatorCmd, VehicleState};
 
 /// 单步闭环上下文（跨步持久状态）。
 pub struct HilContext<E, C>
@@ -106,6 +106,14 @@ where
         let _ = Meter(0.0);
         est_state
     }
+
+    /// 当前估计状态（已含所有已融合观测，含控制器 step 之后的外部 update_alt）。
+    pub fn estimate(&self) -> VehicleState
+    where
+        E: Estimator,
+    {
+        self.est.state()
+    }
 }
 
 #[cfg(test)]
@@ -136,9 +144,11 @@ mod tests {
         let mut ctx = HilContext::new(EkfEstimator::default_quad(), PidController::from_config(&cfg.ctrl_params()), Second(0.01));
         let sp = crate::controller::Setpoint::hover([Meter(0.0), Meter(0.0), Meter(-5.0)], crate::units::Radian(0.0));
 
-        for _ in 0..300 {
+        for it in 0..300 {
             let st = ctx.step(&mut imu, &mut gps, &mut air, &sp, &mut motors, &cfg);
-            assert!(state_finite(&st), "HIL 闭环估计不得含 NaN");
+            if !state_finite(&st) {
+                panic!("HIL NaN at iter {}: pos={:?} vel={:?} att={:?}", it, st.pos, st.vel, st.att);
+            }
             assert!(actuator_bounded(&motors.last_cmd()), "HIL 闭环指令必须 [0,1]");
         }
     }

@@ -79,6 +79,10 @@ impl<E: Estimator, R: ResidualModel> Estimator for LearningEstimator<E, R> {
     fn reset(&mut self) {
         self.base.reset();
     }
+
+    fn state(&self) -> VehicleState {
+        self.base.state()
+    }
 }
 
 #[cfg(test)]
@@ -95,7 +99,7 @@ mod tests {
             accel: [MeterPerSecondSquared(0.0), MeterPerSecondSquared(0.0), MeterPerSecondSquared(-9.81)],
             gyro: [RadianPerSecond(0.0); 3],
         };
-        let gps = Some(PosSample { pos: [Meter(1.0), Meter(2.0), Meter(-5.0)] });
+        let gps = Some(PosSample::pos_only([Meter(1.0), Meter(2.0), Meter(-5.0)]));
         let a = ekf.step(Second(0.01), imu, gps, None);
         let b = le.step(Second(0.01), imu, gps, None);
         assert_eq!(a.pos[0].0, b.pos[0].0);
@@ -111,7 +115,7 @@ mod tests {
             accel: [MeterPerSecondSquared(0.0), MeterPerSecondSquared(0.0), MeterPerSecondSquared(-9.81)],
             gyro: [RadianPerSecond(0.0); 3],
         };
-        let gps = Some(PosSample { pos: [Meter(1.0), Meter(2.0), Meter(-5.0)] });
+        let gps = Some(PosSample::pos_only([Meter(1.0), Meter(2.0), Meter(-5.0)]));
         let st = le.step(Second(0.01), imu, gps, None);
         // 基底估计应约等于 gps 位置，加偏置后应偏离 0.1/-0.2/0.3。
         assert!((st.pos[0].0 - 1.1).abs() < 0.5, "pos[0] 应含 +0.1 偏置修正，得到 {}", st.pos[0].0);

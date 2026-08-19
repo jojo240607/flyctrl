@@ -148,11 +148,24 @@ impl Estimator for ComplementaryEstimator {
             att: self.att,
             omega: self.omega,
             airspeed: MeterPerSecond(self.airspeed),
+            accel_bias: [0.0; 3],
         }
     }
 
     fn reset(&mut self) {
         *self = Self::with_vel(self.att_alpha, self.pos_out_alpha, self.vel_alpha, self.obs_alpha);
+    }
+
+    fn state(&self) -> VehicleState {
+        VehicleState {
+            time_boot_ms: 0,
+            pos: self.pos_out,
+            vel: self.vel,
+            att: self.att,
+            omega: self.omega,
+            airspeed: MeterPerSecond(self.airspeed),
+            accel_bias: [0.0; 3],
+        }
     }
 }
 

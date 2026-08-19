@@ -100,6 +100,9 @@ pub struct VehicleState {
     pub omega: [RadianPerSecond; 3], // 机体角速度 (p, q, r)
     /// 估计空速（m/s），由空速计测量（经 EKF 融合）；无空速计时为 0。
     pub airspeed: MeterPerSecond,
+    /// 估计的加计零偏（m/s²，世界系），由速度观测（Doppler）驱动；无速度观测时为 0。
+    /// 阶段 11-A 诊断：用于确认垂向零偏是否被 EKF 正确估计并扣除。
+    pub accel_bias: [f32; 3],
 }
 
 impl VehicleState {
@@ -111,6 +114,7 @@ impl VehicleState {
             att: Quaternion::IDENTITY,
             omega: [RadianPerSecond::ZERO, RadianPerSecond::ZERO, RadianPerSecond::ZERO],
             airspeed: MeterPerSecond::ZERO,
+            accel_bias: [0.0; 3],
         }
     }
 }
@@ -144,9 +148,25 @@ pub struct ImuSample {
 }
 
 /// 高度计 / GPS 位置测量。
+///
+/// `vel` 为可选的 GPS Doppler 速度观测（多普勒测速）。`None` 表示仅位置观测
+/// （MCU/GPS 默认路径零回归）；仿真侧在 GPS 样本里附带 Doppler 速度时用
+/// [`PosSample::with_vel`]，EKF 融合位置后额外做速度观测。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct PosSample {
-    pub pos: [Meter; 3], // NED 位置
+    pub pos: [Meter; 3],                       // NED 位置
+    pub vel: Option<[MeterPerSecond; 3]>,      // 可选 Doppler 速度（NED）
+}
+
+impl PosSample {
+    /// 仅位置观测（默认，零回归）。
+    pub fn pos_only(pos: [Meter; 3]) -> Self {
+        PosSample { pos, vel: None }
+    }
+    /// 位置 + Doppler 速度观测。
+    pub fn with_vel(pos: [Meter; 3], vel: [MeterPerSecond; 3]) -> Self {
+        PosSample { pos, vel: Some(vel) }
+    }
 }
 
 /// 空速计（皮托管 / 差分气压）单次测量：总压 - 静压差换算的真空速（IAS≈TAS，忽略空气压缩）。
@@ -227,6 +247,17 @@ pub fn rotate_vec_by_quat(q: Quaternion, v: [f32; 3]) -> [f32; 3] {
 /// 反向旋转（世界->机体）。
 pub fn rotate_vec_by_quat_inverse(q: Quaternion, v: [f32; 3]) -> [f32; 3] {
     rotate_vec_by_quat(Quaternion { w: q.w, x: -q.x, y: -q.y, z: -q.z }, v)
+}
+
+/// 由四元数（机体->世界）导出 3x3 旋转矩阵，按行主序写入长度为 9 的数组
+/// `[r00 r01 r02 r10 r11 r12 r20 r21 r22]`，与 [`rotate_vec_by_quat`] 一致。
+pub fn quat_to_rotmat(q: Quaternion) -> [f32; 9] {
+    let w = q.w; let x = q.x; let y = q.y; let z = q.z;
+    [
+        1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - w * z),     2.0 * (x * z + w * y),
+        2.0 * (x * y + w * z),     1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - w * x),
+        2.0 * (x * z - w * y),     2.0 * (y * z + w * x),     1.0 - 2.0 * (x * x + y * y),
+    ]
 }
 
 /// 四元数共轭（单位四元数即逆）：机体->世界映射的反向。

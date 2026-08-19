@@ -148,10 +148,23 @@ impl<B: Controller> Controller for IndiController<B> {
             self.k_inv[2] * e_acc[2] * self.gain_scale,
         ];
         // 5) 增量叠加回电机（混控互逆）。
+        //    关键：gain_scale 只作用于 INDI 角加速度增量，绝不削弱基线控制器的
+        //    基础推力（垂向定高权威）。否则 0.5 的 gain_scale 会把 PID 的推力指令
+        //    整体减半，导致强噪声/零偏下垂直无法纠偏、轨迹无界发散（阶段 11-A）。
         let inc = rates_to_motor_inc(dpqr);
         let mut motor = [0.0f32; 4];
         for i in 0..4 {
-            motor[i] = (u_base.motor[i] + inc[i]).clamp(0.0, 1.0);
+            motor[i] = u_base.motor[i] + self.gain_scale * inc[i];
+        }
+        // 阶段 11-A：保垂向推力。INDI 增量理想情况下均值为 0（不改变总推力），
+        // 但个体电机被 [0,1] 夹紧时会破坏这一性质，导致净推力丢失、定高发散。
+        // 因此把电机指令整体平移，使其均值回到基线指令的均值（PID 期望的总推力），
+        // 仅保留增量造成的"分布倾斜"（姿态纠偏），再夹紧。
+        let base_mean = (u_base.motor[0] + u_base.motor[1] + u_base.motor[2] + u_base.motor[3]) * 0.25;
+        let inc_mean = (motor[0] + motor[1] + motor[2] + motor[3]) * 0.25;
+        let shift = base_mean - inc_mean;
+        for i in 0..4 {
+            motor[i] = (motor[i] + shift).clamp(0.0, 1.0);
         }
 
         // 更新历史。

@@ -129,9 +129,7 @@ fn prop_actuator_bounded_under_disturbance() {
         for _ in 0..4 {
             let mut imu = random_imu(&mut rng);
             imu.accel[2] = MeterPerSecondSquared(-9.81 + rng.spread(0.5));
-            let z = PosSample {
-                pos: [est.pos[0], est.pos[1], est.pos[2]],
-            };
+            let z = PosSample::pos_only([est.pos[0], est.pos[1], est.pos[2]]);
             est = ekf.step(Second(0.01), imu, Some(z), None);
         }
         let cmd = pid.control(Second(0.01), &sp, &est);
@@ -160,7 +158,7 @@ fn prop_ekf_cov_psd_under_noise() {
                 s.pos[1] + Meter(rng.spread(0.5)),
                 s.pos[2] + Meter(rng.spread(0.5)),
             ];
-            let z = PosSample { pos: noisy_pos };
+            let z = PosSample::pos_only(noisy_pos);
             s = ekf.step(Second(0.01), imu, Some(z), None);
         }
         let p = ekf.cov();
@@ -188,9 +186,7 @@ fn prop_no_nan_over_full_chain() {
         for _ in 0..6 {
             let mut imu = random_imu(&mut rng);
             imu.accel[2] = MeterPerSecondSquared(-9.81 + rng.spread(1.0));
-            let z = PosSample {
-                pos: [s.pos[0], s.pos[1], s.pos[2]],
-            };
+            let z = PosSample::pos_only([s.pos[0], s.pos[1], s.pos[2]]);
             s = ekf.step(Second(0.01), imu, Some(z), None);
         }
         // 估计状态有限。

@@ -110,11 +110,11 @@ impl GpsSensor for MockGps {
     fn read(&mut self) -> Option<PosSample> {
         if !self.healthy { return None; }
         self.t += 0.005;
-        Some(PosSample { pos: [
+        Some(PosSample::pos_only([
             Meter(self.base[0].0 + crate::math::sin(self.t * 0.3) * 0.1),
             Meter(self.base[1].0 + crate::math::cos(self.t * 0.4) * 0.1),
             Meter(self.base[2].0),
-        ]})
+        ]))
     }
     fn healthy(&self) -> bool { self.healthy }
 }

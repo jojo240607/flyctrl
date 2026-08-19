@@ -57,6 +57,10 @@ pub struct VehicleConfig {
     pub kp_xy: f32,
     /// 速度中环比例增益（速度误差 -> 期望加速度）。
     pub kv_xy: f32,
+    /// 垂直速度/位置进入控制律前的一阶低通时间常数（秒）。
+    /// IMU 高频噪声经 EKF 估计后直接驱动油门，会导致悬停发散（PLAN 阶段 11-A）。
+    /// 设 >0 时启用 EMA 滤波（截止频率 ≈ 1/τ）；设 0 时不过滤（保持历史行为）。
+    pub vel_lpf_tau: f32,
 }
 
 impl VehicleConfig {
@@ -95,6 +99,7 @@ impl VehicleConfig {
             att_kd: 0.3,
             kp_xy: 0.5,
             kv_xy: 0.8,
+            vel_lpf_tau: 0.15,
         }
     }
 
@@ -134,6 +139,7 @@ impl VehicleConfig {
             att_kd: self.att_kd,
             kp_xy: self.kp_xy,
             kv_xy: self.kv_xy,
+            vel_lpf_tau: self.vel_lpf_tau,
         }
     }
 }
@@ -201,6 +207,10 @@ pub struct CtrlParams {
     pub kp_xy: f32,
     /// 速度中环比例增益（速度误差 -> 期望加速度）。
     pub kv_xy: f32,
+    /// 垂直速度/位置进入控制律前的一阶低通时间常数（秒）。
+    /// IMU 高频噪声经 EKF 估计后直接驱动油门，会导致悬停发散（PLAN 阶段 11-A）。
+    /// 设 >0 时启用 EMA 滤波（截止频率 ≈ 1/τ）；设 0 时不过滤（保持历史行为）。
+    pub vel_lpf_tau: f32,
 }
 
 impl Default for CtrlParams {

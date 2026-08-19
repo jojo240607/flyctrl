@@ -21,4 +21,13 @@ pub trait Estimator {
 
     /// 复位到初始/零状态。
     fn reset(&mut self);
+
+    /// 当前估计状态（不推进），供诊断读取（已含所有已融合观测）。
+    fn state(&self) -> VehicleState;
+
+    /// 当前估计的加计零偏（机体系，m/s²）。默认实现返回零，
+    /// 仅 EKF 等显式估计零偏的估计器会返回真实值。
+    fn accel_bias(&self) -> [f32; 3] {
+        [0.0; 3]
+    }
 }
