@@ -206,6 +206,10 @@ impl Estimator for EkfEstimator {
         airspeed: Option<AirspeedSample>,
     ) -> VehicleState {
         let dt = dt.0;
+        // 防御：协方差若出现非有限项（GPS/位置观测的 Joseph 更新在特定数值下可能产生 NaN，
+        // 对角夹取只清对角、非对角 NaN 会残留并传播），整矩阵清掉非有限项，阻断 NaN 进入
+        // 本拍的 predict/update（否则 S 求逆/增益 K 计算 NaN → 位置/速度状态被污染）。
+        self.sanitize_p();
         let g = self.g_ref;
 
         // 去偏置角速度
@@ -355,6 +359,17 @@ impl EkfEstimator {
         self.att = att;
     }
 
+    /// 防御：清除协方差矩阵中的所有非有限项（NaN/Inf → 0），阻断数值污染传播。
+    /// 对角夹取只处理对角，非对角 NaN 会残留并进入 S 求逆/K 增益计算 → 状态 NaN；
+    /// 在 step 开头统一清理，保证本拍 predict/update 输入协方差干净。
+    fn sanitize_p(&mut self) {
+        for i in 0..(N * N) {
+            if !self.p[i].is_finite() {
+                self.p[i] = 0.0;
+            }
+        }
+    }
+
     /// 协方差预测步：F = I + A*dt，P' = F P F^T + Q。
     /// 栈数组（f/ft/p_pred，各 81 元素）作用域限于本方法，返回后栈槽被回收。
     fn predict_cov(&mut self, dt: f32) {
@@ -394,9 +409,10 @@ impl EkfEstimator {
                 p_pred[i * N + j] = avg;
                 p_pred[j * N + i] = avg;
             }
-            if p_pred[i * N + i] < 1e-6 {
-                p_pred[i * N + i] = 1e-6;
-            } else if p_pred[i * N + i] > P_MAX {
+            let d = p_pred[i * N + i];
+            if !d.is_finite() || d < 1e-6 {
+                p_pred[i * N + i] = 1e-6; // 非有限(NaN/Inf) 重置，阻断协方差 NaN 传播
+            } else if d > P_MAX {
                 p_pred[i * N + i] = P_MAX;
             }
         }
@@ -448,6 +464,12 @@ impl EkfEstimator {
         for j in 0..3 {
             k[9 * 3 + j] = 0.0;
         }
+        // 垂向速度状态 (5) 的增益行也清零：GPS 位置观测经非对角协方差 K[5,*] 会推爆垂向速度
+        // （hil 闭环回归：恒定比力+GPS 下 vel_z 爆炸到 1e5）。垂向速度仅由加速度积分决定，
+        // 由 Doppler 速度观测（update_vel）约束，位置观测不直接修正它。
+        for j in 0..3 {
+            k[5 * 3 + j] = 0.0;
+        }
 
         // 创新 y = z - pos
         let y = [z.pos[0].0 - self.x[0], z.pos[1].0 - self.x[1], z.pos[2].0 - self.x[2]];
@@ -497,9 +519,10 @@ impl EkfEstimator {
                 self.p[j * N + i] = avg;
             }
             // 对角线上下限夹取，杜绝负方差并阻断不可观状态协方差发散。
-            if self.p[i * N + i] < 1e-6 {
-                self.p[i * N + i] = 1e-6;
-            } else if self.p[i * N + i] > P_MAX {
+            let d = self.p[i * N + i];
+            if !d.is_finite() || d < 1e-6 {
+                self.p[i * N + i] = 1e-6; // 非有限(NaN/Inf) 重置，阻断协方差 NaN 传播
+            } else if d > P_MAX {
                 self.p[i * N + i] = P_MAX;
             }
         }
@@ -650,9 +673,10 @@ impl EkfEstimator {
                 self.p[i * N + j] = avg;
                 self.p[j * N + i] = avg;
             }
-            if self.p[i * N + i] < 1e-6 {
-                self.p[i * N + i] = 1e-6;
-            } else if self.p[i * N + i] > P_MAX {
+            let d = self.p[i * N + i];
+            if !d.is_finite() || d < 1e-6 {
+                self.p[i * N + i] = 1e-6; // 非有限(NaN/Inf) 重置，阻断协方差 NaN 传播
+            } else if d > P_MAX {
                 self.p[i * N + i] = P_MAX;
             }
         }
@@ -718,9 +742,10 @@ impl EkfEstimator {
                 self.p[i * N + j] = avg;
                 self.p[j * N + i] = avg;
             }
-            if self.p[i * N + i] < 1e-6 {
-                self.p[i * N + i] = 1e-6;
-            } else if self.p[i * N + i] > P_MAX {
+            let d = self.p[i * N + i];
+            if !d.is_finite() || d < 1e-6 {
+                self.p[i * N + i] = 1e-6; // 非有限(NaN/Inf) 重置，阻断协方差 NaN 传播
+            } else if d > P_MAX {
                 self.p[i * N + i] = P_MAX;
             }
         }
@@ -777,5 +802,34 @@ mod tests {
         let st = ekf.step(Second(0.01), imu, None, None);
         // 静止 + 无观测：速度应≈0，不得 NaN
         assert!(st.vel[0].0.is_finite() && st.vel[1].0.is_finite());
+    }
+
+    #[test]
+    fn hil_ekf_vertical_stays_stable_with_mock_gps() {
+        // 回归：EKF + 完整 MockImu（含 gyro 振动/120Hz accel 振动）+ GPS(d=-5)。
+        // 曾因 GPS 位置观测经非对角协方差 K[5,*] 推爆垂向速度（vel_z 到 1e5，位置漂走）
+        // → hil 闭环 NaN。修复：update_pos 清零垂向速度增益行（K[5,*]=0），垂向速度仅由
+        // 加速度积分 + Doppler 速度观测约束。验证位置物理稳定在 -5 附近（<100m）不漂走。
+        let mut ekf = EkfEstimator::default_quad();
+        ekf.set_initial_position([0.0, 0.0, -5.0]);
+        let gps = PosSample::pos_only([Meter(0.0), Meter(0.0), Meter(-5.0)]);
+        let mut imu2 = crate::hal::sensor::MockImu::new();
+        let mut max_abs = 0.0f32;
+        let mut last = VehicleState::zero();
+        let mut bad = false;
+        for _ in 0..300 {
+            let s = crate::hal::sensor::ImuSensor::read(&mut imu2);
+            last = ekf.step(Second(0.01), s, Some(gps), None);
+            max_abs = max_abs.max(last.pos[2].0.abs());
+            if !last.pos[2].0.is_finite() {
+                bad = true;
+                break;
+            }
+        }
+        assert!(
+            !bad && max_abs < 100.0 && last.pos[2].0.is_finite(),
+            "EKF 恒定比力+GPS 悬停应稳定: max_abs={} pos_z={} vel_z={} bad={}",
+            max_abs, last.pos[2].0, last.vel[2].0, bad
+        );
     }
 }
