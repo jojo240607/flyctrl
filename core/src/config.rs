@@ -97,7 +97,7 @@ impl VehicleConfig {
             vmax_z: 2.0,
             att_kp: 3.0,
             att_kd: 0.3,
-            kp_xy: 0.5,
+            kp_xy: 0.3,
             kv_xy: 0.8,
             vel_lpf_tau: 0.15,
         }
