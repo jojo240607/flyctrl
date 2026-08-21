@@ -107,6 +107,61 @@ where
         est_state
     }
 
+    /// 单步闭环：传感器 → 估计 → FDIR → 执行器，控制指令由调用方实时给出。
+    ///
+    /// 与 [`HilContext::step`] 共用"采集/估计/健康裁决/限幅/失效保护"骨架，仅把
+    /// `setpoint → ctrl.control` 替换为 `cmd_fn(&est_state)`。供**非设定点型**控制律
+    /// （P3-D1：手动角速率 / 增稳姿态保持，直接消费遥控摇杆而非位置设定点）接入
+    /// 同一 SIL/HIL 闭环骨架，保证估计与健康监控路径与自主模式完全一致。
+    pub fn step_with_cmd<I, G, A, M>(
+        &mut self,
+        imu: &mut I,
+        gps: &mut G,
+        airspeed: &mut A,
+        cmd_fn: impl FnOnce(&VehicleState) -> ActuatorCmd,
+        motors: &mut M,
+        cfg: &VehicleConfig,
+    ) -> VehicleState
+    where
+        I: ImuSensor,
+        G: GpsSensor,
+        A: AirspeedSensor,
+        M: MotorActuator,
+    {
+        // 1) 采集传感器。
+        let sample = imu.read();
+        let pos = gps.read();
+        let pos_available = pos.is_some();
+        let air_sample = airspeed.read();
+
+        // 2) 估计。
+        let est_state = self.est.step(self.dt, sample, pos, air_sample);
+
+        // 3) FDIR 健康监控。
+        let health = self.fdir.update(&sample, pos_available, true, true);
+
+        // 4) 控制：调用方按估计状态即时计算指令（手动/增稳直接映射摇杆）。
+        let raw_cmd = cmd_fn(&est_state);
+
+        // 5) 安全裁决：危险时进入失控保护（单向，归零执行器）。
+        match health {
+            Health::Critical => {
+                self.failsafe_engaged = true;
+                motors.disarm();
+            }
+            Health::Degraded | Health::Nominal => {
+                let mut cmd = ActuatorCmd::zero();
+                for i in 0..4 {
+                    cmd.motor[i] = clamp_thrust(raw_cmd.motor[i]);
+                }
+                motors.apply(&cmd);
+            }
+        }
+
+        let _ = cfg;
+        est_state
+    }
+
     /// 当前估计状态（已含所有已融合观测，含控制器 step 之后的外部 update_alt）。
     pub fn estimate(&self) -> VehicleState
     where

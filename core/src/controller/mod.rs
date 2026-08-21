@@ -10,6 +10,7 @@ pub mod mpc;
 pub mod indi;
 pub mod attitude;
 pub mod tecs;
+pub mod manual;
 
 pub use trait_def::{Controller, Setpoint};
 pub use pid::PidController;
@@ -17,3 +18,4 @@ pub use lqr::LqrController;
 pub use mpc::MpcController;
 pub use indi::IndiController;
 pub use tecs::TecsController;
+pub use manual::{manual_rates, stabilize, ManualParams};
