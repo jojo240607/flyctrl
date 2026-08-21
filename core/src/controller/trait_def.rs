@@ -31,6 +31,14 @@ pub trait Controller {
     /// 计算控制输出。dt 为控制周期。
     fn control(&mut self, dt: Second, setpoint: &Setpoint, estimate: &VehicleState) -> ActuatorCmd;
 
+    /// P3-A3：注入空速计测得的相对空速矢量（NED 水平，m/s）= v_ground - wind。
+    ///
+    /// 供 TECS 等需要"真空速方向"的控制律做气动拖拽前馈（`a_ff = k·|v_rel|·v_rel`）。
+    /// 与 EKF 的 `est.airspeed`（地速幅值，用于速度融合）相互独立：这里的测量矢量
+    /// 只做前馈，不污染速度估计。默认空实现——不需要该通道的控制器（PID/LQR/INDI/MPC）
+    /// 零改动。每个控制周期由宿主在调用 `control` 之前写入。
+    fn set_measured_airspeed_vec(&mut self, _v: [f32; 2]) {}
+
     /// 复位内环积分器等状态。
     fn reset(&mut self);
 }

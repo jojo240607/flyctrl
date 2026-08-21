@@ -61,6 +61,10 @@ pub struct VehicleConfig {
     /// IMU 高频噪声经 EKF 估计后直接驱动油门，会导致悬停发散（PLAN 阶段 11-A）。
     /// 设 >0 时启用 EMA 滤波（截止频率 ≈ 1/τ）；设 0 时不过滤（保持历史行为）。
     pub vel_lpf_tau: f32,
+    /// 空速拖拽前馈系数（m/s² per (m/s)²）：TECS 用真空速直接预补偿机体气动型阻。
+    /// 型阻加速度 ≈ 0.5·ρ·Cd_h/m·v_rel²，default_quad 量级 ≈ 0.09。
+    /// 0 表示关闭前馈（退化纯反馈，用于对照测试）。
+    pub drag_fwd: f32,
 }
 
 impl VehicleConfig {
@@ -100,6 +104,8 @@ impl VehicleConfig {
             kp_xy: 0.3,
             kv_xy: 0.8,
             vel_lpf_tau: 0.15,
+            // 0.5·ρ·Cd_h/m ≈ 0.5·1.225·0.18/1.2 ≈ 0.092（default_quad 机体水平型阻，N per (m/s)² per kg）
+            drag_fwd: 0.09,
         }
     }
 
@@ -140,6 +146,7 @@ impl VehicleConfig {
             kp_xy: self.kp_xy,
             kv_xy: self.kv_xy,
             vel_lpf_tau: self.vel_lpf_tau,
+            drag_fwd: self.drag_fwd,
         }
     }
 }
@@ -211,6 +218,8 @@ pub struct CtrlParams {
     /// IMU 高频噪声经 EKF 估计后直接驱动油门，会导致悬停发散（PLAN 阶段 11-A）。
     /// 设 >0 时启用 EMA 滤波（截止频率 ≈ 1/τ）；设 0 时不过滤（保持历史行为）。
     pub vel_lpf_tau: f32,
+    /// 空速拖拽前馈系数（m/s² per (m/s)²），TECS 用（见 VehicleConfig::drag_fwd）。
+    pub drag_fwd: f32,
 }
 
 impl Default for CtrlParams {

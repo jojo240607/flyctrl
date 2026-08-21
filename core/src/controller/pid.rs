@@ -256,53 +256,32 @@ impl Controller for PidController {
         let q_des = Quaternion::from_euler(Radian(tilt_e), Radian(-tilt_n), yaw);
 
         // --- 内环：四元数姿态误差 -> 期望机体角速度（标准鲁棒写法，无欧拉角奇点） ---
-        // q_err = q_est^-1 ⊗ q_des（机体坐标系下的误差旋转）
-        let q_err = crate::vehicle::quat_mul(
-            crate::vehicle::quat_conj(est.att), q_des);
-        // 误差旋转向量 ≈ 2·sign(w)·(x,y,z)
-        let sgn = if q_err.w < 0.0 { -2.0 } else { 2.0 };
-        let ex_b = sgn * q_err.x;
-        let ey_b = sgn * q_err.y;
-        let ez_b = sgn * q_err.z;
-        // 期望机体角速度 = Kp_att·误差向量 - Kd_att·当前角速度（阻尼）
-        let p_cmd = self.att_kp * ex_b - self.att_kd * est.omega[0].0;
-        let q_cmd = self.att_kp * ey_b - self.att_kd * est.omega[1].0;
-        let r_cmd = self.att_kp * ez_b - self.att_kd * est.omega[2].0;
-        self.dbg_err = [ex_b, ey_b, ez_b];
-        self.dbg_pqr = [p_cmd, q_cmd, r_cmd];
+        // 复用共享姿态内环 `attitude::attitude_rates`（P3-A3 提取，与 TECS 完全一致）。
+        // 含：q_err = q_est^-1 ⊗ q_des、误差旋转向量 ≈ 2·sign(w)·(x,y,z)、
+        //     期望机体角速度 = Kp_att·误差向量 - Kd_att·当前角速度（阻尼）。
+        let att_out = super::attitude::attitude_rates(
+            est.att,
+            q_des,
+            self.att_kp,
+            self.att_kd,
+            [est.omega[0].0, est.omega[1].0, est.omega[2].0],
+        );
+        self.dbg_err = att_out.err;
+        self.dbg_pqr = att_out.rates;
         self.dbg_omega = [est.omega[0].0, est.omega[1].0, est.omega[2].0];
 
         // --- 混控：X 型四旋翼（0=前右 1=后左 2=前左 3=后右） ---
+        // 复用共享混控 `attitude::x4_mix`（P3-A3 提取，与 TECS 完全一致）。
+        // 布局与符号（含 yaw 取 +r_cmd 的符号修正）见 attitude.rs 混控注释；
         // 控制器命令 (p_cmd,q_cmd,r_cmd) 定义在飞控机体轴（NED/FRD：前-X 右-Y 下-Z）。
-        // 本混控把命令映射成 4 路油门，使任一按同一 X 布局解算力矩的 plant 都得到
-        //   FC 机体轴力矩：τx = 2l·p_cmd（+roll=右滚）τy = 2l·q_cmd（+pitch=抬头）
-        //   τz = 2k·r_cmd（+yaw）。flyctrl-sim 标准 NED/FRD 直接采用；
-        //   ToyWorld（引擎 Y-up）侧经伪向量反射（FRD→引擎 det=-1，roll 力矩翻转）后
-        //   施加等价引擎力矩（见 fly-sim-core plant.rs 坐标桥接注释）。
-        // 由力矩公式反解（m0前右/m1后左/m2前左/m3后右，spin 0,1 CCW / 2,3 CW）：
-        //   τx = l(m0+m3-m1-m2)  τy = l(m0+m2-m1-m3)  τz = k(m0+m1-m2-m3)
-        // 解得如下（K=0.5 吸收臂长/反扭矩系数）：
-        //   +X(roll) ：m0,m3 增 / m1,m2 减
-        //   +Y(pitch)：m0,m2 增 / m1,m3 减
-        //   +Z(yaw)  ：CCW(0,1) 增 / CW(2,3) 减
-        //
-        // 符号修正（open_loop_torque_sign_probe 实测，2026-08-21）：
-        // 物理模型 m_yaw = tc·(f0+f1-f2-f3)，且 CCW(0,1) 高 -> +ωz（右旋+）。
-        // 旧混控中 r_cmd 项取 -r_cmd，使 yaw 环阻尼项成为正反馈
-        // （ωz>0 -> r_cmd=-kd·ωz<0 -> m_yaw<0 -> ωz 更负 -> 指数发散，
-        // 见 Hover 逐秒诊断 ωz 从 -3 增至 -36 rad/s 后级联横滚/俯仰爆掉）。
-        // 故 yaw 项翻转为 +r_cmd；roll/pitch 保持原符号（隔离探针稳定）。
-        let m0 = des_thrust + 0.5 * (p_cmd + q_cmd + r_cmd);
-        let m1 = des_thrust + 0.5 * (-p_cmd - q_cmd + r_cmd);
-        let m2 = des_thrust + 0.5 * (-p_cmd + q_cmd - r_cmd);
-        let m3 = des_thrust + 0.5 * (p_cmd - q_cmd - r_cmd);
+        let motors = super::attitude::x4_mix(des_thrust, att_out.rates);
 
         ActuatorCmd {
             motor: [
-                m0.clamp(0.0, 1.0),
-                m1.clamp(0.0, 1.0),
-                m2.clamp(0.0, 1.0),
-                m3.clamp(0.0, 1.0),
+                motors[0].clamp(0.0, 1.0),
+                motors[1].clamp(0.0, 1.0),
+                motors[2].clamp(0.0, 1.0),
+                motors[3].clamp(0.0, 1.0),
             ],
         }
     }
