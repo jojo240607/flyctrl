@@ -29,7 +29,7 @@ fn diag_b_mixer_onset() {
         let ideal = phys.step(dt, cmd);
         let s = phys.state();
         let imu = world.sense(dt, ideal, s.pos).0;
-        let e = est.step(dt, imu, Some(PosSample{pos:[Meter(s.pos[0].0),Meter(s.pos[1].0),Meter(s.pos[2].0)]}));
+        let e = est.step(dt, imu, Some(PosSample::pos_only([Meter(s.pos[0].0),Meter(s.pos[1].0),Meter(s.pos[2].0)])), None);
         // 重算控制器内部（复制 pid.rs 逻辑以便打印）
         let ex = sp.pos[0].0 - e.pos[0].0;
         let ey = sp.pos[1].0 - e.pos[1].0;
@@ -79,8 +79,8 @@ fn estimator_tracks_hover() {
         for k in 0..200 {
             let imu: ImuSample = phys.step(dt, ActuatorCmd { motor: [0.5; 4] });
             let s = phys.state();
-            let pos = PosSample { pos: [s.pos[0], s.pos[1], s.pos[2]] };
-            let est_s = est.step(dt, imu, Some(pos));
+            let pos = PosSample::pos_only([s.pos[0], s.pos[1], s.pos[2]]);
+            let est_s = est.step(dt, imu, Some(pos), None);
             if sec == 0 && k % 40 == 0 {
                 eprintln!("  k={} TRUE_pos=({:.3},{:.3},{:.3}) EST_pos=({:.3},{:.3},{:.3}) EST_vel=({:.3},{:.3},{:.3})",
                     k, s.pos[0].0, s.pos[1].0, s.pos[2].0,
@@ -95,7 +95,7 @@ fn estimator_tracks_hover() {
             }
         }
         let s = phys.state();
-        let est_s = est.step(dt, ImuSample { gyro: [flyctrl_core::units::RadianPerSecond(0.0); 3], accel: [flyctrl_core::units::MeterPerSecondSquared(0.0); 3] }, None);
+        let est_s = est.step(dt, ImuSample { gyro: [flyctrl_core::units::RadianPerSecond(0.0); 3], accel: [flyctrl_core::units::MeterPerSecondSquared(0.0); 3] }, None, None);
         eprintln!("t={}s phys_alt={:.2} est.att.w={:.3}", sec+1, -s.pos[2].0, est_s.att.w);
     }
 }
@@ -120,7 +120,7 @@ fn imu_integrate_true_att_diag() {
         let ideal = phys.step(dt, cmd);
         let s = phys.state();
         let imu = world.sense(dt, ideal, s.pos).0;
-        let e = est.step(dt, imu, None);
+        let e = est.step(dt, imu, None, None);
         let f_t = flyctrl_core::vehicle::rotate_vec_by_quat(s.att, [ideal.accel[0].0, ideal.accel[1].0, ideal.accel[2].0]);
         let f_e = flyctrl_core::vehicle::rotate_vec_by_quat(e.att, [imu.accel[0].0, imu.accel[1].0, imu.accel[2].0]);
         vz_true += (f_t[2] + 9.81) * dt.0;
@@ -173,7 +173,7 @@ fn scan_estimator_gain() {
                 let ideal = phys.step(dt, cmd);
                 let s = phys.state();
                 let imu = world.sense(dt, ideal, s.pos).0;
-                let e = est.step(dt, imu, Some(PosSample{pos:[Meter(s.pos[0].0),Meter(s.pos[1].0),Meter(s.pos[2].0)]}));
+                let e = est.step(dt, imu, Some(PosSample::pos_only([Meter(s.pos[0].0),Meter(s.pos[1].0),Meter(s.pos[2].0)])), None);
                 cmd = ctrl.control(dt, &sp, &e);
                 if s.att.w.abs() < minw { minw = s.att.w.abs(); }
                 if k >= 1599 { alt8 = -s.pos[2].0; }
@@ -225,10 +225,10 @@ fn est_att_true_vel_diag() {
             let ideal = phys.step(dt, cmd);
             let s = phys.state();
             let imu = world.sense(dt, ideal, s.pos).0;
-            let e = est.step(dt, imu, Some(PosSample{pos:[Meter(s.pos[0].0),Meter(s.pos[1].0),Meter(s.pos[2].0)]}));
+            let e = est.step(dt, imu, Some(PosSample::pos_only([Meter(s.pos[0].0),Meter(s.pos[1].0),Meter(s.pos[2].0)])), None);
             last_e = e;
             // 诊断：用真实 att/vel/omega，但位置用【带噪估计位置】e.pos
-            let fused = VehicleState { pos: e.pos, vel: s.vel, att: s.att, omega: s.omega };
+            let fused = VehicleState { pos: e.pos, vel: s.vel, att: s.att, omega: s.omega, time_boot_ms: 0, airspeed: MeterPerSecond::ZERO, accel_bias: [0.0; 3] };
             cmd = ctrl.control(dt, &sp, &fused);
             if k >= 100 && k <= 140 {
                 eprintln!("  step{} cmd=({:.3},{:.3},{:.3},{:.3}) TRUE_z={:.2} EST_z={:.2} TRUE_vz={:.2} EST_vz={:.2} EST_vxy=({:.2},{:.2})",
@@ -261,8 +261,8 @@ fn est_posvel_true_omega_diag() {
             let ideal = phys.step(dt, cmd);
             let s = phys.state();
             let imu = world.sense(dt, ideal, s.pos).0;
-            let e = est.step(dt, imu, Some(PosSample{pos:[Meter(s.pos[0].0),Meter(s.pos[1].0),Meter(s.pos[2].0)]}));
-            let fused = VehicleState { pos: e.pos, vel: e.vel, att: e.att, omega: s.omega }; // 真实 omega
+            let e = est.step(dt, imu, Some(PosSample::pos_only([Meter(s.pos[0].0),Meter(s.pos[1].0),Meter(s.pos[2].0)])), None);
+            let fused = VehicleState { pos: e.pos, vel: e.vel, att: e.att, omega: s.omega, time_boot_ms: 0, airspeed: MeterPerSecond::ZERO, accel_bias: [0.0; 3] }; // 真实 omega
             cmd = ctrl.control(dt, &sp, &fused);
             last_e = e;
         }
@@ -288,8 +288,8 @@ fn est_posvel_true_att_diag() {
             let ideal = phys.step(dt, cmd);
             let s = phys.state();
             let imu = world.sense(dt, ideal, s.pos).0;
-            let e = est.step(dt, imu, Some(PosSample{pos:[Meter(s.pos[0].0),Meter(s.pos[1].0),Meter(s.pos[2].0)]}));
-            let fused = VehicleState { pos: e.pos, vel: e.vel, att: s.att, omega: e.omega }; // 真实 att
+            let e = est.step(dt, imu, Some(PosSample::pos_only([Meter(s.pos[0].0),Meter(s.pos[1].0),Meter(s.pos[2].0)])), None);
+            let fused = VehicleState { pos: e.pos, vel: e.vel, att: s.att, omega: e.omega, time_boot_ms: 0, airspeed: MeterPerSecond::ZERO, accel_bias: [0.0; 3] }; // 真实 att
             cmd = ctrl.control(dt, &sp, &fused);
             last_e = e;
         }
@@ -324,7 +324,7 @@ fn parallel_true_vs_est() {
             let idealB = physB.step(dt, cmdB);
             let sB = physB.state();
             let imuB = worldB.sense(dt, idealB, sB.pos).0;
-            let eB = estB.step(dt, imuB, Some(PosSample{pos:[Meter(sB.pos[0].0),Meter(sB.pos[1].0),Meter(sB.pos[2].0)]}));
+            let eB = estB.step(dt, imuB, Some(PosSample::pos_only([Meter(sB.pos[0].0),Meter(sB.pos[1].0),Meter(sB.pos[2].0)])), None);
             cmdB = ctrlB.control(dt, &sp, &eB);
             if sec <= 1 && k % 20 == 0 {
                 eprintln!("  step{} A: z={:.2} vz={:.2} w={:.3} cmd0={:.3} | B: z={:.2}[e{:.2}] vz={:.2}[e{:.2}] w={:.3} cmd0={:.3}",
@@ -355,7 +355,7 @@ fn ekf_est_diag() {
         let ideal = phys.step(dt, cmd);
         let s = phys.state();
         let (imu, gps) = world.sense(dt, ideal, s.pos);
-        let e = est.step(dt, imu, gps);
+        let e = est.step(dt, imu, gps, None);
         cmd = ctrl.control(dt, &sp, &e);
         if k % 50 == 0 {
             let b = est.gyro_bias();

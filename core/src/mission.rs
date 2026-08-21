@@ -271,10 +271,26 @@ impl<const N: usize> MissionRunner<N> {
 
         let (clamped, hit) = self.fence.clamp(self.target);
         self.fence_hit = hit;
+        // 速度前馈（P3-A1 轨迹跟踪）：按目标推进方向给控制器期望速度，消除
+        // "位置环仅靠 kp 误差追赶限速移动目标"的稳态跟随误差（≈v/kp）与相位滞后。
+        // 到达/盘旋（complete）时速度为 0，交由位置环保持。
+        let (vn, ve, vd) = if self.complete() {
+            (0.0f32, 0.0f32, 0.0f32)
+        } else {
+            let dx = goal[0].0 - self.target[0].0;
+            let dy = goal[1].0 - self.target[1].0;
+            let dh = libm::sqrtf(dx * dx + dy * dy).max(1e-6);
+            (
+                dx / dh * self.max_speed.0,
+                dy / dh * self.max_speed.0,
+                (goal[2].0 - self.target[2].0).signum() * self.max_vspeed.0,
+            )
+        };
         Setpoint {
             pos: clamped,
             yaw,
-            vel: [MeterPerSecond::ZERO; 3],
+            vel: [MeterPerSecond(vn), MeterPerSecond(ve), MeterPerSecond(vd)],
+            acc: [MeterPerSecondSquared::ZERO; 3],
         }
     }
 }

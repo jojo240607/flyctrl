@@ -219,6 +219,7 @@ impl<B: Controller, const N: usize> FormationController<B, N> {
             pos: [Meter(desired[0]), Meter(desired[1]), Meter(desired[2])],
             yaw: Radian(0.0),
             vel: [MeterPerSecond::ZERO; 3],
+            acc: [MeterPerSecondSquared::ZERO; 3],
         }
     }
 }

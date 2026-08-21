@@ -104,7 +104,7 @@ impl PidController {
             kp_xy: 0.5,
             kp_z: 0.5,
             kv_xy: 0.8,
-            kv_z: 0.8,
+            kv_z: 1.5,
             vmax_xy: 2.0,
             vmax_z: 2.0,
             tilt_max: 0.35,
@@ -112,7 +112,9 @@ impl PidController {
             att_kd: 0.3,
             hover_thrust: 0.5,
             gravity: 9.81,
-            ki_z: 0.6,
+            ki_z: 0.3, // 原 0.6：积分零点从 ωz=1.2 降到 0.6 rad/s（低于增益穿越 ωc≈0.68 rad/s），
+                      // 使相位裕度从 19.7° 提升到 36.0°（GM 保持 inf）；实测垂直抗扰峰值偏差
+                      // 反而更小（0.094m vs 0.131m），稳态偏差均≈0，未牺牲抗风性能
             iz: 0.0,
             vel_lpf_tau: 0.15,
             filt_vd: 0.0,
@@ -205,9 +207,12 @@ impl Controller for PidController {
         let des_vz = clampf(pre_iz + self.iz, -self.vmax_z, self.vmax_z);
 
         // --- 中环：速度误差 -> 期望世界系加速度 ---
-        let acc_n = self.kv_xy * (des_vx - est.vel[0].0); // 北向
-        let acc_e = self.kv_xy * (des_vy - est.vel[1].0); // 东向
-        let acc_d = self.kv_z * (des_vz - est_vd); // 下垂方向（NED），用滤波后垂直速度
+        // P3-A1 轨迹跟踪：在速度误差 P 项之上叠加设定点加速度前馈 `sp.acc`，
+        // 使转弯/机动时控制器直接按期望加速度预倾（而非等位置/速度误差积累），
+        // 减小轨迹跟踪相位滞后。
+        let acc_n = self.kv_xy * (des_vx - est.vel[0].0) + sp.acc[0].0; // 北向
+        let acc_e = self.kv_xy * (des_vy - est.vel[1].0) + sp.acc[1].0; // 东向
+        let acc_d = self.kv_z * (des_vz - est_vd) + sp.acc[2].0; // 下垂方向（NED），用滤波后垂直速度
 
         // 阶段 11-A 诊断：把控制律内部量存进调试字段，供 host 侧打印（绕开 no_std 无 eprintln）。
         self.dbg_raw_d = est.pos[2].0;
@@ -240,14 +245,15 @@ impl Controller for PidController {
         );
         self.dbg_des_thr = des_thrust;
 
-        // 期望姿态四元数：由（roll=-tilt_e, pitch=-tilt_n, yaw=sp.yaw）构成。
+        // 期望姿态四元数：由（roll=+tilt_e, pitch=-tilt_n, yaw=sp.yaw）构成。
         // 飞控机体(经 X-180 实为前-左-下)：推力沿机体 -Z_body。绕 +Y 正转(+pitch) 把推力
-        // 旋到 -X(南)，故北向(+X)加速需 -pitch；东向(+Y)则需 -roll。
-        // 帧符号校正（SIL 实测）：在 NED 中向东(+Y)是"东侧下沉"，即绕 +X 负转（东侧下、
-        // 西侧上），故东向推力对应【负 roll】；控制器旧约定 "+roll→东" 恰好反了，导致
-        // 东向速度指令产生反向(西)推力 → 水平漂移发散。这里用 -tilt_e 作为期望 roll。
+        // 旋到 -X(南)，故北向(+X)加速需 -pitch；东向(+Y)则需 +roll（绕 +X 正转把 -Z 旋到 +Y，
+        // 实测见下）。
         let yaw = sp.yaw;
-        let q_des = Quaternion::from_euler(Radian(-tilt_e), Radian(-tilt_n), yaw);
+        // 期望 roll 取 +tilt_e（实测 2026-08-21）：NED 中绕 +X(前向) 正转(右滚)把机体 -Z
+        // 旋到 +Y(东) -> 东向推力，故东向加速度需 +roll；旧代码用 -tilt_e 恰好反向，
+        // 导致东向速度指令产生西向推力、东向持续漂移发散（Hover 逐秒诊断 y: 0→-65m）。
+        let q_des = Quaternion::from_euler(Radian(tilt_e), Radian(-tilt_n), yaw);
 
         // --- 内环：四元数姿态误差 -> 期望机体角速度（标准鲁棒写法，无欧拉角奇点） ---
         // q_err = q_est^-1 ⊗ q_des（机体坐标系下的误差旋转）
@@ -276,10 +282,17 @@ impl Controller for PidController {
         //   +X(roll) ：m0,m3 增 / m1,m2 减
         //   +Y(pitch)：m1,m3 增 / m0,m2 减
         //   +Z(yaw)  ：CCW(0,1) 增 / CW(2,3) 减
-        let m0 = des_thrust + 0.5 * (p_cmd + q_cmd - r_cmd);
-        let m1 = des_thrust + 0.5 * (-p_cmd - q_cmd - r_cmd);
-        let m2 = des_thrust + 0.5 * (-p_cmd + q_cmd + r_cmd);
-        let m3 = des_thrust + 0.5 * (p_cmd - q_cmd + r_cmd);
+        //
+        // 符号修正（open_loop_torque_sign_probe 实测，2026-08-21）：
+        // 物理模型 m_yaw = tc·(f0+f1-f2-f3)，且 CCW(0,1) 高 -> +ωz（右旋+）。
+        // 旧混控中 r_cmd 项取 -r_cmd，使 yaw 环阻尼项成为正反馈
+        // （ωz>0 -> r_cmd=-kd·ωz<0 -> m_yaw<0 -> ωz 更负 -> 指数发散，
+        // 见 Hover 逐秒诊断 ωz 从 -3 增至 -36 rad/s 后级联横滚/俯仰爆掉）。
+        // 故 yaw 项翻转为 +r_cmd；roll/pitch 保持原符号（隔离探针稳定）。
+        let m0 = des_thrust + 0.5 * (p_cmd + q_cmd + r_cmd);
+        let m1 = des_thrust + 0.5 * (-p_cmd - q_cmd + r_cmd);
+        let m2 = des_thrust + 0.5 * (-p_cmd + q_cmd - r_cmd);
+        let m3 = des_thrust + 0.5 * (p_cmd - q_cmd - r_cmd);
 
         ActuatorCmd {
             motor: [

@@ -132,8 +132,8 @@ fn run_combo(
         let gps = if gps_available { gps_true } else { None };
 
         let est: VehicleState = match est_kind {
-            EstKind::Complementary => comp.step(dt, imu, gps),
-            EstKind::Ekf => ekf.step(dt, imu, gps),
+            EstKind::Complementary => comp.step(dt, imu, gps, None),
+            EstKind::Ekf => ekf.step(dt, imu, gps, None),
         };
         cmd = match ctrl_kind {
             CtrlKind::Pid => pid.control(dt, &sp, &est),
@@ -516,8 +516,8 @@ fn run_combo_maxerr(
         let gps = if gps_available { gps_true } else { None };
 
         let est: VehicleState = match est_kind {
-            EstKind::Complementary => comp.step(dt, imu, gps),
-            EstKind::Ekf => ekf.step(dt, imu, gps),
+            EstKind::Complementary => comp.step(dt, imu, gps, None),
+            EstKind::Ekf => ekf.step(dt, imu, gps, None),
         };
         cmd = match ctrl_kind {
             CtrlKind::Pid => pid.control(dt, &sp, &est),
@@ -667,8 +667,8 @@ fn run_fixed_params(
         };
         let gps = if gps_available { gps_true } else { None };
         let est: VehicleState = match est_kind {
-            EstKind::Complementary => comp.step(dt, imu, gps),
-            EstKind::Ekf => ekf.step(dt, imu, gps),
+            EstKind::Complementary => comp.step(dt, imu, gps, None),
+            EstKind::Ekf => ekf.step(dt, imu, gps, None),
         };
         cmd = match ctrl_kind {
             CtrlKind::Pid => pid.control(dt, &sp, &est),
@@ -731,7 +731,7 @@ fn run_rtf_eval(scenario: &Scenario, seconds: f32) {
         let ideal = phys.step(dt, cmd);
         let s = phys.state();
         let (imu, gps) = world.sense(dt, ideal, s.pos);
-        let est = ekf.step(dt, imu, gps);
+        let est = ekf.step(dt, imu, gps, None);
         cmd = mpc.control(dt, &sp, &est);
     }
 
@@ -744,7 +744,7 @@ fn run_rtf_eval(scenario: &Scenario, seconds: f32) {
         let ideal = phys.step(dt, cmd);
         let s = phys.state();
         let (imu, gps) = world.sense(dt, ideal, s.pos);
-        let est = ekf.step(dt, imu, gps);
+        let est = ekf.step(dt, imu, gps, None);
         cmd = mpc.control(dt, &sp, &est);
     }
     let elapsed = t0.elapsed();
@@ -808,7 +808,7 @@ fn run_comm_demo(scenario: &Scenario, seconds: f32) {
         let ideal = phys.step(dt, cmd);
         let s = phys.state();
         let (imu, gps_true) = world.sense(dt, ideal, s.pos);
-        let est = ekf.step(dt, imu, gps_true);
+        let est = ekf.step(dt, imu, gps_true, None);
         cmd = mpc.control(dt, &sp, &est);
         let _h = fdir.update(&imu, gps_true.is_some(), true, true);
 
@@ -1037,8 +1037,8 @@ fn run_indi_demo(scenario: &Scenario, seconds: f32) {
         imu_pid.gyro[0] = flyctrl_core::units::RadianPerSecond(imu_pid.gyro[0].0 + disturb);
         imu_indi.gyro[0] = flyctrl_core::units::RadianPerSecond(imu_indi.gyro[0].0 + disturb);
 
-        let est_pid = ekf_pid.step(dt, imu_pid, gps_pid);
-        let est_indi = ekf_indi.step(dt, imu_indi, gps_indi);
+        let est_pid = ekf_pid.step(dt, imu_pid, gps_pid, None);
+        let est_indi = ekf_indi.step(dt, imu_indi, gps_indi, None);
 
         cmd_pid = pid.control(dt, &sp, &est_pid);
         cmd_indi = indi.control(dt, &sp, &est_indi);
@@ -1116,13 +1116,13 @@ fn run_swarm_demo(seconds: f32) {
         let cl = pid_l.control(dt, &sp_l, &sl);
         let ideal_l = phys_l.step(dt, cl);
         let (imu_l, gps_l) = world.sense(dt, ideal_l, phys_l.state().pos);
-        sl = ekf_l.step(dt, imu_l, gps_l);
+        sl = ekf_l.step(dt, imu_l, gps_l, None);
 
         // 僚机：编队控制器用"长机估计位置 + 编队偏移"生成设定点 → PID。
         let cw = fc_w.control(dt, &sp_l, &sw);
         let ideal_w = phys_w.step(dt, cw);
         let (imu_w, gps_w) = world.sense(dt, ideal_w, phys_w.state().pos);
-        sw = ekf_w.step(dt, imu_w, gps_w);
+        sw = ekf_w.step(dt, imu_w, gps_w, None);
 
         // 更新邻居表：长机广播自身估计位置 → 僚机入库。
         fc_w.neighbors().update(NeighborState::fresh(
@@ -1235,7 +1235,7 @@ fn run_mission_demo(seconds: f32) {
         // 推进物理 → 得到理想 IMU（含真实加速度）→ 世界叠加传感器噪声 → EKF 估计。
         let ideal = phys.step(dt, cmd);
         let (imu, gps) = world.sense(dt, ideal, phys.state().pos);
-        est = ekf.step(dt, imu, gps);
+        est = ekf.step(dt, imu, gps, None);
         if !state_finite(&est) { nan = true; break; }
 
         if i % 100 == 0 {
@@ -1347,7 +1347,7 @@ fn run_bus_demo(seconds: f32) {
         let imu_s = bus.recv_imu_est();
         let gps_s = bus.recv_gps();
         if let (Some(imu), gps) = (imu_s, gps_s) {
-            let est = ekf.step(dt, imu, gps);
+            let est = ekf.step(dt, imu, gps, None);
             last_est = est;
             if !state_finite(&est) { nan = true; break; }
             let _ = bus.publish_est(est);
@@ -1460,7 +1460,7 @@ fn print_detail(scenario: &Scenario, seconds: f32) {
         let ideal = phys.step(dt, cmd);
         let s = phys.state();
         let (imu, gps) = world.sense(dt, ideal, s.pos);
-        let est = comp.step(dt, imu, gps);
+        let est = comp.step(dt, imu, gps, None);
         cmd = pid.control(dt, &sp, &est);
         if (k % 200) == 0 || k == steps - 1 {
             println!(

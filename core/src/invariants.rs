@@ -56,7 +56,7 @@ pub fn state_finite(s: &VehicleState) -> bool {
 /// 导致卡尔曼增益出现负方差（不可信估计）。本函数用固定迭代次数的
 /// Jacobi 特征值分解（无堆、有界）校验最小特征值 ≥ `COV_DIAG_MIN`。
 ///
-/// `p` 为 `n*n` 行主序方阵；`n` 必须 ≤ 12（满足当前 9 维 EKF + 余量）。
+/// `p` 为 `n*n` 行主序方阵；`n` 必须 ≤ 12（满足当前 10 维 EKF + 余量）。
 pub fn cov_psd(p: &[f32], n: usize) -> bool {
     if n == 0 || n > 12 || p.len() != n * n {
         return false;

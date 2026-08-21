@@ -11,11 +11,19 @@ pub struct Setpoint {
     pub pos: [Meter; 3],       // 期望 NED 位置（D 向下为正，悬停通常为负高度）
     pub yaw: Radian,           // 期望偏航
     pub vel: [MeterPerSecond; 3], // 期望速度（可为零）
+    /// 期望加速度（NED，m/s²，可为零）。轨迹跟踪前馈：速度中环把 `kv*(des_v - v)`
+    /// 与 `acc` 前馈相加得期望世界系加速度 → 期望倾角（转弯/机动预倾，P3-A1）。
+    pub acc: [MeterPerSecondSquared; 3],
 }
 
 impl Setpoint {
     pub fn hover(pos: [Meter; 3], yaw: Radian) -> Self {
-        Self { pos, yaw, vel: [MeterPerSecond::ZERO; 3] }
+        Self {
+            pos,
+            yaw,
+            vel: [MeterPerSecond::ZERO; 3],
+            acc: [MeterPerSecondSquared::ZERO; 3],
+        }
     }
 }
 

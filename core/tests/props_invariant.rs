@@ -79,6 +79,7 @@ fn random_state(rng: &mut Lcg) -> VehicleState {
         ],
         att: random_att(rng),
         airspeed: MeterPerSecond(rng.spread(10.0)),
+        accel_bias: [0.0; 3],
     }
 }
 
@@ -163,7 +164,7 @@ fn prop_ekf_cov_psd_under_noise() {
         }
         let p = ekf.cov();
         assert!(
-            cov_psd(p, 9),
+            cov_psd(p, 10),
             "EKF 协方差在噪声观测下必须保持对称半正定"
         );
     }

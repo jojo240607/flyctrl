@@ -165,13 +165,12 @@ impl Physics {
             drag_body[i] = -p.drag_coeff[i] * vi * vi.abs();
         }
         // 桨盘滑流 / 诱导阻力：旋翼向下诱导速度产生向下附加阻力（动量理论）。
-        // 诱导速度 v_ind = sqrt(T / (2·ρ·A))，诱导阻力 ∝ T·v_ind（投影到机体下轴）。
-        // 这里用总推力基值 f_total 表示 T（已含重力 + 机动），无量纲系数标定。
-        let t_thrust = f_total.abs();
-        let v_ind = flyctrl_core::math::sqrt(t_thrust / (2.0 * p.air_density * p.disk_area).max(1e-6));
-        // 诱导阻力沿机体下轴（-Z 机体）阻力为正（阻碍前进->展向阻力抵消机身向下流）
-        let induced = -p.induced_drag_coeff * v_ind * v_ind.abs();
-        drag_body[2] += induced; // 机体下轴
+        // 注意：旧实现此处用负号，得到"向上的诱导阻力"，使物理悬停油门点
+        // 被抬到 ~0.40 而控制器参考 hover_thrust=0.5，垂直通道在 0.5 油门
+        // 下持续爬升、bang-bang 振荡（见 open_loop_hover_probe 探针）。
+        // 且该项 ∝ f_total 等价于固定比例推力损耗，本身就是有缺陷的建模。
+        // 直接移除，恢复推力线性模型：cmd=0.5 恰为悬停点，与控制器自洽。
+        // （induced_drag_coeff 字段保留用于配置兼容，动力学不再使用。）
         // 旋回世界系
         let drag_world = rotate_by_quat(r, drag_body);
         let drag = [
@@ -220,7 +219,16 @@ impl Physics {
         ];
         let attn = r.integrate(wn[0].0, wn[1].0, wn[2].0, dt);
 
-        self.state = VehicleState { pos: pn, vel: vn, att: attn, omega: wn };
+        self.state = VehicleState {
+            pos: pn,
+            vel: vn,
+            att: attn,
+            omega: wn,
+            // 以下为估计器输出而非物理真值：物理状态不含空速/零偏/启动计时，置默认。
+            time_boot_ms: 0,
+            airspeed: MeterPerSecond::ZERO,
+            accel_bias: [0.0; 3],
+        };
 
         // 5) 构造"理想 IMU"：机体加速度（含重力分量补偿后的比力）+ 角速度
         //    比力 f = a_world - g_world；再旋到机体

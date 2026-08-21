@@ -139,17 +139,15 @@ impl World {
             self.stuck_imu = None; // 窗口外重置卡死记录
         }
 
-        // 位置测量 = 真实位置 + 噪声（模拟 GPS+气压融合）
+        // 位置测量 = 真实位置 + 噪声（模拟 GPS+气压融合）；无 Doppler 速度观测。
         let pos = if active && self.fault == FaultKind::GpsDropout {
             None // 丢帧：位置测量不可用
         } else {
-            Some(PosSample {
-                pos: [
-                    Meter(true_pos[0].0 + randn() * p.pos_noise),
-                    Meter(true_pos[1].0 + randn() * p.pos_noise),
-                    Meter(true_pos[2].0 + randn() * p.pos_noise),
-                ],
-            })
+            Some(PosSample::pos_only([
+                Meter(true_pos[0].0 + randn() * p.pos_noise),
+                Meter(true_pos[1].0 + randn() * p.pos_noise),
+                Meter(true_pos[2].0 + randn() * p.pos_noise),
+            ]))
         };
         (imu, pos)
     }

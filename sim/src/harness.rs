@@ -63,7 +63,7 @@ impl<E: Estimator, C: Controller> Harness<E, C> {
             // 2) 世界加噪（位置测量基于真实位置）
             let (imu, pos) = self.world.sense(self.dt, ideal, true_pos);
             // 3) 估计
-            let est = self.estimator.step(self.dt, imu, pos);
+            let est = self.estimator.step(self.dt, imu, pos, None);
             self.last_est = est;
             // 4) 控制（计时最坏耗时）
             let t0 = now_ms();
@@ -115,7 +115,7 @@ impl<E: Estimator, C: Controller> Harness<E, C> {
             // 2) 世界加噪
             let (imu, pos) = self.world.sense(self.dt, ideal, true_pos);
             // 3) 估计
-            let est = self.estimator.step(self.dt, imu, pos);
+            let est = self.estimator.step(self.dt, imu, pos, None);
             self.last_est = est;
             // 4) 控制
             let t0 = now_ms();

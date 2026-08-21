@@ -143,6 +143,7 @@ impl Scenario {
                     pos: [Meter(cx), Meter(cy), Meter(self.base_alt)],
                     yaw: Radian(0.0),
                     vel: [MeterPerSecond(vx), MeterPerSecond(vy), MeterPerSecond::ZERO],
+                    acc: [MeterPerSecondSquared::ZERO; 3],
                 }
             }
 
@@ -156,6 +157,7 @@ impl Scenario {
                     pos: [Meter(r * c), Meter(r * s), Meter(self.base_alt)],
                     yaw: Radian(0.0),
                     vel: [MeterPerSecond(vx), MeterPerSecond(vy), MeterPerSecond::ZERO],
+                    acc: [MeterPerSecondSquared::ZERO; 3],
                 }
             }
         }
