@@ -273,14 +273,17 @@ impl Controller for PidController {
         self.dbg_omega = [est.omega[0].0, est.omega[1].0, est.omega[2].0];
 
         // --- 混控：X 型四旋翼（0=前右 1=后左 2=前左 3=后右） ---
-        // 控制器命令 (p_cmd,q_cmd,r_cmd) 在飞控机体轴；quat_up_to_ned 用 X-180 翻转，
-        // 故飞控机体 -> 引擎机体的力矩向量变换为 (τx, τy, τz)_eng = (τx, -τy, -τz)_fc。
-        // 即期望引擎机体力矩 = (p_cmd, -q_cmd, -r_cmd)。由引擎机体电机力矩公式反解
-        // （m0前右/m1后左/m2前左/m3后右，spin 0,1 CCW / 2,3 CW）：
-        //   τx = l(m0+m3-m1-m2)  τy = l(m1+m3-m0-m2)  τz = k(m0+m1-m2-m3)
-        // 代入 (p_cmd,-q_cmd,-r_cmd) 解得如下（K=0.5 吸收臂长/反扭矩系数）：
+        // 控制器命令 (p_cmd,q_cmd,r_cmd) 定义在飞控机体轴（NED/FRD：前-X 右-Y 下-Z）。
+        // 本混控把命令映射成 4 路油门，使任一按同一 X 布局解算力矩的 plant 都得到
+        //   FC 机体轴力矩：τx = 2l·p_cmd（+roll=右滚）τy = 2l·q_cmd（+pitch=抬头）
+        //   τz = 2k·r_cmd（+yaw）。flyctrl-sim 标准 NED/FRD 直接采用；
+        //   ToyWorld（引擎 Y-up）侧经伪向量反射（FRD→引擎 det=-1，roll 力矩翻转）后
+        //   施加等价引擎力矩（见 fly-sim-core plant.rs 坐标桥接注释）。
+        // 由力矩公式反解（m0前右/m1后左/m2前左/m3后右，spin 0,1 CCW / 2,3 CW）：
+        //   τx = l(m0+m3-m1-m2)  τy = l(m0+m2-m1-m3)  τz = k(m0+m1-m2-m3)
+        // 解得如下（K=0.5 吸收臂长/反扭矩系数）：
         //   +X(roll) ：m0,m3 增 / m1,m2 减
-        //   +Y(pitch)：m1,m3 增 / m0,m2 减
+        //   +Y(pitch)：m0,m2 增 / m1,m3 减
         //   +Z(yaw)  ：CCW(0,1) 增 / CW(2,3) 减
         //
         // 符号修正（open_loop_torque_sign_probe 实测，2026-08-21）：
