@@ -177,6 +177,57 @@ pub struct AirspeedSample {
     pub timestamp_s: f64,
 }
 
+/// 视觉里程计（VIO）单次测量：机载相机 + IMU 融合出的**相对**运动增量。
+///
+/// 特点：更新率高（30–60Hz）、短期精度高（速度误差 ~0.1 m/s 量级）、
+/// 但**无绝对参考、随时间缓慢漂移**（位置长期误差累积）。
+/// 因此 EKF 用中等位置噪声 + 较小速度噪声融合：作为 GPS 帧之间的连续修正，
+/// 填补 GPS 失锁 / 低更新率时的位置与速度估计空白。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VioSample {
+    /// NED 位置（可选：相对起点累积的估计，存在长期漂移）。
+    pub pos: Option<[Meter; 3]>,
+    /// NED 速度（可选：光流 / 特征点跟踪估计，精度高于 GPS Doppler）。
+    pub vel: Option<[MeterPerSecond; 3]>,
+}
+
+impl VioSample {
+    /// 空样本（传感器故障 / 未装备）。
+    pub fn none() -> Self {
+        VioSample { pos: None, vel: None }
+    }
+    /// 仅位置观测。
+    pub fn pos_only(pos: [Meter; 3]) -> Self {
+        VioSample { pos: Some(pos), vel: None }
+    }
+    /// 仅速度观测。
+    pub fn vel_only(vel: [MeterPerSecond; 3]) -> Self {
+        VioSample { pos: None, vel: Some(vel) }
+    }
+    /// 位置 + 速度观测。
+    pub fn with_vel(pos: [Meter; 3], vel: [MeterPerSecond; 3]) -> Self {
+        VioSample { pos: Some(pos), vel: Some(vel) }
+    }
+}
+
+/// RTK-GPS 单次测量：载波相位差分后的**厘米级高精度**位置（NED）。
+///
+/// 特点：更新率低（1–5Hz），但绝对精度比普通 GPS 高一个量级以上
+/// （水平 ~2cm、垂向 ~4cm，即标准差 ~0.05m）。
+/// EKF 用极小位置观测噪声融合，把位置协方差压到厘米量级，
+/// 同时抑制 VIO 长期漂移（RTK 提供绝对参考、VIO 提供帧间连续）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RtkSample {
+    /// NED 厘米级位置。
+    pub pos: [Meter; 3],
+}
+
+impl RtkSample {
+    pub fn new(pos: [Meter; 3]) -> Self {
+        RtkSample { pos }
+    }
+}
+
 /// 控制输出：四个电机的归一化推力指令 [0,1]。
 /// 索引对应 X 型四旋翼：0=前右(CCW) 1=后左(CCW) 2=前左(CW) 3=后右(CW)。
 #[derive(Debug, Clone, Copy, PartialEq, Default)]

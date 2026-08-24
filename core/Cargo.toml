@@ -10,6 +10,10 @@ license.workspace = true
 [dependencies]
 libm = "0.2"
 
+# 共用 MAVLink v2 编解码核心（帧层 + codec 全消息 + 地面站兼容层）。
+# 单一事实来源：本 crate 不再手搓帧层/编解码，只保留 VehicleState 便捷封装。
+mavlink-core = { path = "../../mavlink-core" }
+
 # 真实芯片依赖（仅在启用 stm32f407 特性时编译进固件，host/SIL 不受影响）。
 # 走原始 PAC + cortex-m 裸机运行时，与 joc-base 直接寄存器访问风格一致，零堆、no_std。
 stm32f4 = { version = "0.16", features = ["stm32f407"], optional = true }

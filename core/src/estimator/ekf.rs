@@ -18,8 +18,8 @@ use crate::estimator::trait_def::Estimator;
 use crate::math::sqrt;
 use crate::units::*;
 use crate::vehicle::{
-    AirspeedSample, ImuSample, PosSample, Quaternion, VehicleState, quat_to_rotmat,
-    rotate_vec_by_quat,
+    AirspeedSample, ImuSample, PosSample, Quaternion, RtkSample, VehicleState, VioSample,
+    quat_to_rotmat, rotate_vec_by_quat,
 };
 
 const N: usize = 10; // pos(3) + vel(3) + gyro_bias(3) + accel_bias_z(1)
@@ -27,6 +27,13 @@ const N: usize = 10; // pos(3) + vel(3) + gyro_bias(3) + accel_bias_z(1)
 /// 协方差对角线硬上限（m² / (m/s)² / (m/s²)²）。防止不可观状态协方差经 F 矩阵耦合
 /// 指数增长而至 Inf/NaN。正常可观测状态下协方差远小于此值。
 const P_MAX: f32 = 1e3;
+
+/// 卡尔曼增益元素硬上限。紧噪声观测（RTK 厘米级 / VIO）下，位置观测经非对角协方差
+/// 产生的速度行增益可爆炸到 ~40（K[3][0]=P[3][0]/S00，S00≈r_rtk→0.0025），一步把速度
+/// 踢飞，随后 Joseph 协方差更新在 float32 下失去 PSD、交叉项 p03 发散到 -1e13 → NaN。
+/// 限幅后每个观测元素对状态的修正有界（≤2 m/s per m），协方差更新保持数值稳定；
+/// 位置行增益天然 ≤1（p00/(p00+r)），不受限幅影响。
+const K_MAX: f32 = 2.0;
 
 #[inline]
 fn mat_ident(p: &mut [f32; N * N]) {
@@ -84,6 +91,9 @@ pub struct EkfEstimator {
     r_vel: f32,         // 速度观测噪声（Doppler，m/s）^2
     r_alt: f32,         // 高度（气压）观测噪声（m）^2
     r_airspeed: f32,    // 空速观测噪声（m/s）^2
+    r_vio_pos: f32,     // VIO 位置观测噪声（m）^2（中长期漂移，弱于 RTK/GPS 绝对位置）
+    r_vio_vel: f32,     // VIO 速度观测噪声（m/s）^2（光流高精度，强于 GPS Doppler）
+    r_rtk: f32,         // RTK-GPS 位置观测噪声（m）^2（厘米级，远强于普通 GPS）
     att_alpha: f32,     // 姿态重力修正强度（0 = 纯积分）
     airspeed_est: f32,  // 估计空速 (m/s)，由空速计融合得到
     accel_lp: [f32; 3],  // 加计低通滤波（滤除高频振动，用于重力锚定）
@@ -132,6 +142,12 @@ impl EkfEstimator {
             r_vel,
             r_alt,
             r_airspeed: 0.75, // ~0.87 m/s RMS 空速观测噪声
+            r_vio_pos: 0.25,  // ~0.5 m RMS：VIO 位置有中长期漂移，权重弱于 GPS/RTK 绝对位置
+            // ~0.2 m/s RMS：VIO 速度（光流）精度高于 GPS Doppler，但不可过紧——
+            // r=0.01 时速度协方差塌缩 + ab_z 交叉增益放大，任何持久速度残差都会驱动
+            // 垂向零偏指数发散（仿真：GPS 中断 + VIO 时 ab_z → 4.3e6 → NaN）。
+            r_vio_vel: 0.04,
+            r_rtk: 0.0025,    // ~0.05 m RMS：RTK 厘米级绝对位置，权重最强
             att_alpha,
             airspeed_est: 0.0,
             accel_lp: [0.0; 3],
@@ -311,6 +327,26 @@ impl Estimator for EkfEstimator {
         }
     }
 
+    /// 注入 VIO 测量：位置（中等噪声，容忍长期漂移）+ 速度（小噪声，光流高精度）。
+    /// 在 GPS 帧间 / 失锁时提供连续修正，与 RTK 绝对参考互补。
+    fn update_vio(&mut self, vio: Option<VioSample>) {
+        if let Some(v) = vio {
+            if let Some(pos) = v.pos {
+                self.update_pos_r(PosSample::pos_only(pos), self.r_vio_pos);
+            }
+            if let Some(vel) = v.vel {
+                self.update_vel_r([vel[0].0, vel[1].0, vel[2].0], self.r_vio_vel);
+            }
+        }
+    }
+
+    /// 注入 RTK-GPS 测量：厘米级绝对位置（极小噪声），压紧位置协方差、抑制 VIO 漂移。
+    fn update_rtk(&mut self, rtk: Option<RtkSample>) {
+        if let Some(z) = rtk {
+            self.update_pos_r(PosSample::pos_only(z.pos), self.r_rtk);
+        }
+    }
+
     /// 当前估计状态（不推进），供诊断/日志读取（已含所有已融合观测）。
     fn state(&self) -> VehicleState {
         VehicleState {
@@ -420,14 +456,14 @@ impl EkfEstimator {
     }
 
     /// 位置观测更新步（Joseph 形式）：S = HPH^T+R、K = P H^T S^-1、x += K y、
-    /// P = (I-KH)P(I-KH)^T + K R K^T。
-    /// 栈数组（s/pht/k/sinv/a/ap/apat/krkt）作用域限于本方法，返回后栈槽被回收。
-    fn update_pos(&mut self, z: PosSample) {
+    /// P = (I-KH)P(I-KH)^T + K R K^T。`r` 为观测噪声（m²），供 GPS / VIO / RTK 以
+    /// 各自精度融合同一位置状态。栈数组作用域限于本方法，返回后栈槽被回收。
+    fn update_pos_r(&mut self, z: PosSample, r: f32) {
         // S = H P H^T + R (3x3)
         let mut s = [0.0f32; 9];
         for i in 0..3 {
             for j in 0..3 {
-                s[i * 3 + j] = self.p[i * N + j] + if i == j { self.r_pos } else { 0.0 };
+                s[i * 3 + j] = self.p[i * N + j] + if i == j { r } else { 0.0 };
             }
         }
         // K = P H^T S^-1 (9x3) ; P H^T 即 P 前三列
@@ -458,6 +494,12 @@ impl EkfEstimator {
 
         let mut k = [0.0f32; 36];
         mat_mul(&pht, &sinv, &mut k, N, 3, 3);
+
+        // 数值鲁棒：卡尔曼增益限幅。紧噪声位置观测（RTK/VIO）下速度行增益可爆炸，
+        // 限幅后 Joseph 协方差更新保持 PSD，阻断 p03 发散（见 K_MAX 注释）。
+        for e in k.iter_mut() {
+            *e = e.clamp(-K_MAX, K_MAX);
+        }
 
         // 垂向加计零偏状态 (9) 不可由位置观测驱动（不可观 → 发散风险）：
         // 清零其卡尔曼增益行，使位置更新不修正 accel_bias_z（仅速度观测可估计，见 update_vel）。
@@ -497,7 +539,7 @@ impl EkfEstimator {
         mat_mul(&a, &self.p, &mut ap, N, N, N);
         let mut apat = [0.0f32; N * N];
         mat_mul_at(&ap, &a, &mut apat, N, N, N);
-        // 3) K R K^T （R = r_pos * I3）
+        // 3) K R K^T （R = r * I3）
         let mut krkt = [0.0f32; N * N];
         for i in 0..N {
             for j in 0..N {
@@ -505,7 +547,7 @@ impl EkfEstimator {
                 for l in 0..3 {
                     acc += k[i * 3 + l] * k[j * 3 + l];
                 }
-                krkt[i * N + j] = acc * self.r_pos;
+                krkt[i * N + j] = acc * r;
             }
         }
         // 4) P = A P A^T + K R K^T，并对称化（消除尾差）
@@ -528,14 +570,20 @@ impl EkfEstimator {
         }
     }
 
+    /// 位置观测更新（GPS，默认噪声 `r_pos`）。等价于 `update_pos_r(z, self.r_pos)`。
+    pub fn update_pos(&mut self, z: PosSample) {
+        self.update_pos_r(z, self.r_pos);
+    }
+
     /// 速度观测更新步（Doppler GPS）：H = [0 0 0 I3 0] 作用于状态 [pos, vel, bias]，
-    /// 直接观测速度分量 3..6。Joseph 形式，栈数组作用域限于本方法。
-    pub fn update_vel(&mut self, vel: [f32; 3]) {
+    /// 直接观测速度分量 3..6。`r` 为观测噪声（m/s）²，供 GPS Doppler / VIO 以各自
+    /// 精度融合。Joseph 形式，栈数组作用域限于本方法。
+    pub fn update_vel_r(&mut self, vel: [f32; 3], r: f32) {
         // S = H P H^T + R (3x3)
         let mut s = [0.0f32; 9];
         for i in 0..3 {
             for j in 0..3 {
-                s[i * 3 + j] = self.p[(3 + i) * N + (3 + j)] + if i == j { self.r_vel } else { 0.0 };
+                s[i * 3 + j] = self.p[(3 + i) * N + (3 + j)] + if i == j { r } else { 0.0 };
             }
         }
         // K = P H^T S^-1 (9x3)；P H^T 即 P 第 3..6 列
@@ -566,6 +614,20 @@ impl EkfEstimator {
         let mut k = [0.0f32; 36];
         mat_mul(&pht, &sinv, &mut k, N, 3, 3);
 
+        // 数值鲁棒：卡尔曼增益限幅（同 update_pos_r）。紧速度观测（VIO 光流 r=0.04）下
+        // 位置/交叉状态行增益可过大，限幅保持 Joseph 更新数值稳定。
+        for e in k.iter_mut() {
+            *e = e.clamp(-K_MAX, K_MAX);
+        }
+
+        // 垂向加计零偏 x[9] 只应被【垂向】速度观测驱动：水平速度创新（y0/y1）经交叉
+        // 协方差 K[9][0..1] 会注入水平残差噪声/偏置进零偏（物理上水平速度误差由水平
+        // 加计零偏引起，而本滤波器不估计水平零偏），紧速度观测下放大成 ab_z 发散
+        // （仿真：GPS 中断 + VIO 时 ab_z → 4.3e6 → NaN）。清零其水平增益行，仅保留
+        // 垂向增益 K[9][2]。
+        k[9 * 3 + 0] = 0.0;
+        k[9 * 3 + 1] = 0.0;
+
         // 注：垂向加计零偏 x[9] 仅由速度观测驱动，单分量可观且数值稳定，
         // 无需额外增益阻尼（3 轴机体系版本曾有 Y 轴正反馈发散，已收敛为单分量）。
         // 阶段 11-A：启用垂向零偏估计。之前 0.0 把零偏恒锁在初值 0，
@@ -585,6 +647,15 @@ impl EkfEstimator {
                 corr *= AB_VEL_GAIN;
             }
             self.x[i] += corr;
+        }
+        // 加计零偏物理上界夹取（消费级 IMU 零偏通常 < 0.3 m/s²）：该状态仅由速度观测
+        // 驱动，正常收敛不受影响；夹取作发散兜底。必须在此执行——`update_vio`/`update_rtk`
+        // 在 `step`（其尾部已有同款夹取）之后调用，若不加此处则 VIO/RTK 驱动的零偏
+        // 在整步内无界增长，成为 NaN 源头。
+        if self.x[9] > 0.3 {
+            self.x[9] = 0.3;
+        } else if self.x[9] < -0.3 {
+            self.x[9] = -0.3;
         }
 
         // Joseph 形式：P = (I - K H) P (I - K H)^T + K R K^T，H 仅 3..6 行非零
@@ -606,7 +677,7 @@ impl EkfEstimator {
                 for l in 0..3 {
                     acc += k[i * 3 + l] * k[j * 3 + l];
                 }
-                krkt[i * N + j] = acc * self.r_vel;
+                krkt[i * N + j] = acc * r;
             }
         }
         for i in 0..(N * N) {
@@ -622,6 +693,11 @@ impl EkfEstimator {
                 self.p[i * N + i] = 1e-6;
             }
         }
+    }
+
+    /// 速度观测更新（GPS Doppler，默认噪声 `r_vel`）。等价于 `update_vel_r(vel, self.r_vel)`。
+    pub fn update_vel(&mut self, vel: [f32; 3]) {
+        self.update_vel_r(vel, self.r_vel);
     }
 
     /// 高度观测更新步（气压计）：气压计测得**向上**高度 `alt`，而状态 D 轴向下为正，
@@ -757,6 +833,8 @@ impl EkfEstimator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(test)]
+    extern crate std;
     use crate::config::VehicleConfig;
     use crate::units::*;
     use crate::vehicle::{Airspeed, AirspeedSample, ImuSample, MeterPerSecond, RadianPerSecond};
@@ -831,5 +909,140 @@ mod tests {
             "EKF 恒定比力+GPS 悬停应稳定: max_abs={} pos_z={} vel_z={} bad={}",
             max_abs, last.pos[2].0, last.vel[2].0, bad
         );
+    }
+
+    #[test]
+    fn vio_fusion_tracks_truth_during_gps_outage() {
+        // P3-B1：GPS 失锁期间 VIO 桥接。机体匀速 2 m/s 前飞（北向），IMU 零加速度
+        // （比力变化由水平速度保持承担）、无 GPS、无空速；仅 VIO 提供位置+速度观测。
+        // 无 VIO 时 EKF 因无速度/位置观测会把速度锁在 0、位置停在起点（纯积分无输入）；
+        // 有 VIO 时估计位置/速度应跟随真值，验证 VIO 填补 GPS 帧间/失锁的估计空白。
+        let mut ekf = EkfEstimator::default_quad();
+        ekf.set_initial_position([0.0, 0.0, -5.0]);
+        let imu = ImuSample {
+            accel: [MeterPerSecondSquared(0.0); 3],
+            gyro: [RadianPerSecond(0.0); 3],
+        };
+        let mut truth_n = 0.0f32;
+        let mut last = VehicleState::zero();
+        for _ in 0..300 {
+            truth_n += 2.0 * 0.01; // 2 m/s 匀速
+            let vio = VioSample::with_vel(
+                [Meter(truth_n), Meter(0.0), Meter(-5.0)],
+                [MeterPerSecond(2.0), MeterPerSecond(0.0), MeterPerSecond(0.0)],
+            );
+            last = ekf.step(Second(0.01), imu, None, None);
+            ekf.update_vio(Some(vio));
+        }
+        // 3s 后真值北向 6m。
+        assert!(
+            (last.pos[0].0 - 6.0).abs() < 1.0,
+            "VIO 桥接后估计位置应≈6m，got {:.3}",
+            last.pos[0].0
+        );
+        assert!(
+            (last.vel[0].0 - 2.0).abs() < 0.3,
+            "VIO 速度融合后估计速度应≈2 m/s，got {:.3}",
+            last.vel[0].0
+        );
+        assert!(
+            last.pos[2].0.is_finite() && last.vel[0].0.is_finite(),
+            "VIO 融合不得产生 NaN"
+        );
+    }
+
+    #[test]
+    fn rtk_fusion_reaches_cm_precision() {
+        // P3-B1：RTK 厘米级位置融合。初始位置给定大误差（[10,5,-5]），RTK 测得真值
+        // [0,0,-5]（噪声 ~0.05m）。反复融合后估计位置应收敛到厘米量级（<0.15m）。
+        // IMU 用悬停比力 [0,0,-9.81]（抵消重力），az_w = -9.81+g-0 = 0，垂向不漂移；
+        // 若用 [0,0,0]（自由落体）EKF 会按 g 积分垂向速度，而位置观测不改垂向速度
+        // （见 update_pos_r 清零第 5 行增益），垂向将发散，测试失去意义。
+        let mut ekf = EkfEstimator::default_quad();
+        ekf.set_initial_position([10.0, 5.0, -5.0]);
+        let imu = ImuSample {
+            accel: [MeterPerSecondSquared(0.0), MeterPerSecondSquared(0.0), MeterPerSecondSquared(-9.81)],
+            gyro: [RadianPerSecond(0.0); 3],
+        };
+        let rtk = RtkSample::new([Meter(0.0), Meter(0.0), Meter(-5.0)]);
+        let mut last = VehicleState::zero();
+        for _ in 0..50 {
+            last = ekf.step(Second(0.01), imu, None, None);
+            ekf.update_rtk(Some(rtk));
+        }
+        let err = [
+            (last.pos[0].0 - 0.0).abs(),
+            (last.pos[1].0 - 0.0).abs(),
+            (last.pos[2].0 + 5.0).abs(),
+        ];
+        assert!(
+            err[0] < 0.15 && err[1] < 0.15 && err[2] < 0.15,
+            "RTK 融合后估计位置应达厘米级（<0.15m），got err={:?}",
+            err
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn dbg_rtk_divergence() {
+        #[cfg(test)]
+        use std::println;
+        let mut ekf = EkfEstimator::default_quad();
+        ekf.set_initial_position([10.0, 5.0, -5.0]);
+        let imu = ImuSample {
+            accel: [MeterPerSecondSquared(0.0); 3],
+            gyro: [RadianPerSecond(0.0); 3],
+        };
+        let rtk = RtkSample::new([Meter(0.0), Meter(0.0), Meter(-5.0)]);
+        for i in 0..3 {
+            let _last = ekf.step(Second(0.01), imu, None, None);
+            println!("--- i={i} BEFORE update: x=[{:.6},{:.6},{:.6}] vel=[{:.6},{:.6},{:.6}]", ekf.x[0], ekf.x[1], ekf.x[2], ekf.x[3], ekf.x[4], ekf.x[5]);
+            println!("  P rows 0-6 cols0-3:");
+            for r in 0..6 {
+                println!("    r{r}: [{:.3e},{:.3e},{:.3e}] cross0={:.3e} cross1={:.3e} cross2={:.3e}",
+                    ekf.p[r*10+0], ekf.p[r*10+1], ekf.p[r*10+2], ekf.p[r*10+3], ekf.p[r*10+4], ekf.p[r*10+5]);
+            }
+            ekf.update_rtk(Some(rtk));
+            println!("  AFTER update: x=[{:.6},{:.6},{:.6}] vel=[{:.6},{:.6},{:.6}]", ekf.x[0], ekf.x[1], ekf.x[2], ekf.x[3], ekf.x[4], ekf.x[5]);
+            println!("  P rows 0-6 cols0-3:");
+            for r in 0..6 {
+                println!("    r{r}: [{:.3e},{:.3e},{:.3e}] cross0={:.3e} cross1={:.3e} cross2={:.3e}",
+                    ekf.p[r*10+0], ekf.p[r*10+1], ekf.p[r*10+2], ekf.p[r*10+3], ekf.p[r*10+4], ekf.p[r*10+5]);
+            }
+        }
+    }
+
+    #[test]
+    fn vio_rtk_none_gracefully() {
+        // P3-B1：VIO/RTK 无观测（None / 未装备）时 EKF 不应崩溃，状态保持有限。
+        let imu = ImuSample {
+            accel: [MeterPerSecondSquared(0.0); 3],
+            gyro: [RadianPerSecond(0.0); 3],
+        };
+        let mut ekf = EkfEstimator::default_quad();
+        let st = ekf.step(Second(0.01), imu, None, None);
+        ekf.update_vio(None);
+        ekf.update_rtk(None);
+        assert!(st.vel[0].0.is_finite() && st.pos[0].0.is_finite());
+    }
+
+    #[test]
+    #[ignore]
+    fn dbg_matrix_semantics() {
+        #[cfg(test)]
+        use std::println;
+        // A = [[1,2],[3,4]], B = [[5,6],[7,8]]  (row-major 2x2)
+        let a = [1.0f32, 2.0, 3.0, 4.0];
+        let b = [5.0f32, 6.0, 7.0, 8.0];
+        let mut c = [0.0f32; 4];
+        mat_mul(&a, &b, &mut c, 2, 2, 2);
+        println!("A*B      = {:?}  (expect [19,22,43,50])", c);
+        let mut d = [0.0f32; 4];
+        mat_mul_at(&a, &b, &mut d, 2, 2, 2);
+        println!("mat_mul_at(A,B) = {:?}  (A^T*B expect [26,30,38,44])", d);
+        // 换成第二个参数转置测一下：mat_mul_at(B,A) 应为 B^T*A
+        let mut e = [0.0f32; 4];
+        mat_mul_at(&b, &a, &mut e, 2, 2, 2);
+        println!("mat_mul_at(B,A) = {:?}  (B^T*A expect [26,38,30,44])", e);
     }
 }

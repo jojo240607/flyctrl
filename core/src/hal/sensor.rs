@@ -9,7 +9,7 @@
 //!   真实 PAC 接入时替换内部寄存器访问即可，算法层零改动）。
 
 use crate::units::*;
-use crate::vehicle::{AirspeedSample, ImuSample, PosSample, RcInput};
+use crate::vehicle::{AirspeedSample, ImuSample, PosSample, RcInput, RtkSample, VioSample};
 
 /// IMU（陀螺 + 加速度计）传感器。
 pub trait ImuSensor {
@@ -45,6 +45,22 @@ pub trait MagSensor {
 pub trait AirspeedSensor {
     /// 读取一次空速样本；故障/无效时返回 `None`。
     fn read(&mut self) -> Option<AirspeedSample>;
+    fn healthy(&self) -> bool;
+}
+
+/// 视觉里程计（VIO）：机载相机 + IMU 融合出的高频相对位置/速度。
+pub trait VioSensor {
+    /// 读取最新 VIO 样本（NED）；故障/无锁定时返回 `None`。
+    fn read(&mut self) -> Option<VioSample>;
+    /// 自检测。
+    fn healthy(&self) -> bool;
+}
+
+/// RTK-GPS：载波相位差分厘米级高精度位置（NED）。
+pub trait RtkSensor {
+    /// 读取最新 RTK 位置；无固定解/无锁定时返回 `None`。
+    fn read(&mut self) -> Option<RtkSample>;
+    /// 自检测。
     fn healthy(&self) -> bool;
 }
 
@@ -175,6 +191,88 @@ impl AirspeedSensor for MockAirspeed {
     fn healthy(&self) -> bool { self.healthy }
 }
 
+/// Mock VIO：高更新率，位置带缓慢累积漂移 + 白噪声，速度带小噪声。
+///
+/// 默认位置漂移率 ~0.02 m/s（长期累积）、噪声 ~0.3m；速度噪声 ~0.05 m/s。
+/// 通过 `set_drift` / `set_health` 可注入漂移/故障，供 EKF 融合单测使用。
+pub struct MockVio {
+    /// 位置漂移累积（m），模拟 VIO 无绝对参考的长期漂移。
+    drift: [f32; 3],
+    /// 位置白噪声幅值（m）。
+    pos_noise: f32,
+    /// 速度噪声幅值（m/s）。
+    vel_noise: f32,
+    healthy: bool,
+    t: f32,
+}
+
+impl MockVio {
+    pub fn new() -> Self {
+        Self { drift: [0.0; 3], pos_noise: 0.3, vel_noise: 0.05, healthy: true, t: 0.0 }
+    }
+    /// 设置位置漂移速率（m/s，各轴），模拟 VIO 长期漂移累积。
+    pub fn set_drift(&mut self, d: [f32; 3]) { self.drift = d; }
+    pub fn set_health(&mut self, h: bool) { self.healthy = h; }
+}
+
+impl Default for MockVio { fn default() -> Self { Self::new() } }
+
+impl VioSensor for MockVio {
+    fn read(&mut self) -> Option<VioSample> {
+        if !self.healthy { return None; }
+        self.t += 0.005;
+        // 漂移按时间线性累积（VIO 无绝对参考）。
+        let drift = [self.drift[0] * self.t, self.drift[1] * self.t, self.drift[2] * self.t];
+        let w = |amp: f32| crate::math::sin(self.t * 37.0) * amp;
+        Some(VioSample::with_vel(
+            [
+                Meter(drift[0] + w(self.pos_noise)),
+                Meter(drift[1] + w(self.pos_noise * 0.8)),
+                Meter(drift[2] + w(self.pos_noise * 0.6)),
+            ],
+            [
+                MeterPerSecond(w(self.vel_noise)),
+                MeterPerSecond(w(self.vel_noise * 0.8)),
+                MeterPerSecond(w(self.vel_noise * 0.6)),
+            ],
+        ))
+    }
+    fn healthy(&self) -> bool { self.healthy }
+}
+
+/// Mock RTK-GPS：厘米级高精度位置（噪声 ~0.05m），低更新率（1Hz 由调用方控制）。
+pub struct MockRtk {
+    base: [Meter; 3],
+    noise: f32,
+    healthy: bool,
+    t: f32,
+}
+
+impl MockRtk {
+    pub fn new() -> Self {
+        Self { base: [Meter(0.0); 3], noise: 0.05, healthy: true, t: 0.0 }
+    }
+    pub fn set_noise(&mut self, n: f32) { self.noise = n; }
+    pub fn set_health(&mut self, h: bool) { self.healthy = h; }
+}
+
+impl Default for MockRtk { fn default() -> Self { Self::new() } }
+
+impl RtkSensor for MockRtk {
+    fn read(&mut self) -> Option<RtkSample> {
+        if !self.healthy { return None; }
+        self.t += 0.005;
+        // 厘米级噪声（0.05m 量级）。
+        let w = |amp: f32| crate::math::sin(self.t * 41.0) * amp;
+        Some(RtkSample::new([
+            Meter(self.base[0].0 + w(self.noise)),
+            Meter(self.base[1].0 + w(self.noise * 0.8)),
+            Meter(self.base[2].0 + w(self.noise * 0.6)),
+        ]))
+    }
+    fn healthy(&self) -> bool { self.healthy }
+}
+
 // ─────────────────────────────────────────────────────────────
 // STM32F407 占位实现
 //
@@ -244,6 +342,30 @@ pub mod stm32f407 {
         fn read(&mut self) -> Option<AirspeedSample> {
             let _ = self.ok;
             // 占位：读取差分 ADC -> 动压 -> 空速 = sqrt(2·Δp/ρ_air)。
+            None
+        }
+        fn healthy(&self) -> bool { self.ok }
+    }
+
+    /// STM32F4 上的 VIO 源（外部视觉处理器的 UART 输出）占位。
+    pub struct VioAux { ok: bool }
+    impl VioAux { pub const fn new() -> Self { Self { ok: true } } }
+    impl VioSensor for VioAux {
+        fn read(&mut self) -> Option<VioSample> {
+            let _ = self.ok;
+            // 占位：解析视觉处理器输出的位姿/速度流。
+            None
+        }
+        fn healthy(&self) -> bool { self.ok }
+    }
+
+    /// STM32F4 上的 RTK-GPS（双天线 / 差分接收机 UART）占位。
+    pub struct RtkUblox { ok: bool }
+    impl RtkUblox { pub const fn new() -> Self { Self { ok: true } } }
+    impl RtkSensor for RtkUblox {
+        fn read(&mut self) -> Option<RtkSample> {
+            let _ = self.ok;
+            // 占位：解析 RTCM -> NED 厘米级位置。
             None
         }
         fn healthy(&self) -> bool { self.ok }

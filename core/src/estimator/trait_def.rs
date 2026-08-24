@@ -4,7 +4,7 @@
 //! `step` 必须是确定性、无堆分配、有界执行时间的，以满足硬实时要求。
 
 use crate::units::Second;
-use crate::vehicle::{AirspeedSample, ImuSample, PosSample, VehicleState};
+use crate::vehicle::{AirspeedSample, ImuSample, PosSample, RtkSample, VehicleState, VioSample};
 
 pub trait Estimator {
     /// 推进一个采样周期，返回当前估计状态。
@@ -18,6 +18,19 @@ pub trait Estimator {
         pos: Option<PosSample>,
         airspeed: Option<AirspeedSample>,
     ) -> VehicleState;
+
+    /// 注入 VIO（视觉里程计）测量：高频位置/速度（短期准、长期漂移）。
+    ///
+    /// EKF 用中等位置噪声 + 较小速度噪声融合，填补 GPS 帧间 / 失锁时的估计空白。
+    /// 默认 no-op（无 VIO 的估计器不受影响），需融合的估计器（如 [`EkfEstimator`]）
+    /// 覆写实现具体更新。
+    fn update_vio(&mut self, _vio: Option<VioSample>) {}
+
+    /// 注入 RTK-GPS 测量：厘米级高精度位置（NED）。
+    ///
+    /// EKF 用极小位置观测噪声融合，把位置协方差压到厘米量级、抑制 VIO 长期漂移
+    /// （RTK 提供绝对参考）。默认 no-op（无 RTK 的估计器不受影响）。
+    fn update_rtk(&mut self, _rtk: Option<RtkSample>) {}
 
     /// 复位到初始/零状态。
     fn reset(&mut self);

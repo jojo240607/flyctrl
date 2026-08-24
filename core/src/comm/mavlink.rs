@@ -1,764 +1,115 @@
 //! MAVLink v2 兼容消息层（M6.2，QGC 可解析）。
 //!
-//! 实现标准 MAVLink v2 帧格式 + CRC16/X25 + **CRC_EXTRA**（地面站识别飞控的硬门槛），
-//! 覆盖 QGC 常用的几条消息：
-//! HEARTBEAT、SYS_STATUS、ATTITUDE、LOCAL_POSITION_NED、COMMAND_LONG、PARAM_*。
-//! 全部固定大小、无堆，可在嵌入式端按 50Hz 周期组帧发出。
+//! 本文件自 `mavlink-core` 抽取后改为 **re-export 薄层**：帧层（magic/9 字节头部/
+//! CRC16+CRC_EXTRA/msg_id/enums）与全部具体消息编解码统一收口到
+//! [`mavlink_core`]（单一事实来源），固件/仿真器/地面站/App 共用同一份实现。
 //!
-//! 与 v1 的差异（本文件实现）：
-//! - magic = `0xFD`（v1 为 `0xFE`）；
-//! - 头部 6 字节扩为 **9 字节**：在 `len,seq,sys,comp` 之后 `msgid` 由 1 字节扩为 **3 字节小端**，
-//!   并新增 `incompat_flags(1) + compat_flags(1)`（本实现均置 0，不用签名）；
-//! - 头部布局：`len(1) incompat(1) compat(1) seq(1) sys(1) comp(1) msgid(3 LE)`；
-//! - payload ≤ 255，CRC16 + CRC_EXTRA（与 v1 同算法，仅头部长度不同）。
-//!
-//! 注意：本协议字节级兼容标准 MAVLink v2（magic/头部/CRC + CRC_EXTRA），可被标准地面站解析；
-//! 为保持核心 `no_std` 且不引入大型代码生成，这里手搓必要子集而非依赖 mavlink 库。
-//! CRC_EXTRA 取自标准 common.xml 生成常量（见 [`CRC_EXTRA`]）。
+//! 本文件只保留两样东西：
+//! 1. 对 [`mavlink_core::frame`] / [`mavlink_core::codec`] 的 re-export，
+//!    使调用方 `use crate::comm::mavlink` 的接口完全不变；
+//! 2. 依赖 [`VehicleState`] 的便捷封装（`encode_attitude` / `encode_local_pos` /
+//!    `encode_vfr_hud` / `encode_global_position_int` 等），内部换算后委托给
+//!    `mavlink_core` 的 `*_raw` 函数。
 
-use crate::comm::link::{Frame, MAX_FRAME_LEN};
 use crate::vehicle::VehicleState;
 
-/// MAVLink v2 帧起始符。
-pub const MAVLINK_MAGIC: u8 = 0xFD;
+// ── 帧层与编解码：re-export 自 mavlink-core ─────────────────────
 
-/// 系统/组件 ID（飞控侧固定）。
-pub const SYS_ID: u8 = 1;
-pub const COMP_ID: u8 = 1; // MAV_COMP_ID_AUTOPILOT1
-
-/// 消息 ID 常量（与标准 MAVLink 一致）。
-pub mod msg_id {
-    pub const HEARTBEAT: u32 = 0;
-    pub const SYS_STATUS: u32 = 1;
-    pub const ATTITUDE: u32 = 30;
-    pub const GLOBAL_POSITION_INT: u32 = 33;
-    pub const LOCAL_POSITION_NED: u32 = 32;
-    pub const VFR_HUD: u32 = 74;
-    pub const COMMAND_LONG: u32 = 76;
-    pub const COMMAND_ACK: u32 = 77;
-    pub const PARAM_REQUEST_LIST: u32 = 21;
-    pub const PARAM_VALUE: u32 = 22;
-    pub const PARAM_SET: u32 = 23;
-    pub const PARAM_REQUEST_READ: u32 = 20;
-    pub const AUTOPILOT_VERSION: u32 = 300;
-    // 航点（MISSION）系列
-    pub const MISSION_REQUEST_LIST: u32 = 43;
-    pub const MISSION_COUNT: u32 = 44;
-    pub const MISSION_CLEAR_ALL: u32 = 45;
-    pub const MISSION_ACK: u32 = 47;
-    pub const MISSION_REQUEST: u32 = 40;
-    pub const MISSION_ITEM_INT: u32 = 73;
-    // RC 通道覆盖（地面站手动操控）
-    pub const RC_CHANNELS_OVERRIDE: u32 = 70;
-    // 围栏（FENCE）系列
-    pub const FENCE_POINT: u32 = 160;
-    pub const FENCE_FETCH_POINT: u32 = 161;
-    // 数据流速率控制
-    pub const REQUEST_DATA_STREAM: u32 = 66;
-    pub const DATA_STREAM: u32 = 67;
-}
-
-/// 标准 MAVLink common.xml 的 CRC_EXTRA 值（按 msg_id 索引；无则为 0）。
-/// 这些值由 mavgen 从 common.xml 字段定义 + 类型生成，是地面站校验帧合法性的必备字节。
-/// 来源：标准 `common.xml`（v2.0 方言）。
-pub const CRC_EXTRA: [u8; 301] = {
-    let mut t = [0u8; 301];
-    t[msg_id::HEARTBEAT as usize] = 50;
-    t[msg_id::SYS_STATUS as usize] = 124;
-    t[msg_id::PARAM_REQUEST_LIST as usize] = 159;
-    t[msg_id::PARAM_VALUE as usize] = 220;
-    t[msg_id::PARAM_SET as usize] = 168;
-    t[msg_id::PARAM_REQUEST_READ as usize] = 214;
-    t[msg_id::AUTOPILOT_VERSION as usize] = 178;
-    t[msg_id::ATTITUDE as usize] = 39;
-    t[msg_id::GLOBAL_POSITION_INT as usize] = 104; // 标准 common.xml CRC_EXTRA
-    t[msg_id::LOCAL_POSITION_NED as usize] = 185; // 标准 common.xml CRC_EXTRA (v2.0)
-    t[msg_id::VFR_HUD as usize] = 20; // 标准 common.xml CRC_EXTRA
-    t[msg_id::COMMAND_LONG as usize] = 152;
-    t[msg_id::COMMAND_ACK as usize] = 143; // 标准 common.xml CRC_EXTRA
-    t[msg_id::MISSION_REQUEST_LIST as usize] = 132;
-    t[msg_id::MISSION_COUNT as usize] = 221;
-    t[msg_id::MISSION_CLEAR_ALL as usize] = 232;
-    t[msg_id::MISSION_ACK as usize] = 153;
-    t[msg_id::MISSION_REQUEST as usize] = 230;
-    t[msg_id::MISSION_ITEM_INT as usize] = 38;
-    t[msg_id::RC_CHANNELS_OVERRIDE as usize] = 124;
-    t[msg_id::FENCE_POINT as usize] = 78;
-    t[msg_id::FENCE_FETCH_POINT as usize] = 68;
-    t[msg_id::REQUEST_DATA_STREAM as usize] = 148; // 标准 common.xml
-    t[msg_id::DATA_STREAM as usize] = 21;          // 标准 common.xml
-    t
+pub use mavlink_core::frame::{
+    crc16_x25, decode, encode, put_f32, put_i16, put_i32, put_u16, MAVLINK_MAGIC, CRC_EXTRA,
+    COMP_ID, MAX_FRAME_LEN, SYS_ID, Frame, enums, msg_id,
+};
+pub use mavlink_core::codec::{
+    CommandLong, FencePoint, HilActuatorControls, MissionItem, ParamSet, ParamValue,
+    SetPositionTargetLocalNed, command_long_params,
+    decode_command_ack, decode_command_long, decode_fence_fetch_point, decode_fence_point,
+    decode_hil_rc_inputs_raw, decode_hil_sensor, decode_mission_count,
+    decode_mission_item_int, decode_mission_request, decode_mission_request_list,
+    decode_param_request_list, decode_param_request_read, decode_param_set, decode_param_value,
+    decode_rc_channels_override, decode_request_data_stream, decode_set_position_target_local_ned,
+    encode_attitude_raw, encode_autopilot_version, encode_command_ack, encode_command_long,
+    encode_data_stream, encode_fence_point, encode_global_position_int_raw, encode_heartbeat,
+    encode_heartbeat_ap, encode_heartbeat_hil, encode_hil_actuator_controls,
+    encode_local_pos_from_raw, encode_local_pos_raw, encode_mission_ack, encode_mission_count,
+    encode_mission_item_int, encode_mission_request, encode_param_request_list,
+    encode_param_value, encode_sys_status, encode_vfr_hud_raw,
 };
 
-/// CRC16/MCRF4XX（标准 MAVLink v2 帧校验多项式，与 pymavlink/fastcrc 一致）。
-/// 参数 `crc` 为初始值（标准用 0xFFFF），逐字节累积后返回。
-fn crc16_x25(mut crc: u16, bytes: &[u8]) -> u16 {
-    for &b in bytes {
-        crc ^= b as u16;
-        for _ in 0..8 {
-            if crc & 1 != 0 {
-                crc = (crc >> 1) ^ 0x8408;
-            } else {
-                crc >>= 1;
-            }
-        }
-    }
-    crc
-}
+// ── VehicleState 便捷封装（内部委托 mavlink-core 的 *_raw） ───────
 
-/// 组一帧 MAVLink v2 报文（含 magic/9 字节头部/payload/crc + CRC_EXTRA）。
-/// `seq` 由调用方维护（跨帧递增）。`payload` 长度必须 ≤ 255。
-/// 头部布局：`len(1) incompat(1) compat(1) seq(1) sys(1) comp(1) msgid(3 LE)`。
-/// 与标准地面站字节级兼容：`crc = CRC16_X25(CRC16_X25(0xFFFF, header+payload), CRC_EXTRA[msgid])`。
-pub fn encode(msgid: u32, seq: u8, payload: &[u8], out: &mut [u8; MAX_FRAME_LEN]) -> usize {
-    let plen = payload.len().min(255);
-    // 直接写入 out，避免额外 280 字节中转缓冲（栈敏感场景）。
-    out[0] = MAVLINK_MAGIC;
-    out[1] = plen as u8;
-    out[2] = 0; // incompat_flags（无签名）
-    out[3] = 0; // compat_flags
-    out[4] = seq;
-    out[5] = SYS_ID;
-    out[6] = COMP_ID;
-    // msgid 以小端写入 3 字节（v2 扩展消息 ID，支持 ≥256 的标准消息如 AUTOPILOT_VERSION=300）。
-    out[7] = msgid as u8;
-    out[8] = (msgid >> 8) as u8;
-    out[9] = (msgid >> 16) as u8;
-    out[10..10 + plen].copy_from_slice(&payload[..plen]);
-    // 标准 MAVLink v2 CRC：先对 9 字节头部+payload 算 CRC16，再异或 CRC_EXTRA 字节。
-    let mut crc = crc16_x25(0xFFFF, &out[1..10 + plen]);
-    crc = crc16_x25(crc, &[CRC_EXTRA[msgid as usize]]);
-    out[10 + plen] = (crc & 0xFF) as u8;
-    out[10 + plen + 1] = (crc >> 8) as u8;
-    10 + plen + 2
-}
-
-/// 从一帧 `Frame` 解析出 (msgid, payload_slice)；非 MAVLink v2 帧或 CRC（含 CRC_EXTRA）不通过返回 None。
-/// msgid 返回 u32（v2 三字节 ID 空间，可支持 ≥256 的标准消息如 AUTOPILOT_VERSION=300）。
-pub fn decode(frame: &Frame) -> Option<(u32, &[u8])> {
-    let d = frame.as_slice();
-    if d.len() < 12 || d[0] != MAVLINK_MAGIC { return None; }
-    let plen = d[1] as usize;
-    if d.len() < 10 + plen + 2 { return None; }
-    // v2：msgid 为 3 字节小端（位于头部 [7..10]）。
-    let msgid = d[7] as u32 | (d[8] as u32) << 8 | (d[9] as u32) << 16;
-    if (msgid as usize) >= CRC_EXTRA.len() { return None; } // 超出发射端已知 CRC_EXTRA 表范围
-    let payload = &d[10..10 + plen];
-    // 校验 CRC（含 CRC_EXTRA），与 encode 同算法（v2 头部 9 字节）。
-    let mut crc = crc16_x25(0xFFFF, &d[1..10 + plen]);
-    crc = crc16_x25(crc, &[CRC_EXTRA[msgid as usize]]);
-    let got = ((d[10 + plen + 1] as u16) << 8) | (d[10 + plen] as u16);
-    if crc != got { return None; }
-    Some((msgid, payload))
-}
-
-// ── 具体消息编码器 ──────────────────────────────────────────────
-
-/// 把 f32 以小端写入 buf 的 offset 处（MAVLink 用 IEEE754 小端）。
-fn put_f32(buf: &mut [u8], off: usize, v: f32) {
-    let b = v.to_le_bytes();
-    buf[off..off + 4].copy_from_slice(&b);
-}
-fn put_i32(buf: &mut [u8], off: usize, v: i32) {
-    let b = v.to_le_bytes();
-    buf[off..off + 4].copy_from_slice(&b);
-}
-fn put_i16(buf: &mut [u8], off: usize, v: i16) {
-    let b = v.to_le_bytes();
-    buf[off..off + 2].copy_from_slice(&b);
-}
-fn put_u16(buf: &mut [u8], off: usize, v: u16) {
-    let b = v.to_le_bytes();
-    buf[off..off + 2].copy_from_slice(&b);
-}
-
-/// 标准 MAVLink 枚举常量（与 common.xml 对齐，供 QGC 正确识别）。
-pub mod enums {
-    /// MAV_TYPE：飞行器类型（HEARTBEAT.type）。
-    pub const MAV_TYPE_QUADROTOR: u8 = 2;
-    /// MAV_AUTOPILOT：自驾仪类型（HEARTBEAT.autopilot）。
-    /// 选 ARDUPILOTMEGA(3) 使地面站（QGC/groundctrl）按 ArduCopter 自定义模式码解析模式名（STABILIZE/ALT_HOLD/LOITER/RTL/LAND…）。
-    pub const MAV_AUTOPILOT_DEV: u8 = 13;
-    pub const MAV_AUTOPILOT_ARDUPILOTMEGA: u8 = 3;
-    /// MAV_MODE_FLAG 位（HEARTBEAT.base_mode）。注意 CUSTOM_MODE_ENABLED 是 bit7 = 0x80（标准值，不是 0x01）。
-    pub const MAV_MODE_FLAG_CUSTOM_MODE_ENABLED: u8 = 0x80;
-    pub const MAV_MODE_FLAG_TEST_ENABLED: u8 = 0x02;
-    pub const MAV_MODE_FLAG_AUTO_ENABLED: u8 = 0x10;
-    pub const MAV_MODE_FLAG_GUIDED_ENABLED: u8 = 0x08;
-    pub const MAV_MODE_FLAG_STABILIZE_ENABLED: u8 = 0x04;
-    pub const MAV_MODE_FLAG_HIL_ENABLED: u8 = 0x20;
-    pub const MAV_MODE_FLAG_SAFETY_ARMED: u8 = 0x80;
-    /// MAV_STATE（HEARTBEAT.system_status）。
-    pub const MAV_STATE_UNINIT: u8 = 0;
-    pub const MAV_STATE_BOOT: u8 = 1;
-    pub const MAV_STATE_CALIBRATING: u8 = 2;
-    pub const MAV_STATE_STANDBY: u8 = 3;
-    pub const MAV_STATE_ACTIVE: u8 = 4;
-    pub const MAV_STATE_CRITICAL: u8 = 5;
-    pub const MAV_STATE_EMERGENCY: u8 = 6;
-    pub const MAV_STATE_POWEROFF: u8 = 7;
-    /// MAV_CMD（COMMAND_LONG.command）子集。
-    pub const MAV_CMD_NAV_TAKEOFF: u16 = 22;
-    pub const MAV_CMD_NAV_LAND: u16 = 21;
-    pub const MAV_CMD_NAV_RETURN_TO_LAUNCH: u16 = 20;
-    pub const MAV_CMD_COMPONENT_ARM_DISARM: u16 = 400;
-    pub const MAV_CMD_DO_SET_MODE: u16 = 176;
-    pub const MAV_CMD_MISSION_START: u16 = 300;
-    pub const MAV_CMD_REQUEST_AUTOPILOT_CAPABILITIES: u16 = 520;
-    /// MAV_CMD_SET_MESSAGE_INTERVAL：地面站设置单条消息的发送间隔（微秒）。
-    pub const MAV_CMD_SET_MESSAGE_INTERVAL: u16 = 203;
-    /// ArduCopter 自定义模式码（custom_mode 字段），地面站据此显示模式名（STABILIZE/ALT_HOLD/...）。
-    pub const COPTER_MODE_STABILIZE: u16 = 0;
-    pub const COPTER_MODE_ALT_HOLD: u16 = 2;
-    pub const COPTER_MODE_LOITER: u16 = 5;
-    pub const COPTER_MODE_RTL: u16 = 6;
-    pub const COPTER_MODE_LAND: u16 = 9;
-    pub const COPTER_MODE_GUIDED: u16 = 4;
-    /// MAV_PARAM_TYPE（PARAM_VALUE/PARAM_SET.param_type）。
-    pub const MAV_PARAM_TYPE_REAL32: u8 = 9;
-    /// MAV_RESULT（COMMAND_ACK.result）。
-    pub const MAV_RESULT_ACCEPTED: u8 = 0;
-    pub const MAV_RESULT_TEMPORARILY_REJECTED: u8 = 1;
-    pub const MAV_RESULT_DENIED: u8 = 2;
-    pub const MAV_RESULT_UNSUPPORTED: u8 = 3;
-    pub const MAV_RESULT_FAILED: u8 = 4;
-    /// MAV_PROTOCOL_CAPABILITY 位（AUTOPILOT_VERSION.capabilities）。
-    pub const MAV_PROTOCOL_CAPABILITY_MAVLINK2: u64 = 1 << 23;
-    pub const MAV_PROTOCOL_CAPABILITY_PARAM_FLOAT: u64 = 1 << 5;
-}
-
-/// HEARTBEAT：声明飞控存活 + 当前模式（标准字段，QGC 可识别）。
-/// `mode` 为自定义飞行模式自定义码（与 `flightmode::FlightMode` 映射），`armed` 反映解锁态。
-pub fn encode_heartbeat(mode: u8, armed: bool, seq: u8, out: &mut [u8; MAX_FRAME_LEN]) -> usize {
-    // 默认 autopilot 用 ARDUPILOT，使地面站（QGC/groundctrl）按 ArduCopter 自定义模式解码模式名。
-    encode_heartbeat_ap(mode, enums::MAV_AUTOPILOT_ARDUPILOTMEGA, armed, enums::MAV_STATE_ACTIVE, enums::MAV_STATE_STANDBY, seq, out)
-}
-
-/// 完整版心跳：允许指定 autopilot 与 system_status（激活/待命）。
-pub fn encode_heartbeat_ap(
-    mode: u8,
-    autopilot: u8,
-    armed: bool,
-    state_active: u8,
-    state_standby: u8,
-    seq: u8,
-    out: &mut [u8; MAX_FRAME_LEN],
-) -> usize {
-    use enums::*;
-    let mut payload = [0u8; 9];
-    payload[0] = MAV_TYPE_QUADROTOR; // type
-    payload[1] = autopilot;          // autopilot
-    payload[2] = MAV_MODE_FLAG_CUSTOM_MODE_ENABLED
-        | if armed { MAV_MODE_FLAG_SAFETY_ARMED } else { 0 };
-    // custom_mode 是 uint32（标准 common.xml），占 [3..7]。
-    payload[3..7].copy_from_slice(&(mode as u32).to_le_bytes());
-    payload[7] = if armed { state_active } else { state_standby }; // system_status
-    payload[8] = 3; // mavlink_version (v3)
-    encode(msg_id::HEARTBEAT, seq, &payload, out)
-}
-
-/// COMMAND_LONG：地面站下发的通用指令（含 SET_MODE / 解锁 / 起降 / RTL）。
-/// `command` 见 [`enums::MAV_CMD_*`]；`p1..p7` 为 7 个 f32 参数，`confirmation` 为确认计数。
-pub fn encode_command_long(
-    command: u16,
-    p1: f32, p2: f32, p3: f32, p4: f32, p5: f32, p6: f32, p7: f32,
-    confirmation: u8,
-    seq: u8,
-    out: &mut [u8; MAX_FRAME_LEN],
-) -> usize {
-    let mut p = [0u8; 33];
-    // target_system, target_component, command(u16), confirmation, param1-7 (f32)
-    p[0] = 0; // broadcast target_system
-    p[1] = 0; // broadcast target_component
-    p[2..4].copy_from_slice(&command.to_le_bytes());
-    p[4] = confirmation;
-    put_f32(&mut p, 5, p1);
-    put_f32(&mut p, 9, p2);
-    put_f32(&mut p, 13, p3);
-    put_f32(&mut p, 17, p4);
-    put_f32(&mut p, 21, p5);
-    put_f32(&mut p, 25, p6);
-    put_f32(&mut p, 29, p7);
-    encode(msg_id::COMMAND_LONG, seq, &p, out)
-}
-
-/// COMMAND_LONG 解码结果（地面站 -> 飞控）。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct CommandLong {
-    pub target_system: u8,
-    pub target_component: u8,
-    pub command: u16,
-    pub confirmation: u8,
-    pub params: [f32; 7],
-}
-
-/// 从 payload 解析 COMMAND_LONG（需先经 [`decode`] 取出 payload）。
-pub fn decode_command_long(payload: &[u8]) -> Option<CommandLong> {
-    if payload.len() < 33 { return None; }
-    let command = u16::from_le_bytes([payload[2], payload[3]]);
-    let rd = |o: usize| f32::from_le_bytes([payload[o], payload[o+1], payload[o+2], payload[o+3]]);
-    Some(CommandLong {
-        target_system: payload[0],
-        target_component: payload[1],
-        command,
-        confirmation: payload[4],
-        params: [rd(5), rd(9), rd(13), rd(17), rd(21), rd(25), rd(29)],
-    })
-}
-
-/// 把 f32 参数打包进 COMMAND_LONG 的便利函数（用于板端构造应答/测试）。
-pub fn command_long_params(p: [f32; 7]) -> [f32; 7] { p }
-
-/// PARAM_VALUE：飞控向地面站回传单个参数（QGC 参数表读取）。
-/// `id` 为 16 字节 NUL 结尾参数名；`value` 为 f32；`param_type` 见 [`enums::MAV_PARAM_TYPE_REAL32`]；
-/// `param_count`/`param_index` 为参数表总数/当前索引。
-pub fn encode_param_value(
-    id: &[u8; 16],
-    value: f32,
-    param_type: u8,
-    param_count: u16,
-    param_index: u16,
-    seq: u8,
-    out: &mut [u8; MAX_FRAME_LEN],
-) -> usize {
-    let mut p = [0u8; 25];
-    p[0..16].copy_from_slice(id);
-    put_f32(&mut p, 16, value);
-    p[20] = param_type;
-    p[21..23].copy_from_slice(&param_count.to_le_bytes());
-    p[23..25].copy_from_slice(&param_index.to_le_bytes());
-    encode(msg_id::PARAM_VALUE, seq, &p, out)
-}
-
-/// PARAM_VALUE 解码（地面站 -> 飞控，用于参数写入回执校验）。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ParamValue {
-    pub id: [u8; 16],
-    pub value: f32,
-    pub param_type: u8,
-    pub param_count: u16,
-    pub param_index: u16,
-}
-
-pub fn decode_param_value(payload: &[u8]) -> Option<ParamValue> {
-    if payload.len() < 25 { return None; }
-    let mut id = [0u8; 16];
-    id.copy_from_slice(&payload[0..16]);
-    Some(ParamValue {
-        id,
-        value: f32::from_le_bytes(payload[16..20].try_into().unwrap()),
-        param_type: payload[20],
-        param_count: u16::from_le_bytes([payload[21], payload[22]]),
-        param_index: u16::from_le_bytes([payload[23], payload[24]]),
-    })
-}
-
-/// PARAM_REQUEST_LIST 解码（地面站 -> 飞控，请求参数表全量流水）。
-/// 该消息无 payload 字段（仅头部），只需识别 msg_id 即可。
-pub fn decode_param_request_list(_payload: &[u8]) -> Option<()> {
-    Some(())
-}
-
-/// PARAM_REQUEST_LIST：飞控向地面站广播“开始参数表流水”（本实现由桥接层在收到请求后自动触发，
-/// 该编码函数主要用于测试/对称实现）。payload 为 `target_system(1) + target_component(1)`。
-pub fn encode_param_request_list(
-    target_system: u8,
-    target_component: u8,
-    req_comp_id: u8,
-    seq: u8,
-    out: &mut [u8; MAX_FRAME_LEN],
-) -> usize {
-    let mut p = [0u8; 2];
-    p[0] = target_system;
-    p[1] = target_component;
-    let _ = req_comp_id; // 保留位，标准里该消息无此字段
-    encode(msg_id::PARAM_REQUEST_LIST, seq, &p, out)
-}
-
-/// PARAM_SET 解码（地面站 -> 飞控，写入单个参数）。
-/// `id` 为 16 字节 NUL 结尾参数名；`value` 为 f32；`param_type` 见 [`enums::MAV_PARAM_TYPE_REAL32`]。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct ParamSet {
-    pub id: [u8; 16],
-    pub value: f32,
-    pub param_type: u8,
-}
-
-pub fn decode_param_set(payload: &[u8]) -> Option<ParamSet> {
-    if payload.len() < 20 { return None; }
-    let mut id = [0u8; 16];
-    id.copy_from_slice(&payload[0..16]);
-    Some(ParamSet {
-        id,
-        value: f32::from_le_bytes(payload[16..20].try_into().unwrap()),
-        param_type: payload[20],
-    })
-}
-
-/// PARAM_REQUEST_READ 解码（地面站 -> 飞控，按参数名点读单个参数）。
-/// payload：`param_id[16] + param_index i16`（index=-1 表示按名查找）。
-pub fn decode_param_request_read(payload: &[u8]) -> Option<([u8; 16], i16)> {
-    if payload.len() < 18 { return None; }
-    let mut id = [0u8; 16];
-    id.copy_from_slice(&payload[0..16]);
-    let idx = i16::from_le_bytes([payload[16], payload[17]]);
-    Some((id, idx))
-}
-
-/// AUTOPILOT_VERSION：飞控向地面站上报固件/能力信息（响应 REQUEST_AUTOPILOT_CAPABILITIES）。
-/// 标准布局（60B）：flight_sw_version u32, middleware_sw_version u32, os_sw_version u32,
-/// board_version u32, flight_custom_version[8], middleware_custom_version[8], os_custom_version[8],
-/// vendor_id u16, product_id u16, uid[12], capabilities u64, uid2[8]（MAVLink v2 扩展字段）。
-/// 本实现填最小有效子集 + 能力位（MAV_PROTOCOL_CAPABILITY_MAVLINK2 + PARAM_FLOAT）。
-pub fn encode_autopilot_version(
-    capabilities: u64,
-    seq: u8,
-    out: &mut [u8; MAX_FRAME_LEN],
-) -> usize {
-    let mut p = [0u8; 60];
-    // flight_sw_version = 1.0.0 (0x010000)
-    p[0..4].copy_from_slice(&0x0100_0000u32.to_le_bytes());
-    // board_version = 0x407 (STM32F407)
-    p[12..16].copy_from_slice(&0x0407u32.to_le_bytes());
-    // vendor_id / product_id
-    p[48..50].copy_from_slice(&0x4A4F_u16.to_le_bytes()); // "JO"
-    p[50..52].copy_from_slice(&0x4352_u16.to_le_bytes()); // "CR"
-    // uid[12] = 0（无唯一芯片 ID 来源时留空）
-    // capabilities u64 @ offset 52
-    p[52..60].copy_from_slice(&capabilities.to_le_bytes());
-    encode(msg_id::AUTOPILOT_VERSION, seq, &p, out)
-}
-
-/// COMMAND_ACK：飞控对地面站指令的应答（确认/拒绝）。
-/// `command` 为被应答的 MAV_CMD；`result` 见 [`enums::MAV_RESULT_*`]；
-/// `progress` 为完成进度(0-100)，`result_param2` 为附加结果。
-pub fn encode_command_ack(
-    command: u16,
-    result: u8,
-    progress: u8,
-    result_param2: i32,
-    seq: u8,
-    out: &mut [u8; MAX_FRAME_LEN],
-) -> usize {
-    let mut p = [0u8; 11];
-    p[0..2].copy_from_slice(&command.to_le_bytes());
-    p[2] = result;
-    p[3] = progress;
-    p[4..8].copy_from_slice(&result_param2.to_le_bytes());
-    // target_system, target_component（应答回地面站）
-    p[8] = 0; // broadcast
-    p[9] = 0; // broadcast
-    p[10] = 0; // mavlink_version reserved
-    encode(msg_id::COMMAND_ACK, seq, &p, out)
-}
-
-/// COMMAND_ACK 解码（地面站 -> 飞控，用于请求重发/确认链路）。
-pub fn decode_command_ack(payload: &[u8]) -> Option<(u16, u8)> {
-    if payload.len() < 3 { return None; }
-    let command = u16::from_le_bytes([payload[0], payload[1]]);
-    Some((command, payload[2]))
-}
-
-/// ATTITUDE：姿态欧拉角 + 角速度（rad/s）。
-/// 标准布局（28B）：time_boot_ms i32, roll f32, pitch f32, yaw f32,
-/// rollspeed f32, pitchspeed f32, yawspeed f32。
+/// ATTITUDE：姿态欧拉角 + 角速度（rad/s）。标准布局（28B）。
+/// 从 [`VehicleState`] 取欧拉角与机体角速度，委托 [`encode_attitude_raw`]。
 pub fn encode_attitude(state: &VehicleState, seq: u8, out: &mut [u8; MAX_FRAME_LEN]) -> usize {
-    let mut p = [0u8; 28];
-    put_i32(&mut p, 0, state.time_boot_ms);
-    put_f32(&mut p, 4, state.att.roll());
-    put_f32(&mut p, 8, state.att.pitch());
-    put_f32(&mut p, 12, state.att.yaw());
-    put_f32(&mut p, 16, state.omega[0].0); // rollspeed (p)
-    put_f32(&mut p, 20, state.omega[1].0); // pitchspeed (q)
-    put_f32(&mut p, 24, state.omega[2].0); // yawspeed (r)
-    encode(msg_id::ATTITUDE, seq, &p, out)
+    encode_attitude_raw(
+        state.time_boot_ms,
+        state.att.roll(),
+        state.att.pitch(),
+        state.att.yaw(),
+        state.omega[0].0, // rollspeed (p)
+        state.omega[1].0, // pitchspeed (q)
+        state.omega[2].0, // yawspeed (r)
+        seq,
+        out,
+    )
 }
 
-/// LOCAL_POSITION_NED：NED 位置 + 速度。
+/// LOCAL_POSITION_NED：NED 位置 + 速度。默认用固定 `SYS_ID` 广播。
 pub fn encode_local_pos(state: &VehicleState, seq: u8, out: &mut [u8; MAX_FRAME_LEN]) -> usize {
     encode_local_pos_from(SYS_ID, state, seq, out)
 }
 
 /// 同上，但允许指定 `sys_id`（多机协同：每架飞机用各自 sys_id 广播自身状态）。
-/// 内部 helper：构造完整帧（含标准 CRC_EXTRA）后覆盖 sys_id 并重算头部 CRC。
-pub fn encode_local_pos_from(sys_id: u8, state: &VehicleState, seq: u8, out: &mut [u8; MAX_FRAME_LEN]) -> usize {
-    let mut p = [0u8; 28];
-    put_i32(&mut p, 0, state.time_boot_ms);
-    put_f32(&mut p, 4, state.pos[0].0);
-    put_f32(&mut p, 8, state.pos[1].0);
-    put_f32(&mut p, 12, state.pos[2].0);
-    put_f32(&mut p, 16, state.vel[0].0);
-    put_f32(&mut p, 20, state.vel[1].0);
-    put_f32(&mut p, 24, state.vel[2].0);
-    let plen = p.len();
-    // 直接构造到 out（避免 280 字节中转栈缓冲）。v2 头部 9 字节。
-    out[0] = MAVLINK_MAGIC;
-    out[1] = plen as u8;
-    out[2] = 0; // incompat_flags
-    out[3] = 0; // compat_flags
-    out[4] = seq;
-    out[5] = sys_id; // 自定义 sys_id
-    out[6] = COMP_ID;
-    // msgid 以小端写入 3 字节（v2 扩展消息 ID）。
-    out[7] = msg_id::LOCAL_POSITION_NED as u8;
-    out[8] = (msg_id::LOCAL_POSITION_NED >> 8) as u8;
-    out[9] = (msg_id::LOCAL_POSITION_NED >> 16) as u8;
-    out[10..10 + plen].copy_from_slice(&p[..plen]);
-    // 标准 MAVLink v2 CRC（含 CRC_EXTRA），与 encode() 同算法。
-    let mut crc = crc16_x25(0xFFFF, &out[1..10 + plen]);
-    crc = crc16_x25(crc, &[CRC_EXTRA[msg_id::LOCAL_POSITION_NED as usize]]);
-    out[10 + plen] = (crc & 0xFF) as u8;
-    out[10 + plen + 1] = (crc >> 8) as u8;
-    10 + plen + 2
+pub fn encode_local_pos_from(
+    sys_id: u8,
+    state: &VehicleState,
+    seq: u8,
+    out: &mut [u8; MAX_FRAME_LEN],
+) -> usize {
+    encode_local_pos_from_raw(
+        sys_id,
+        state.time_boot_ms,
+        state.pos[0].0,
+        state.pos[1].0,
+        state.pos[2].0,
+        state.vel[0].0,
+        state.vel[1].0,
+        state.vel[2].0,
+        seq,
+        out,
+    )
 }
 
-/// SYS_STATUS：健康位（取 FDIR 健康；此处仅填传感器位）。
-pub fn encode_sys_status(sensors_ok: bool, seq: u8, out: &mut [u8; MAX_FRAME_LEN]) -> usize {
-    let mut p = [0u8; 31];
-    let sensor_bits: i32 = if sensors_ok { 0x1F } else { 0 };
-    put_i32(&mut p, 0, sensor_bits); // onboard_control_sensors_present
-    put_i32(&mut p, 4, sensor_bits); // enabled
-    put_i32(&mut p, 8, sensor_bits); // health
-    // load (u16), voltage_battery (i16 mV/1000), current_battery (i16 cA), battery_remaining (i8 %)
-    put_u16(&mut p, 12, 100); // 10% CPU load placeholder
-    put_i16(&mut p, 14, 12000); // 12.0V battery (mV/1000)
-    put_i16(&mut p, 16, 0); // 0 cA current
-    p[18] = 80; // 80% remaining
-    encode(msg_id::SYS_STATUS, seq, &p, out)
-}
-
-/// VFR_HUD：空速/地速/高度/航向/油门（标准 HUD 主盘字段）。
-/// 标准布局（20B）：airspeed f32, groundspeed f32, heading i16 (cdeg),
-/// throttle uint16 (%), alt f32, climb f32。
+/// VFR_HUD：空速/地速/高度/航向/油门（标准 HUD 主盘字段）。标准布局（20B）。
 /// 本项目无空速计，airspeed=0；groundspeed 取 NED 速度的平面幅值；alt 用本地高度（-pos.z），
 /// heading 由姿态 yaw 导出（厘度 = deg*100）；throttle 由外部控制律写入（0..100）。
-pub fn encode_vfr_hud(state: &VehicleState, throttle_pct: u16, seq: u8, out: &mut [u8; MAX_FRAME_LEN]) -> usize {
-    let mut p = [0u8; 20];
+pub fn encode_vfr_hud(
+    state: &VehicleState,
+    throttle_pct: u16,
+    seq: u8,
+    out: &mut [u8; MAX_FRAME_LEN],
+) -> usize {
     let gnd = libm::sqrtf(state.vel[0].0 * state.vel[0].0 + state.vel[1].0 * state.vel[1].0);
-    put_f32(&mut p, 0, 0.0); // airspeed
-    put_f32(&mut p, 4, gnd); // groundspeed
     let heading_cdeg = (state.att.yaw_deg() * 100.0) as i16;
-    put_i16(&mut p, 8, heading_cdeg); // heading (centidegrees)
-    put_u16(&mut p, 10, throttle_pct); // throttle (%)
-    put_f32(&mut p, 12, -state.pos[2].0); // alt (relative)
-    put_f32(&mut p, 16, state.vel[2].0); // climb rate
-    encode(msg_id::VFR_HUD, seq, &p, out)
+    encode_vfr_hud_raw(gnd, heading_cdeg, throttle_pct, -state.pos[2].0, state.vel[2].0, seq, out)
 }
 
 /// GLOBAL_POSITION_INT：GPS 全局位置（lat/lon 为 1e7 整数度；无 GPS 时给 0）。
-/// 高度用相对高度（-pos.z * 1000 mm），航向由 yaw 导出。地面站据此在地图上定位（无 GPS 时地图不动，但高度盘正常）。
-pub fn encode_global_position_int(state: &VehicleState, seq: u8, out: &mut [u8; MAX_FRAME_LEN]) -> usize {
-    let mut p = [0u8; 28];
-    // time_boot_ms i32, lat i32 (1e7), lon i32 (1e7), alt int32 (mm, relative), alt_amsl int32,
-    // vx/vy/vz int16 (cm/s), hdg uint16 (cdeg)
-    put_i32(&mut p, 0, state.time_boot_ms);
-    put_i32(&mut p, 4, 0); // lat (no GPS)
-    put_i32(&mut p, 8, 0); // lon
-    put_i32(&mut p, 12, (-state.pos[2].0 * 1000.0) as i32); // relative alt mm
-    put_i32(&mut p, 16, (-state.pos[2].0 * 1000.0) as i32); // alt_amsl mm (no GPS datum)
-    put_i16(&mut p, 20, (state.vel[0].0 * 100.0) as i16);
-    put_i16(&mut p, 22, (state.vel[1].0 * 100.0) as i16);
-    put_i16(&mut p, 24, (state.vel[2].0 * 100.0) as i16);
-    put_u16(&mut p, 26, state.att.yaw_deg() as u16 * 100); // heading cdeg
-    encode(msg_id::GLOBAL_POSITION_INT, seq, &p, out)
-}
-
-// ── 航点（MISSION）系列编解码 ─────────────────────────────────────
-
-/// 单条航点（与标准 MAVLink `MISSION_ITEM_INT` 字段对齐）。
-/// 坐标 lat/lon 为 1e7 整数度，alt 为米（f32）。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct MissionItem {
-    pub target_system: u8,
-    pub target_component: u8,
-    pub seq: u16,
-    pub command: u16,
-    pub param1: f32,
-    pub param2: f32,
-    pub param3: f32,
-    pub param4: f32,
-    pub x: i32, // lat * 1e7
-    pub y: i32, // lon * 1e7
-    pub z: f32, // alt (m)
-    pub frame: u8,
-    pub current: u8,
-    pub autocontinue: u8,
-    pub mission_type: u8, // MAV_MISSION_TYPE（如 0=ALL, 1=PLAN, 2=FENCE...），MISSION_ITEM_INT 末端 1B
-}
-
-/// MISSION_ITEM_INT 解码（地面站 -> 飞控，上传的单条航点）。
-/// 标准布局（37B）：target_system, target_component, seq(u16), frame(u8),
-/// command(u16), current(u8), autocontinue(u8), param1-4(f32 x4),
-/// x(i32), y(i32), z(f32), mission_type(u8)。
-pub fn decode_mission_item_int(payload: &[u8]) -> Option<MissionItem> {
-    if payload.len() < 37 { return None; }
-    let rd = |o: usize| f32::from_le_bytes([payload[o], payload[o+1], payload[o+2], payload[o+3]]);
-    Some(MissionItem {
-        target_system: payload[0],
-        target_component: payload[1],
-        seq: u16::from_le_bytes([payload[2], payload[3]]),
-        frame: payload[4],
-        command: u16::from_le_bytes([payload[5], payload[6]]),
-        current: payload[7],
-        autocontinue: payload[8],
-        param1: rd(9),
-        param2: rd(13),
-        param3: rd(17),
-        param4: rd(21),
-        x: i32::from_le_bytes([payload[25], payload[26], payload[27], payload[28]]),
-        y: i32::from_le_bytes([payload[29], payload[30], payload[31], payload[32]]),
-        z: rd(33),
-        mission_type: payload[36],
-    })
-}
-
-/// MISSION_REQUEST 解码（地面站 -> 飞控，请求某条航点）。
-/// 标准布局（4B）：target_system, target_component, seq(u16)。
-pub fn decode_mission_request(payload: &[u8]) -> Option<u16> {
-    if payload.len() < 4 { return None; }
-    Some(u16::from_le_bytes([payload[2], payload[3]]))
-}
-
-/// MISSION_COUNT 解码（地面站 -> 飞控，宣布上传航点总数）。
-/// 标准布局（4B）：target_system, target_component, count(u16)。
-pub fn decode_mission_count(payload: &[u8]) -> Option<u16> {
-    if payload.len() < 4 { return None; }
-    Some(u16::from_le_bytes([payload[2], payload[3]]))
-}
-
-/// MISSION_REQUEST_LIST 解码（地面站 -> 飞控，请求下载全部航点）。
-/// 标准布局（2B）：target_system, target_component（无额外字段）。
-pub fn decode_mission_request_list(_payload: &[u8]) -> Option<()> {
-    Some(())
-}
-
-/// MISSION_REQUEST 编码（飞控 -> 地面站，请求某条航点）。
-pub fn encode_mission_request(seq: u16, out: &mut [u8; MAX_FRAME_LEN]) -> usize {
-    let mut p = [0u8; 4];
-    p[2..4].copy_from_slice(&seq.to_le_bytes());
-    encode(msg_id::MISSION_REQUEST, 0, &p, out)
-}
-
-/// MISSION_COUNT 编码（飞控 -> 地面站，宣布航点总数）。
-pub fn encode_mission_count(count: u16, out: &mut [u8; MAX_FRAME_LEN]) -> usize {
-    let mut p = [0u8; 4];
-    p[2..4].copy_from_slice(&count.to_le_bytes());
-    encode(msg_id::MISSION_COUNT, 0, &p, out)
-}
-
-/// MISSION_ITEM_INT 编码（飞控 -> 地面站，下载的单条航点）。
-pub fn encode_mission_item_int(item: &MissionItem, out: &mut [u8; MAX_FRAME_LEN]) -> usize {
-    let mut p = [0u8; 37];
-    p[2..4].copy_from_slice(&item.seq.to_le_bytes());
-    p[4] = item.frame;
-    p[5..7].copy_from_slice(&item.command.to_le_bytes());
-    p[7] = item.current;
-    p[8] = item.autocontinue;
-    put_f32(&mut p, 9, item.param1);
-    put_f32(&mut p, 13, item.param2);
-    put_f32(&mut p, 17, item.param3);
-    put_f32(&mut p, 21, item.param4);
-    p[25..29].copy_from_slice(&item.x.to_le_bytes());
-    p[29..33].copy_from_slice(&item.y.to_le_bytes());
-    put_f32(&mut p, 33, item.z);
-    p[36] = item.mission_type;
-    encode(msg_id::MISSION_ITEM_INT, 0, &p, out)
-}
-
-/// MISSION_ACK 编码（飞控 -> 地面站，握手结束确认）。
-/// `ack_type`：0=ACCEPTED, 1=ERROR, 4=NO_SPACE, 5=INVALID_SEQUENCE 等（MAV_MISSION_RESULT）。
-pub fn encode_mission_ack(ack_type: u8, out: &mut [u8; MAX_FRAME_LEN]) -> usize {
-    let mut p = [0u8; 4];
-    p[2] = ack_type; // type
-    p[3] = 0; // mission_type (ALL=0)
-    encode(msg_id::MISSION_ACK, 0, &p, out)
-}
-
-// ── RC 通道覆盖 ──────────────────────────────────────────────────
-
-/// RC_CHANNELS_OVERRIDE 解码（地面站 -> 飞控，手动操控通道）。
-/// 标准布局（21B）：target_system, target_component, chan1-8(u16 x8), rssi(u8)。
-/// 通道为 PWM 微秒值（典型 1000-2000），板子侧需归一化到 0.0-1.0。
-pub fn decode_rc_channels_override(payload: &[u8]) -> Option<[u16; 8]> {
-    if payload.len() < 21 { return None; }
-    let mut ch = [0u16; 8];
-    for i in 0..8 {
-        ch[i] = u16::from_le_bytes([payload[2 + i * 2], payload[3 + i * 2]]);
-    }
-    Some(ch)
-}
-
-// ── 围栏（FENCE）系列编解码 ─────────────────────────────────────
-
-/// 单条围栏顶点（与标准 MAVLink `FENCE_POINT` 字段对齐）。
-/// 坐标 lat/lon 为 1e7 整数度。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct FencePoint {
-    pub target_system: u8,
-    pub target_component: u8,
-    pub idx: u8,
-    pub count: u8,
-    pub lat: i32, // * 1e7
-    pub lon: i32, // * 1e7
-}
-
-/// FENCE_POINT 解码（地面站 -> 飞控，上传的单条围栏顶点）。
-/// 标准布局（12B）：target_system, target_component, idx(u8), count(u8),
-/// lat(i32), lon(i32)。
-pub fn decode_fence_point(payload: &[u8]) -> Option<FencePoint> {
-    if payload.len() < 12 { return None; }
-    Some(FencePoint {
-        target_system: payload[0],
-        target_component: payload[1],
-        idx: payload[2],
-        count: payload[3],
-        lat: i32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]),
-        lon: i32::from_le_bytes([payload[8], payload[9], payload[10], payload[11]]),
-    })
-}
-
-/// FENCE_FETCH_POINT 解码（地面站 -> 飞控，请求下载某条围栏顶点）。
-/// 标准布局（3B）：target_system, target_component, idx(u8)。
-pub fn decode_fence_fetch_point(payload: &[u8]) -> Option<u8> {
-    if payload.len() < 3 { return None; }
-    Some(payload[2])
-}
-
-/// FENCE_POINT 编码（飞控 -> 地面站，下载的单条围栏顶点）。
-pub fn encode_fence_point(pt: &FencePoint, out: &mut [u8; MAX_FRAME_LEN]) -> usize {
-    let mut p = [0u8; 12];
-    p[0] = pt.target_system;
-    p[1] = pt.target_component;
-    p[2] = pt.idx;
-    p[3] = pt.count;
-    p[4..8].copy_from_slice(&pt.lat.to_le_bytes());
-    p[8..12].copy_from_slice(&pt.lon.to_le_bytes());
-    encode(msg_id::FENCE_POINT, 0, &p, out)
-}
-
-// ── 数据流速率控制（REQUEST_DATA_STREAM / DATA_STREAM） ─────────────
-
-/// REQUEST_DATA_STREAM 解码（地面站 -> 飞控）。
-/// 标准布局（6B）：req_stream_id(u8), req_message_rate(u16), target_system, target_component, start_stop(u8)。
-pub fn decode_request_data_stream(payload: &[u8]) -> Option<(u8, u16, u8)> {
-    if payload.len() < 6 { return None; }
-    let stream_id = payload[0];
-    let rate_hz = u16::from_le_bytes([payload[1], payload[2]]);
-    let start_stop = payload[5];
-    Some((stream_id, rate_hz, start_stop))
-}
-
-/// DATA_STREAM 编码（飞控 -> 地面站，对 REQUEST_DATA_STREAM 的应答）。
-/// 标准布局（7B）：stream_id(u8), message_rate(u16), target_system, target_component, messages_sent(u16, 0), on_off(u8)。
-pub fn encode_data_stream(stream_id: u8, rate_hz: u16, on_off: u8, out: &mut [u8; MAX_FRAME_LEN]) -> usize {
-    let mut p = [0u8; 8];
-    p[0] = stream_id;
-    p[1..3].copy_from_slice(&rate_hz.to_le_bytes());
-    p[3] = 1; // target_system
-    p[4] = 1; // target_component
-    p[5..7].copy_from_slice(&0u16.to_le_bytes()); // messages_sent（累计发送数，未知填 0）
-    p[7] = on_off; // 0=off 1=on
-    encode(msg_id::DATA_STREAM, 0, &p, out)
+/// 高度用相对高度（-pos.z * 1000 mm），航向由 yaw 导出。
+pub fn encode_global_position_int(
+    state: &VehicleState,
+    seq: u8,
+    out: &mut [u8; MAX_FRAME_LEN],
+) -> usize {
+    encode_global_position_int_raw(
+        state.time_boot_ms,
+        (-state.pos[2].0 * 1000.0) as i32, // relative alt mm
+        (state.vel[0].0 * 100.0) as i16,
+        (state.vel[1].0 * 100.0) as i16,
+        (state.vel[2].0 * 100.0) as i16,
+        state.att.yaw_deg() as u16 * 100, // heading cdeg
+        seq,
+        out,
+    )
 }
 
 #[cfg(test)]
@@ -857,7 +208,6 @@ mod tests {
     #[test]
     fn attitude_uses_euler_layout() {
         // 标准 ATTITUDE：28B = time_boot_ms i32 + roll/pitch/yaw f32 + 3 rates f32。
-        // 与之前错误的"四元数"布局有本质区别：此处用 euler 角，可被标准地面站解析。
         let mut st = crate::vehicle::VehicleState::zero();
         st.time_boot_ms = 1234;
         st.att = crate::vehicle::Quaternion::from_euler(

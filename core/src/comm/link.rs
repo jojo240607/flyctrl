@@ -4,38 +4,9 @@
 //! 具体实现可以是串口（UART+DMA）、USB-CDC、或是 host 端的回环/文件。
 //! 所有实现无堆、有界耗时。
 
-/// 单帧最大负载 + 头部开销的硬上限（MAVLink v2 最大 279，这里留余量）。
-pub const MAX_FRAME_LEN: usize = 280;
-
-/// 一段已封装的链路帧（含 MAVLink 报文 + 链路层开销）。
-/// 用固定大小数组 + 长度字段，避免堆分配。
-#[derive(Clone, Copy)]
-pub struct Frame {
-    pub data: [u8; MAX_FRAME_LEN],
-    pub len: usize,
-}
-
-impl Frame {
-    /// 由原始字节构造（长度 clamp 到上限）。
-    pub fn from_bytes(buf: &[u8]) -> Self {
-        let n = buf.len().min(MAX_FRAME_LEN);
-        let mut data = [0u8; MAX_FRAME_LEN];
-        data[..n].copy_from_slice(&buf[..n]);
-        Frame { data, len: n }
-    }
-
-    pub fn as_slice(&self) -> &[u8] {
-        &self.data[..self.len]
-    }
-
-    pub fn is_empty(&self) -> bool { self.len == 0 }
-}
-
-impl Default for Frame {
-    fn default() -> Self {
-        Frame { data: [0u8; MAX_FRAME_LEN], len: 0 }
-    }
-}
+// 帧结构与长度上限统一取自 mavlink-core（单一事实来源），避免多处重复定义漂移。
+// 这样 `link::Frame` 与 `mavlink::decode` 期望的帧类型是同一个类型。
+pub use mavlink_core::frame::{Frame, MAX_FRAME_LEN};
 
 /// 链路接口：发送/接收完整帧。
 pub trait Link {

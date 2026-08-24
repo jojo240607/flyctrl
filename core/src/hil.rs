@@ -14,7 +14,7 @@ use crate::controller::Controller;
 use crate::estimator::Estimator;
 use crate::fdir::{Fdir, Health};
 use crate::hal::actuator::{clamp_thrust, MotorActuator};
-use crate::hal::sensor::{AirspeedSensor, GpsSensor, ImuSensor};
+use crate::hal::sensor::{AirspeedSensor, GpsSensor, ImuSensor, RtkSensor, VioSensor};
 use crate::units::{Meter, Second};
 use crate::vehicle::{ActuatorCmd, VehicleState};
 
@@ -50,16 +50,21 @@ where
 
     /// 单步闭环：每调用一次推进一个控制周期。
     ///
-    /// - `imu` / `gps`：当拍传感器（泛型，host/mock 或 MCU/PAC 均可）。
+    /// - `imu` / `gps` / `airspeed`：当拍传感器（泛型，host/mock 或 MCU/PAC 均可）。
+    /// - `vio` / `rtk`：P3-B1 多源融合通道（视觉里程计 / RTK-GPS）。二者在估计步
+    ///   之后经 [`Estimator::update_vio`] / [`Estimator::update_rtk`] 注入（默认 no-op，
+    ///   仅 `EkfEstimator` 实际融合）。保持 `step` 主链签名稳定，仅在尾部追加。
     /// - `setpoint`：当前设定点（由轨迹/遥控器提供）。
     /// - `motors`：执行器（泛型）。
     ///
     /// 返回本拍估计状态（供遥测/HIL 回采比对）。
-    pub fn step<I, G, A, M>(
+    pub fn step<I, G, A, V, R, M>(
         &mut self,
         imu: &mut I,
         gps: &mut G,
         airspeed: &mut A,
+        vio: &mut V,
+        rtk: &mut R,
         setpoint: &crate::controller::Setpoint,
         motors: &mut M,
         cfg: &VehicleConfig,
@@ -68,6 +73,8 @@ where
         I: ImuSensor,
         G: GpsSensor,
         A: AirspeedSensor,
+        V: VioSensor,
+        R: RtkSensor,
         M: MotorActuator,
     {
         // 1) 采集传感器。
@@ -75,9 +82,13 @@ where
         let pos = gps.read();
         let pos_available = pos.is_some();
         let air_sample = airspeed.read();
+        let vio_sample = vio.read();
+        let rtk_sample = rtk.read();
 
-        // 2) 估计。
+        // 2) 估计（含 VIO/RTK 观测融合，非 EkfEstimator 实现为 no-op）。
         let est_state = self.est.step(self.dt, sample, pos, air_sample);
+        self.est.update_vio(vio_sample);
+        self.est.update_rtk(rtk_sample);
 
         // 3) FDIR 健康监控（基于 IMU 冻结 + GPS dropout）。
         let health = self.fdir.update(&sample, pos_available, true, true);
@@ -113,11 +124,13 @@ where
     /// `setpoint → ctrl.control` 替换为 `cmd_fn(&est_state)`。供**非设定点型**控制律
     /// （P3-D1：手动角速率 / 增稳姿态保持，直接消费遥控摇杆而非位置设定点）接入
     /// 同一 SIL/HIL 闭环骨架，保证估计与健康监控路径与自主模式完全一致。
-    pub fn step_with_cmd<I, G, A, M>(
+    pub fn step_with_cmd<I, G, A, V, R, M>(
         &mut self,
         imu: &mut I,
         gps: &mut G,
         airspeed: &mut A,
+        vio: &mut V,
+        rtk: &mut R,
         cmd_fn: impl FnOnce(&VehicleState) -> ActuatorCmd,
         motors: &mut M,
         cfg: &VehicleConfig,
@@ -126,6 +139,8 @@ where
         I: ImuSensor,
         G: GpsSensor,
         A: AirspeedSensor,
+        V: VioSensor,
+        R: RtkSensor,
         M: MotorActuator,
     {
         // 1) 采集传感器。
@@ -133,9 +148,13 @@ where
         let pos = gps.read();
         let pos_available = pos.is_some();
         let air_sample = airspeed.read();
+        let vio_sample = vio.read();
+        let rtk_sample = rtk.read();
 
-        // 2) 估计。
+        // 2) 估计（含 VIO/RTK 观测融合，非 EkfEstimator 实现为 no-op）。
         let est_state = self.est.step(self.dt, sample, pos, air_sample);
+        self.est.update_vio(vio_sample);
+        self.est.update_rtk(rtk_sample);
 
         // 3) FDIR 健康监控。
         let health = self.fdir.update(&sample, pos_available, true, true);
@@ -179,7 +198,7 @@ mod tests {
     use crate::controller::Controller;
     use crate::estimator::ekf::EkfEstimator;
     use crate::hal::actuator::MockMotors;
-    use crate::hal::sensor::{MockAirspeed, MockBaro, MockGps, MockImu, MockMag};
+    use crate::hal::sensor::{MockAirspeed, MockBaro, MockGps, MockImu, MockMag, MockRtk, MockVio};
     use crate::invariants::{actuator_bounded, state_finite};
     use crate::units::Second;
     use crate::vehicle::ImuSample;
@@ -192,6 +211,8 @@ mod tests {
         let mut imu = MockImu::new();
         let mut gps = MockGps::new();
         let mut air = MockAirspeed::new(0.0);
+        let mut vio = MockVio::new();
+        let mut rtk = MockRtk::new();
         let _baro = MockBaro::new();
         let _mag = MockMag::new();
         let mut motors = MockMotors::new(crate::hal::actuator::OutputProtocol::Pwm);
@@ -200,7 +221,7 @@ mod tests {
         let sp = crate::controller::Setpoint::hover([Meter(0.0), Meter(0.0), Meter(-5.0)], crate::units::Radian(0.0));
 
         for it in 0..300 {
-            let st = ctx.step(&mut imu, &mut gps, &mut air, &sp, &mut motors, &cfg);
+            let st = ctx.step(&mut imu, &mut gps, &mut air, &mut vio, &mut rtk, &sp, &mut motors, &cfg);
             if !state_finite(&st) {
                 panic!("HIL NaN at iter {}: pos={:?} vel={:?} att={:?}", it, st.pos, st.vel, st.att);
             }
@@ -215,13 +236,15 @@ mod tests {
         let mut imu = MockImu::new();
         let mut gps = MockGps::new();
         let mut air = MockAirspeed::new(0.0);
+        let mut vio = MockVio::new();
+        let mut rtk = MockRtk::new();
         let mut motors = MockMotors::new(crate::hal::actuator::OutputProtocol::Pwm);
         let mut ctx = HilContext::new(EkfEstimator::default_quad(), PidController::from_config(&cfg.ctrl_params()), Second(0.01));
         let sp = crate::controller::Setpoint::hover([Meter(0.0); 3], crate::units::Radian(0.0));
 
         // 先正常跑几拍。
         for _ in 0..5 {
-            let _ = ctx.step(&mut imu, &mut gps, &mut air, &sp, &mut motors, &cfg);
+            let _ = ctx.step(&mut imu, &mut gps, &mut air, &mut vio, &mut rtk, &sp, &mut motors, &cfg);
         }
         // 冻结 IMU。
         imu.set_health(false);
