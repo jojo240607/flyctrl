@@ -4,7 +4,7 @@
 //! `step` 必须是确定性、无堆分配、有界执行时间的，以满足硬实时要求。
 
 use crate::units::Second;
-use crate::vehicle::{AirspeedSample, ImuSample, PosSample, RtkSample, VehicleState, VioSample};
+use crate::vehicle::{AirspeedSample, ImuSample, PosSample, Quaternion, RtkSample, VehicleState, VioSample};
 
 pub trait Estimator {
     /// 推进一个采样周期，返回当前估计状态。
@@ -34,6 +34,18 @@ pub trait Estimator {
 
     /// 复位到初始/零状态。
     fn reset(&mut self);
+
+    /// HIL/共享单步：设置初始姿态四元数（首帧 IMU 重力向量 tilt alignment 后调用）。
+    /// 默认 no-op（不支持显式姿态初始化的估计器不受影响）。
+    fn set_initial_attitude(&mut self, _q: Quaternion) {}
+
+    /// HIL/共享单步：设置初始位置估计（NED，m），使首拍位置误差≈0。
+    /// 默认 no-op（不支持显式位置初始化的估计器不受影响）。
+    fn set_initial_position(&mut self, _ned: [f32; 3]) {}
+
+    /// 注入气压高度观测（m，向上为正），锚定垂直通道（predict-then-correct）。
+    /// 默认 no-op（无气压融合的估计器不受影响）。
+    fn update_alt(&mut self, _alt: f32) {}
 
     /// 当前估计状态（不推进），供诊断读取（已含所有已融合观测）。
     fn state(&self) -> VehicleState;

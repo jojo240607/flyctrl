@@ -166,10 +166,12 @@ impl EkfEstimator {
         // （PID 实机下沉 ~3m）。baro 噪声小 (`r_alt=0.3`) 强约束高度；
         // `q_accel` 让 EKF 由速度观测在线估计并扣除加计零偏（消费级 IMU 常见 0.05 m/s²），
         // 否则垂向速度持续积分零偏而发散。
-        // `att_alpha` 保持 0（纯陀螺积分）：重力锚定在低通后仍导致姿态发散（实测：
-        // 启用 0.02 后 PID/INDI/LQR 全部飞到 +19m，att_err 300°+，锚定方向逻辑破坏系统）。
-        // 姿态依赖陀螺积分 + 速度/位置测量间接约束，不做加速度计重力锚定。
+        // `att_alpha=0.02` 开启微弱重力锚定。历史教训（无门控时启用 0.02 → PID/INDI/LQR
+        // 全飞到 +19m、att_err 300°+）已由**比力幅值门控**解决：仅当 |a|∈[0.5g, 2.5g]
+        // 时锚定增益按 w 线性缩放，自由落体/落地碰撞尖峰自动关闭锚定，避免姿态被
+        // 平移加速度分量错误引导。悬停/平稳飞行时持续锚定 roll/pitch，抑制纯陀螺积分漂移。
         // 垂向零偏 x[9] 仅由速度观测弱驱动（AB_VEL_GAIN 阻尼）。
+        // TEMP-EXPERIMENT: att_alpha=0（纯陀螺积分，对照已提交稳定基线）。
         Self::new(0.0, 0.05, 0.05, 1e-5, 5e-4, 0.5, 0.3, 0.3)
     }
 
@@ -211,6 +213,15 @@ impl EkfEstimator {
             self.p[i * N + i] = 0.01;
         }
     }
+
+    /// HIL：设置 EKF 初始姿态四元数。
+    ///
+    /// 默认构造 att=IDENTITY（0°），若物理引擎起始姿态非 0°（或机头 yaw 非 0），
+    /// 首拍即带姿态误差；陀螺零偏未收敛时会经积分累积放大（历史教训：pitch 恒定 90°）。
+    /// 启动前用物理引擎真值姿态初始化，使首拍姿态误差≈0。
+    pub fn set_initial_attitude(&mut self, q: Quaternion) {
+        self.att = q.normalize();
+    }
 }
 
 impl Estimator for EkfEstimator {
@@ -222,6 +233,14 @@ impl Estimator for EkfEstimator {
         airspeed: Option<AirspeedSample>,
     ) -> VehicleState {
         let dt = dt.0;
+        // 防御：IMU 输入非有限（HIL 注入异常/总线噪声）直接放弃本拍积分，返回上一状态。
+        // 否则 att.integrate(NaN) 会把姿态四元数直接污染为 NaN（历史教训：电机指令 NaN
+        // 即由状态/姿态 NaN 传播而来），进而经位置预测/观测更新污染整个状态向量。
+        let gyro_finite = imu.gyro.iter().all(|g| g.0.is_finite());
+        let accel_finite = imu.accel.iter().all(|a| a.0.is_finite());
+        if !gyro_finite || !accel_finite {
+            return self.state();
+        }
         // 防御：协方差若出现非有限项（GPS/位置观测的 Joseph 更新在特定数值下可能产生 NaN，
         // 对角夹取只清对角、非对角 NaN 会残留并传播），整矩阵清掉非有限项，阻断 NaN 进入
         // 本拍的 predict/update（否则 S 求逆/增益 K 计算 NaN → 位置/速度状态被污染）。
@@ -249,13 +268,31 @@ impl Estimator for EkfEstimator {
             }
             let a = self.accel_lp;
             let an = sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+            // 比力幅值门控：仅当 |a| 接近 g 时才信任加速度计的「重力方向」参考。
+            //   - 自由落体/失重 |a|≈0：比力方向无意义，若照常锚定会把姿态拖向随机方向
+            //     （历史教训：att_alpha=0.02 未加门控 → PID/INDI/LQR 全飞到 +19m、att_err 300°+）。
+            //   - 高机动/落地碰撞尖峰 |a|≫g：比力含平移加速度分量，同样不代表重力方向。
+            //   门控权重 w：|a|=g 时 w=1，向边界（0.5g / 2.5g）线性衰减到 0，增益按 w 缩放。
             if an > 1e-3 {
+                let ratio = an / g;
+                let w = if ratio < 0.5 || ratio > 2.5 {
+                    0.0
+                } else if ratio < 1.0 {
+                    (ratio - 0.5) / 0.5
+                } else {
+                    (2.5 - ratio) / 1.5
+                };
+                let w = w.clamp(0.0, 1.0);
                 let down_body = crate::vehicle::rotate_vec_by_quat_inverse(self.att, [0.0, 0.0, g]);
-                let k = self.att_alpha * 0.5;
+                let k = self.att_alpha * 0.5 * w;
                 // 把估计重力向量 down_body 锚定到【真实重力方向】，即比力的反方向 (-a)。
-                let ax = -(down_body[1] * (a[2] / an) - down_body[2] * (a[1] / an)) * k;
-                let ay = -(down_body[2] * (a[0] / an) - down_body[0] * (a[2] / an)) * k;
-                let az = -(down_body[0] * (a[1] / an) - down_body[1] * (a[0] / an)) * k;
+                // 修正轴 = down_body × (-a/an)：n 为垂直于二者的旋转轴，
+                // 右乘（机体系）dq 使 down_body 旋转向 -a，姿态向水平收敛。
+                //   （符号教训：若用 a_hat × down_body 方向反 → 锚定放大倾斜而非收敛，
+                //   姿态被逐渐推向倒扣 180°，且倒扣处叉积恰为零 → 冻结在 r=-179.9°。）
+                let ax = (down_body[1] * (a[2] / an) - down_body[2] * (a[1] / an)) * k;
+                let ay = (down_body[2] * (a[0] / an) - down_body[0] * (a[2] / an)) * k;
+                let az = (down_body[0] * (a[1] / an) - down_body[1] * (a[0] / an)) * k;
                 let na = sqrt(ax * ax + ay * ay + az * az);
                 if na > 1e-6 {
                     let dq = Quaternion::from_axis_angle([ax, ay, az], Radian(na));
@@ -378,6 +415,19 @@ impl Estimator for EkfEstimator {
             self.p[i * N + i] = 1e-4; // gyro bias
         }
         self.p[9 * N + 9] = 0.05; // accel bias (vertical) — 与 new() 一致，保证可观可收敛
+    }
+
+    // HIL/共享单步：转发到同名的固有方法（trait 默认 no-op，EKF 实际生效）。
+    fn set_initial_attitude(&mut self, q: Quaternion) {
+        EkfEstimator::set_initial_attitude(self, q);
+    }
+
+    fn set_initial_position(&mut self, ned: [f32; 3]) {
+        EkfEstimator::set_initial_position(self, ned);
+    }
+
+    fn update_alt(&mut self, alt: f32) {
+        EkfEstimator::update_alt(self, alt);
     }
 }
 
@@ -704,9 +754,13 @@ impl EkfEstimator {
     /// 故观测 `z = -alt`，H = [0 0 1 0 0 0 0 0 0]（作用于 D 位置索引 2）。
     /// Joseph 形式，栈数组作用域限于本方法。
     pub fn update_alt(&mut self, alt: f32) {
+        // 防御：观测值本身非有限（传感器/HIL 注入异常）直接跳过，防止 y 为 NaN 污染状态。
+        if !alt.is_finite() {
+            return;
+        }
         // S = H P H^T + R (标量)，H 仅在索引 2（D 位置）非零
         let s = self.p[2 * N + 2] + self.r_alt;
-        if s.abs() < 1e-9 {
+        if !s.is_finite() || s.abs() < 1e-9 {
             return;
         }
         // K = P H^T / S (9x1)，仅 P 第 2 列非零
@@ -714,8 +768,21 @@ impl EkfEstimator {
         for i in 0..N {
             k[i] = self.p[i * N + 2] / s;
         }
-        // 创新 y = z - x，z = -alt（D 向下正）
+        // 创新 y = z - x，z = -alt（D 向下正）；非有限（状态已被污染）则跳过本观测，
+        // 阻断 x += k*y 把 NaN 传播进状态。
         let y = -alt - self.x[2];
+        if !y.is_finite() {
+            return;
+        }
+        // 垂向速度状态 (5) 的增益行清零：气压同为位置观测，经非对角协方差 K[5]
+        // 会推爆垂向速度（hil 闭环回归：恒定比力+气压下 vel_z 单拍 +24.6 → 爆炸）。
+        // 垂向速度仅由加速度积分决定（同 update_pos 的处理），位置观测不直接修正它。
+        k[5] = 0.0;
+        // 卡尔曼增益限幅（与 update_pos_r 一致，见 K_MAX 注释）：紧噪声观测下
+        // 非对角增益可爆炸，限幅后 Joseph 协方差更新保持 PSD，阻断交叉项发散。
+        for e in k.iter_mut() {
+            *e = e.clamp(-K_MAX, K_MAX);
+        }
         // 垂向加计零偏状态 (9) 不可由气压高度观测驱动（不可观 → 发散风险）：
         // 清零其卡尔曼增益元素，使气压更新不修正 accel_bias_z（仅速度观测可估计）。
         k[9] = 0.0;

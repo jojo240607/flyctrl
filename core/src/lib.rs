@@ -10,6 +10,7 @@
 
 pub mod math;
 pub mod units;
+pub mod filter;
 pub mod state;
 pub mod vehicle;
 pub mod config;
