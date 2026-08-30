@@ -442,6 +442,37 @@ where
     {
         self.est.state()
     }
+
+    /// HIL 会话重启自动复位：新 HIL 会话（上一会话断开后重新注入）开始时调用，
+    /// 把估计器、控制器、FDIR、初始化门控、输入滤波器、回退 IMU 全部重置到
+    /// "链路未建立"的初始状态，使新会话从干净状态重新初始化（姿态/位置门控
+    /// 重新按真实帧对齐）。
+    ///
+    /// 根因：HIL 会话之间 MCU 不复位，EKF/控制器状态从上一会话继承，而新会话
+    /// 从干净真值（如 5m 水平静止）注入时与 MCU 残留状态错配 → 开局即发散
+    /// （实测：同脚本在未复位 MCU 上立即打转，复位后稳定）。事件驱动闭环下，
+    /// control 任务以"相邻两拍帧间隔超过阈值"检测新会话，并在执行首拍前调用
+    /// 本方法。复位后 `hil_att_inited`/`hil_pos_inited` 重新置假 → 起飞台闸在
+    /// 对齐完成前恒输出零，杜绝带着旧姿态误差弹射。
+    pub fn reset_session(&mut self) {
+        // 估计器：EKF 回到默认水平姿态 + 零位置/速度/偏置、协方差重建。
+        self.est.reset();
+        // 控制器：清积分项/滤波状态，防 windup 残留。
+        self.ctrl.reset();
+        // FDIR：清冻结计数/健康状态/失控保护（单向标志一并复位，新会话重新观测）。
+        self.fdir = Fdir::new();
+        self.failsafe_engaged = false;
+        // 初始化门控重新武装：下一帧真实 IMU / 下一有效设定点重新对齐。
+        self.hil_att_inited = false;
+        self.hil_pos_inited = false;
+        // 回退源清空：新会话首帧到达前回退 SimImu（零陀螺，不外推漂移）。
+        self.last_real_imu = None;
+        // 输入滤波器重建：IIR 瞬态（x1/x2/y1/y2）清零，避免旧会话残留污染新会话。
+        let fs = 1.0 / self.dt.0;
+        self.imu_accel_notch = [Biquad::notch(40.0, fs, 5.0); 3];
+        self.imu_accel_lowpass = [Biquad::low_pass(20.0, fs, 0.7071); 3];
+        self.imu_gyro_notch = [Biquad::notch(40.0, fs, 5.0); 3];
+    }
 }
 
 #[cfg(test)]
@@ -520,6 +551,59 @@ mod tests {
         assert!(a.roll().abs() < 0.5, "roll 应≈0，实测 {}", a.roll());
         assert!(a.pitch().abs() < 0.5, "pitch 应≈0，实测 {}", a.pitch());
         assert!((a.yaw() - 0.7).abs() < 0.5, "yaw 应≈0.7，实测 {}", a.yaw());
+    }
+
+    #[test]
+    fn hil_reset_session_reinitializes_for_new_session() {
+        // HIL 会话重启自动复位自测：上一会话把 EKF 打到翻滚发散（门控已置位、
+        // 姿态偏离水平），`reset_session()` 后门控/回退源清零，再跑"新会话"
+        // 悬停闭环应重新初始化并收敛稳定，不继承旧会话姿态残留（否则开局即打转）。
+        let cfg = VehicleConfig::default_quad();
+        let mut ctx = HilContext::new(
+            EkfEstimator::default_quad(),
+            PidController::from_config(&cfg.ctrl_params()),
+            Second(0.004),
+        );
+        let mut sim_imu = SimImu::new();
+        let sp = crate::controller::Setpoint::hover(
+            [Meter(0.0), Meter(0.0), Meter(-5.0)],
+            crate::units::Radian(0.0),
+        );
+        let hover = ImuSample {
+            accel: [MeterPerSecondSquared(0.0), MeterPerSecondSquared(0.0), MeterPerSecondSquared(-9.81)],
+            gyro: [RadianPerSecond(0.0); 3],
+        };
+        let spin = ImuSample {
+            accel: [MeterPerSecondSquared(0.0), MeterPerSecondSquared(0.0), MeterPerSecondSquared(-9.81)],
+            gyro: [RadianPerSecond(3.0), RadianPerSecond(0.0), RadianPerSecond(0.0)],
+        };
+        let gps = Some(crate::vehicle::PosSample::pos_only([
+            Meter(0.0), Meter(0.0), Meter(-5.0),
+        ]));
+
+        // 上一会话：旋转注入污染 EKF 姿态（陀螺持续 3rad/s，纯积分 → roll 大幅偏离）。
+        for _ in 0..200 {
+            let _ = ctx.step_hil(Some(spin), gps, Some(5.0), None, None, &sp, true, true, true, &mut sim_imu);
+        }
+        assert!(ctx.hil_att_inited && ctx.hil_pos_inited, "旧会话应已完成初始化门控");
+        let polluted_roll = ctx.est.state().att.roll();
+        assert!(polluted_roll.abs() > 0.3, "旧会话姿态应偏离水平，实测 roll={}", polluted_roll);
+
+        // 会话重启：全量复位。
+        ctx.reset_session();
+        assert!(!ctx.hil_att_inited, "复位后姿态门控重新武装");
+        assert!(!ctx.hil_pos_inited, "复位后位置门控重新武装");
+        assert!(ctx.last_real_imu.is_none(), "复位后回退源清空");
+
+        // 新会话：悬停闭环稳定（重新初始化 → 姿态回水平、位置 -5m、指令有界）。
+        for it in 0..300 {
+            let r = ctx.step_hil(Some(hover), gps, Some(5.0), None, None, &sp, true, true, true, &mut sim_imu);
+            assert!(state_finite(&r.est), "新会话 NaN at iter {}: {:?}", it, r.est.att);
+            assert!(actuator_bounded(&r.cmd), "新会话指令必须 [0,1] at iter {}", it);
+        }
+        let a = ctx.est.state().att;
+        assert!(a.roll().abs() < 0.5, "新会话 roll 应≈0，实测 {}", a.roll());
+        assert!(a.pitch().abs() < 0.5, "新会话 pitch 应≈0，实测 {}", a.pitch());
     }
 
     #[test]
