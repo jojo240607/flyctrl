@@ -1,0 +1,132 @@
+//! 传感器数据源统一封装（虚拟 / 真实 编译期切换）。
+//!
+//! 飞控算法、控制环、遥测层只依赖 `flyctrl_core::hal::sensor` 定义的四个 trait
+//! （`ImuSensor` / `BaroSensor` / `GpsSensor` / `RcReceiver`，外加 `MagSensor`），
+//! 不关心底层是虚拟回放还是真实 I2C/UART 驱动。
+//!
+//! 切换方式：编译期 `cfg(feature = "real-sensors")`。
+//! - 默认（不开启）：四路全部使用虚拟源（`VirtualImu` 等），无需外接硬件即可闭环调试。
+//! - 开启 `real-sensors` 后：四路自动替换为真实驱动（`ImuMpu6050` / `BaroBmp280` /
+//!   `GpsUblox` / `RcSbus`）。真实驱动读取失败时返回安全值并 `healthy()==false`，
+//!   由上层 FDIR 降级，无需改算法层。
+//!
+//! 注：真实驱动始终编译进镜像（读取失败安全降级），仅在工厂处决定实例化哪套，
+//! 后续接真实设备只需开启 feature，无需改动任何上层代码。
+
+use flyctrl_core::hal::sensor::{
+    BaroSensor, GpsSensor, ImuSensor, MagSensor, RcReceiver,
+};
+use flyctrl_core::vehicle::{ImuSample, PosSample, RcInput};
+
+#[cfg(not(feature = "real-sensors"))]
+pub type ImuSource = crate::sensors::sim::VirtualImu;
+#[cfg(not(feature = "real-sensors"))]
+pub type BaroSource = crate::sensors::sim::VirtualBaro;
+#[cfg(not(feature = "real-sensors"))]
+pub type GpsSource = crate::sensors::sim::VirtualGps;
+#[cfg(not(feature = "real-sensors"))]
+pub type RcSource = crate::sensors::sim::VirtualRc;
+#[cfg(not(feature = "real-sensors"))]
+pub type MagSource = crate::sensors::sim::VirtualMag;
+
+#[cfg(feature = "real-sensors")]
+pub type ImuSource = crate::sensors::imu::ImuMpu6050;
+#[cfg(feature = "real-sensors")]
+pub type BaroSource = crate::sensors::baro::BaroBmp280;
+#[cfg(feature = "real-sensors")]
+pub type GpsSource = crate::sensors::gps::GpsUblox;
+#[cfg(feature = "real-sensors")]
+pub type RcSource = crate::sensors::rc::RcSbus;
+#[cfg(feature = "real-sensors")]
+pub type MagSource = crate::sensors::mag::MagQmc5883;
+
+/// 四路数据源统一栈。字段类型为编译期别名，算法层只调用 trait 方法。
+pub struct SensorStack {
+    pub imu: ImuSource,
+    pub baro: BaroSource,
+    pub gps: GpsSource,
+    pub rc: RcSource,
+    pub mag: MagSource,
+}
+
+impl SensorStack {
+    pub fn new() -> Self {
+        // 虚拟源：无参构造（始终成功）。
+        #[cfg(not(feature = "real-sensors"))]
+        {
+            Self {
+                imu: crate::sensors::sim::VirtualImu::new()
+                    .expect("virtual imu"),
+                baro: crate::sensors::sim::VirtualBaro::new()
+                    .expect("virtual baro"),
+                gps: crate::sensors::sim::VirtualGps::new()
+                    .expect("virtual gps"),
+                rc: crate::sensors::sim::VirtualRc::new()
+                    .expect("virtual rc"),
+                mag: crate::sensors::sim::VirtualMag::new()
+                    .expect("virtual mag"),
+            }
+        }
+        // 真实源：需指定总线名 / I2C 地址；硬件缺失时 `new` 返回 None（启动即报错）。
+        #[cfg(feature = "real-sensors")]
+        {
+            Self {
+                imu: crate::sensors::imu::ImuMpu6050::new("i2c0", 0x68)
+                    .expect("imu6050"),
+                baro: crate::sensors::baro::BaroBmp280::new("i2c0", 0x76)
+                    .expect("bmp280"),
+                gps: crate::sensors::gps::GpsUblox::new("uart1")
+                    .expect("gps"),
+                rc: crate::sensors::rc::RcSbus::new("uart2")
+                    .expect("sbus"),
+                mag: crate::sensors::mag::MagQmc5883::new("i2c0", 0x0D)
+                    .expect("mag"),
+            }
+        }
+    }
+
+    /// 读取一帧 IMU（accel+gyro）。
+    pub fn read_imu(&mut self) -> ImuSample {
+        self.imu.read()
+    }
+
+    /// 读取磁力计。
+    pub fn read_mag(&mut self) -> [f32; 3] {
+        self.mag.read()
+    }
+
+    /// 读取气压高度（向下为正，米）。
+    pub fn read_altitude(&mut self) -> f32 {
+        self.baro.read_altitude().0
+    }
+
+    /// 读取 GPS 位置（None 表示暂未定位 / 无数据）。
+    pub fn read_gps(&mut self) -> Option<PosSample> {
+        self.gps.read()
+    }
+
+    /// 读取遥控输入；返回各通道归一化值。
+    pub fn read_rc(&mut self) -> RcInput {
+        self.rc.read()
+    }
+
+    /// 汇总各源健康状态（供 FDIR / 遥测健康位使用）。
+    pub fn health(&self) -> SensorHealth {
+        SensorHealth {
+            imu: self.imu.healthy(),
+            baro: self.baro.healthy(),
+            gps: self.gps.healthy(),
+            rc: self.rc.healthy(),
+            mag: self.mag.healthy(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SensorHealth {
+    pub imu: bool,
+    pub baro: bool,
+    pub gps: bool,
+    pub rc: bool,
+    pub mag: bool,
+}

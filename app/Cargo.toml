@@ -1,0 +1,49 @@
+[package]
+name = "flyctrl-app"
+version = "0.1.0"
+edition = "2021"
+authors = ["flyctrl"]
+license = "MIT OR Apache-2.0"
+description = "飞控 App 分区：直接引用 joc-rtos-app-sdk（rtos-app-sdk）+ flyctrl-core 编译成 app.bin"
+
+[lib]
+# 最终产物 libflyctrl_app.a；由 flyctrl/build_app.py 用 SDK 的 linker/app.ld 链接成 app.bin。
+crate-type = ["staticlib"]
+name = "flyctrl_app"
+
+[profile.release]
+opt-level = "z"      # 尺寸优先（APP_FLASH 384KB / APP_RAM 111KB 预算）
+lto = true
+codegen-units = 1
+panic = "abort"      # 无 unwind；panic! -> UDF -> 内核 fault handler
+debug = false
+
+[dependencies]
+# jOS RTOS 应用层 SDK：ABI 绑定 / 任务 / 设备 / 日志 / 挂载自举（唯一"中间工程"）。
+rtos-app-sdk = { path = "../../joc-rtos-app-sdk/sdk" }
+
+# 飞控核心算法（estimator/controller/vehicle/fdir/comm），no_std + 仅依赖 libm。
+# 不启用 stm32f407：App 经 RTOS 设备 vtable 做 IO，绝不碰裸寄存器（规避 CCM/MPU/DMA 风险）。
+flyctrl-core = { path = "../core" }
+
+# 数学函数（sinf/cosf），供占位 IMU 注入等使用（flyctrl-core 自身也依赖它）。
+libm = "0.2"
+
+
+[features]
+# 调试 feature：启用极简 demo 入口（只起一个打日志任务，不碰任何外设），
+# 用于先验证 App 拉起链路（RTOS 异步 app_host 任务）是否跑通，再切回正式 flyctrl。
+demo = []
+# 启用 USB CDC 下行验证 demo（隔离验证 usb0 写通道是否通畅），
+# 不碰 EST_MTX/传感器，只周期经 usb0 写一行 + 经 uart0 镜像日志。
+usbtest = []
+# 启用真实传感器驱动（I2C IMU/Baro/Mag + UART GPS/SBUS）替代虚拟回放源。
+# 默认关闭：使用 VirtualXxx 虚拟源，无需外接硬件即可闭环调试。
+real-sensors = []
+# 启用硬件在环（HIL）：PC 仿真器经 USB 注入传感器真值（HIL_SENSOR）+ 设定点
+# （SET_POSITION_TARGET_LOCAL_NED），飞控回传执行器指令（HIL_ACTUATOR_CONTROLS）。
+# 与 real-sensors 互斥（HIL 数据源替代传感器采样）；默认关闭。
+hil = []
+# 集成测试：Rust 侧经 g_app_slot 验证 ABI 兼容链路（配合 verify_app.py）。
+integration-test = []
+panic-test = []

@@ -15,3 +15,8 @@ build_*.log
 # OS files
 .DS_Store
 Thumbs.db
+
+# App 分区构建产物（由 build_app.py 生成；需要时再手动提交）
+app.bin
+app.elf
+app/target

@@ -1,0 +1,11 @@
+[build]
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+# 仅控制代码生成；staticlib 不进入链接阶段（由 build_app.py 的 arm-none-eabi-gcc
+# 用 app.ld 统一链接），故不设置 linker / link-arg，避免 cargo 尝试生成可执行。
+rustflags = [
+    "-C", "target-cpu=cortex-m4",
+    "-C", "relocation-model=static",
+    "-C", "linker-flavor=gcc",
+]

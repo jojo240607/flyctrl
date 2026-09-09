@@ -5,11 +5,13 @@ members = [
     "sim",
     "bin",
 ]
-# `fw` 是裸机固件（thumbv7em-none-eabihf），单独 `cd fw && cargo build --target ...` 构建。
+# `fw`（裸机固件）/ `app`（jOS App 分区）都是 thumbv7em-none-eabihf，单独
+# `cd fw|app && cargo build --target ...` 构建。
 # 不列入默认成员：避免 feature 统一把 `stm32f407` 灌进 host 的 `flyctrl-core` 构建，
 # 否则 cortex-m-rt 被链接进 sitl 出现 `undefined reference to UsageFault/SVCall/...`。
 exclude = [
     "fw",
+    "app",
 ]
 
 [workspace.package]

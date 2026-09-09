@@ -588,7 +588,7 @@ mod tests {
     /// - SIL 侧：`PidController::from_config(cfg.ctrl_params())` → `kp_xy=0.3`、`kv_z=1.5`
     ///   （`CtrlParams` 无 `kv_z`，故保留 `default_quad` 基值 1.5）。
     /// - MCU 侧：`PidController::default_quad()` 后每周期被 `sync_gains_to_pid` 用
-    ///   `G_PARAM_VALS` 覆盖（见 joc-app-rust uplink.rs）→ 曾为 `[0.5,0.5,0.8,0.8,0.5]`，
+    ///   `G_PARAM_VALS` 覆盖（见 flyctrl/app uplink.rs）→ 曾为 `[0.5,0.5,0.8,0.8,0.5]`，
     ///   导致 `kp_xy=0.5`、`kv_z=0.8`，与 SIL 不一致 → 同输入下电机指令最大差 10.3%。
     /// 已按"MCU 对齐 SIL"决策将 `G_PARAM_VALS` 默认值改为 `[0.3,0.5,0.8,1.5,0.5]`。
     ///
@@ -606,7 +606,7 @@ mod tests {
     #[test]
     fn hil_same_input_sil_vs_mcu_output_compare() {
         let cfg = VehicleConfig::default_quad();
-        // MCU 侧配置（复刻 joc-app-rust control.rs）：default_quad + sync_gains_to_pid
+        // MCU 侧配置（复刻 flyctrl/app control.rs）：default_quad + sync_gains_to_pid
         // 每周期用 G_PARAM_VALS 默认值覆盖 → 已对齐 SIL：kp_xy=0.3, kv_z=1.5。
         let mut mcu_ctx = HilContext::new(
             EkfEstimator::default_quad(),
