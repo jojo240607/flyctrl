@@ -14,6 +14,7 @@ use core::ffi::c_void;
 
 use rtos_app_sdk::abi::g_app_slot;
 use rtos_app_sdk::device::Device;
+use rtos_app_sdk::info;
 use rtos_app_sdk::ioctl;
 
 const DEG2RAD: f32 = core::f32::consts::PI / 180.0;
@@ -303,6 +304,9 @@ impl GpsSensor for GpsUblox {
                 self.ref_lat = Some(lat);
                 self.ref_lon = Some(lon);
                 self.ref_alt = Some(alt);
+                // 首次有效定位：锁定 NED 原点（模拟器验收/真机调试均以此为 GPS 就绪标志）
+                info!(tag: "gps", "fix established: lat={:.6} lon={:.6} alt={:.1} (NED origin locked)",
+                      lat, lon, alt);
                 (lat, lon, alt)
             }
         };
