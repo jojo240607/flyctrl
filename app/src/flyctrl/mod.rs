@@ -33,7 +33,7 @@ use flyctrl_core::fdir::Health;
 use flyctrl_core::units::{Meter, MeterPerSecond, RadianPerSecond};
 
 use rtos_app_sdk::abi::RTOS_PRIO_BH_HIGH;
-use rtos_app_sdk::rtos::{spawn_rt, Mutex, RTOS_RT_HARD, RTOS_RT_NONE};
+use rtos_app_sdk::rtos::{spawn_rt, Mutex, Semaphore, RTOS_RT_HARD, RTOS_RT_NONE};
 
 /* ===================== 共享数据 ===================== */
 

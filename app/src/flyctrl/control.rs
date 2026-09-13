@@ -61,6 +61,9 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
     let mut last_est: Option<VehicleState> = None;
     let mut seq: u32 = 0;
 
+    // [联调诊断] 最近一拍执行器指令（静态，测试直读；定位后移除）
+    #[used]
+    static mut DBG_MOTOR: [f32; 4] = [0.0; 4];
     // PWM 设备（4 路，control 专用）
     let mut pwm_dev: [Option<Device>; 4] = [None, None, None, None];
     let mut pwm_period: [u32; 4] = [0; 4];
@@ -194,7 +197,11 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
                         vel: [MeterPerSecond(0.0); 3],
                         acc: [MeterPerSecondSquared(0.0); 3],
                     },
-                    false,
+                    // 非 HIL 模式的「原点定高」设定点恒有效：RC 油门/模式/已锁基准
+                    // 构成的 setpoint 是真实控制目标。若传 false，`hil_pos_inited`
+                    // 永不置位（step_hil 位置闸要求 setpoint_valid），执行器恒零——
+                    // 正是联调 F 的「非 HIL 无 PWM」阻塞根因（旧版临时放宽绕开的点）。
+                    true,
                 )
             }
         };
@@ -228,6 +235,10 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
 
         // --- 输出 PWM（4 路 ioctl 设占空比 ticks） ---
         if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: before pwm"); }
+        // [联调诊断] 指令观测（静态，无栈开销；测试直读定位无推力来源）
+        unsafe {
+            DBG_MOTOR = cmd.motor;
+        }
         for i in 0..4 {
             if let Some(d) = &pwm_dev[i] {
                 let m = cmd.motor[i].clamp(0.0, 1.0);

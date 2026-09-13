@@ -12,6 +12,12 @@
 use crate::config::VehicleConfig;
 use crate::controller::{Controller, Setpoint};
 use crate::estimator::Estimator;
+
+/// [联调诊断] step_hil 原始指令闸位观测（b0=armed b1=rc_fresh b2=health
+/// b3=est_finite b4=sp_finite b5=att_inited b6=pos_inited）。只写不读，无栈
+/// 开销；测试直读定位闭环无推力时哪道闸关闭（定位后移除）。
+#[used]
+pub static mut HIL_DIAG_GATES: u32 = 0;
 use crate::fdir::{Fdir, Health};
 use crate::filter::Biquad;
 use crate::hal::actuator::{clamp_thrust, MotorActuator};
@@ -410,6 +416,16 @@ where
             && setpoint.vel.iter().all(|v| v.0.is_finite())
             && setpoint.acc.iter().all(|a| a.0.is_finite())
             && setpoint.yaw.0.is_finite();
+        // [联调诊断] 记录闸位（b0-6），测试直读定位闭闸来源。
+        unsafe {
+            HIL_DIAG_GATES = (armed as u32)
+                | ((rc_fresh as u32) << 1)
+                | (((health != Health::Critical) as u32) << 2)
+                | ((est_finite as u32) << 3)
+                | ((sp_finite as u32) << 4)
+                | ((self.hil_att_inited as u32) << 5)
+                | ((self.hil_pos_inited as u32) << 6);
+        }
         let raw_cmd = if armed
             && rc_fresh
             && health != Health::Critical

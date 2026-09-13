@@ -95,7 +95,7 @@ impl SensorStack {
         self.mag.read()
     }
 
-    /// 读取气压高度（向下为正，米）。
+    /// 读取气压高度（向上为正，米）。
     pub fn read_altitude(&mut self) -> f32 {
         self.baro.read_altitude().0
     }

@@ -14,6 +14,15 @@ use crate::vehicle::{ActuatorCmd, Quaternion, VehicleState};
 use crate::controller::{Controller, trait_def::Setpoint};
 
 
+/// [联调诊断] PID 内部量观测（静态，无栈开销；测试直读，定位后移除）。
+#[used]
+pub static mut DBG_PID: [f32; 12] = [0.0; 12];
+/// [联调诊断] clamp 前原始值 / clamp 后推力（独立 static 强制求值顺序）。
+#[used]
+pub static mut DBG_PRE: f32 = 0.0;
+#[used]
+pub static mut DBG_THR: f32 = 0.0;
+
 pub struct PidController {
     // 位置外环 P：位置误差 -> 期望速度（世界系）
     kp_xy: f32,
@@ -239,11 +248,20 @@ impl Controller for PidController {
         } else {
             0.2
         };
-        let des_thrust = clampf(
-            (self.hover_thrust - acc_d / g) / cos_tilt,
-            0.1, 1.0,
-        );
+        let dbg_pre = (self.hover_thrust - acc_d / g) / cos_tilt;
+        unsafe { DBG_PRE = dbg_pre; }
+        let des_thrust = clampf(dbg_pre, 0.1, 1.0);
+        unsafe { DBG_THR = des_thrust; }
         self.dbg_des_thr = des_thrust;
+        // [联调诊断] 记录内部量（含 gravity 与 clamp 前原始值）
+        unsafe {
+            DBG_PID = [
+                self.hover_thrust, acc_d, des_vz, ez, des_thrust, cos_tilt,
+                self.kv_z, est_vd, g,
+                (self.hover_thrust - acc_d / g) / cos_tilt,
+                self.kp_z, self.ki_z,
+            ];
+        }
 
         // 期望姿态四元数：由（roll=+tilt_e, pitch=-tilt_n, yaw=sp.yaw）构成。
         // 飞控机体(经 X-180 实为前-左-下)：推力沿机体 -Z_body。绕 +Y 正转(+pitch) 把推力
@@ -278,10 +296,10 @@ impl Controller for PidController {
 
         ActuatorCmd {
             motor: [
-                motors[0].clamp(0.0, 1.0),
-                motors[1].clamp(0.0, 1.0),
-                motors[2].clamp(0.0, 1.0),
-                motors[3].clamp(0.0, 1.0),
+                clampf(motors[0], 0.0, 1.0),
+                clampf(motors[1], 0.0, 1.0),
+                clampf(motors[2], 0.0, 1.0),
+                clampf(motors[3], 0.0, 1.0),
             ],
         }
     }
@@ -299,5 +317,11 @@ impl Controller for PidController {
 
 #[inline]
 fn clampf(v: f32, lo: f32, hi: f32) -> f32 {
-    if v < lo { lo } else if v > hi { hi } else { v }
+    if v < lo {
+        lo
+    } else if v > hi {
+        hi
+    } else {
+        v
+    }
 }
