@@ -190,12 +190,13 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
                     target_alt = (cur_z - 0.02).max(0.0);
                 }
                 // RTL/LOITER 水平目标已为原点（N=0,E=0）；STABILIZE 保持同样基准，确保联调可观测。
-                // 【演示机动】摇杆 roll/pitch 映射为水平位置目标（×3m/满偏）：PC 端 vperiph
-                // 注入 SBUS 摇杆正弦 → 飞机按 8 字轨迹拉向目标点，半径 = 摇杆幅度×3（实测
-                // amp 0.4 → ±1.2m）。摇杆中位 → 原点（悬停），不影响定高（高度仍由油门决定）。
+                // 【演示机动】摇杆 roll/pitch 映射为水平位置目标（×8.5m/满偏）：PC 端 vperiph
+                // 注入 SBUS 摇杆正弦 → 飞机按 8 字轨迹拉向目标点，半径 = 摇杆幅度×8.5（实测
+                // amp 0.4 → ±3.4m 目标，Position 环跟随 ~0.89 → ~3.0m）。摇杆中位 → 原点
+                // （悬停），不影响定高（高度仍由油门决定）。
                 (
                     Setpoint {
-                        pos: [Meter(rc.pitch * 3.0), Meter(-rc.roll * 3.0), Meter(target_alt)],
+                        pos: [Meter(rc.pitch * 8.5), Meter(-rc.roll * 8.5), Meter(target_alt)],
                         yaw: Radian(rc.yaw * 0.5),
                         vel: [MeterPerSecond(0.0); 3],
                         acc: [MeterPerSecondSquared(0.0); 3],
