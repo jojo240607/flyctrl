@@ -34,6 +34,9 @@ pub struct PidController {
     vmax_xy: f32,
     vmax_z: f32,
     tilt_max: f32,
+    // 速率模式（水平）：位置外环旁路，期望速度 = sp.vel（摇杆直通，推杆飞/松杆停）。
+    // 默认 false（位置模式）；非 HIL 演示固件开启（大疆手感），HIL 保持位置模式。
+    rate_mode_xy: bool,
     // 姿态内环：四元数误差 -> 机体角速度 的 P（比例）与 D（角速度阻尼）增益
     att_kp: f32,
     att_kd: f32,
@@ -106,6 +109,12 @@ impl PidController {
         self.hover_thrust = g[4];
     }
 
+    /// 切换水平速率模式（位置外环旁路，期望速度 = sp.vel）。
+    /// 非 HIL 演示固件开启（大疆手感）；HIL 轨迹模式保持位置环。
+    pub fn set_rate_mode_xy(&mut self, on: bool) {
+        self.rate_mode_xy = on;
+    }
+
     /// 典型 450mm X 四旋翼参数（后续可移到机型配置）。
     /// 标准串级：pos_err -> 期望速度(限幅) -> vel_err -> 期望加速度 -> 期望姿态(四元数) -> 角速度。
     pub fn default_quad() -> Self {
@@ -114,9 +123,10 @@ impl PidController {
             kp_z: 0.5,
             kv_xy: 0.8,
             kv_z: 1.5,
-            vmax_xy: 2.0,
+            vmax_xy: 3.5, // 速率模式（摇杆→速度）上限：满杆 3.0m/s 不被 clamp（8 字半径 ~3m）
             vmax_z: 2.0,
             tilt_max: 0.35,
+            rate_mode_xy: false,
             att_kp: 3.0,
             att_kd: 0.3,
             hover_thrust: 0.5,
@@ -211,8 +221,17 @@ impl Controller for PidController {
             iz_final = clampf(-self.vmax_z - pre_iz, -2.0, 2.0);
         }
         self.iz = iz_final;
-        let des_vx = clampf(self.kp_xy * ex + sp.vel[0].0, -self.vmax_xy, self.vmax_xy);
-        let des_vy = clampf(self.kp_xy * ey + sp.vel[1].0, -self.vmax_xy, self.vmax_xy);
+        // 速率模式：位置外环旁路，期望速度 = sp.vel（摇杆直通）；否则位置 P + 速度前馈
+        let des_vx = if self.rate_mode_xy {
+            clampf(sp.vel[0].0, -self.vmax_xy, self.vmax_xy)
+        } else {
+            clampf(self.kp_xy * ex + sp.vel[0].0, -self.vmax_xy, self.vmax_xy)
+        };
+        let des_vy = if self.rate_mode_xy {
+            clampf(sp.vel[1].0, -self.vmax_xy, self.vmax_xy)
+        } else {
+            clampf(self.kp_xy * ey + sp.vel[1].0, -self.vmax_xy, self.vmax_xy)
+        };
         let des_vz = clampf(pre_iz + self.iz, -self.vmax_z, self.vmax_z);
 
         // --- 中环：速度误差 -> 期望世界系加速度 ---

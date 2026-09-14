@@ -52,6 +52,12 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         PidController::default_quad(),
         Second(4.0 / 1000.0),
     );
+    // 非 HIL（real-sensors）演示：速率模式（摇杆 → 期望速度，位置外环旁路），
+    // 大疆/航模手感（推杆飞、松杆停）。HIL 保持位置模式（setpoint 来自 PC 轨迹）。
+    #[cfg(not(feature = "hil"))]
+    {
+        hil.ctrl.set_rate_mode_xy(true);
+    }
     // 共享单步回退 IMU（与 SIL 同源实现，保证注入饥饿时回退数据完全一致）。
     let mut sim_imu = SimImu::new();
     let mut hold_alt = Meter(0.0);
@@ -189,16 +195,27 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
                     let cur_z = last_est.map(|e| e.pos[2].0).unwrap_or(hold_alt.0);
                     target_alt = (cur_z - 0.02).max(0.0);
                 }
-                // RTL/LOITER 水平目标已为原点（N=0,E=0）；STABILIZE 保持同样基准，确保联调可观测。
-                // 【演示机动】摇杆 roll/pitch 映射为水平位置目标（×8.5m/满偏）：PC 端 vperiph
-                // 注入 SBUS 摇杆正弦 → 飞机按 8 字轨迹拉向目标点，半径 = 摇杆幅度×8.5（实测
-                // amp 0.4 → ±3.4m 目标，Position 环跟随 ~0.89 → ~3.0m）。摇杆中位 → 原点
-                // （悬停），不影响定高（高度仍由油门决定）。
+                // 【速率模式·大疆手感】摇杆 roll/pitch → 期望水平速度（×1.7m/s 满偏）：
+                // 推杆飞机以对应速度飞、松杆停；pos 用"速度外推的预测位置"（补偿 EKF
+                // 位置估计延迟）。实测期望→真值速度放大 ~1.84×（EKF 速度标定 vs 物理），
+                // ×1.7 → 杆 0.4 期望 0.68 → 实际 ~1.25m/s → 8 字半径 1.25×16/2π ≈ 3.2m。
+                // 高度仍由油门定高（vel_z=0 → 高度位置环）。
+                let pred = last_est.map(|e| {
+                    [
+                        Meter(e.pos[0].0 + e.vel[0].0 * 0.25),
+                        Meter(e.pos[1].0 + e.vel[1].0 * 0.25),
+                        e.pos[2],
+                    ]
+                }).unwrap_or([Meter(0.0); 3]);
                 (
                     Setpoint {
-                        pos: [Meter(rc.pitch * 8.5), Meter(-rc.roll * 8.5), Meter(target_alt)],
+                        pos: [pred[0], pred[1], Meter(target_alt)],
                         yaw: Radian(rc.yaw * 0.5),
-                        vel: [MeterPerSecond(0.0); 3],
+                        vel: [
+                            MeterPerSecond(rc.pitch * 1.7),
+                            MeterPerSecond(-rc.roll * 1.7),
+                            MeterPerSecond(0.0),
+                        ],
                         acc: [MeterPerSecondSquared(0.0); 3],
                     },
                     // 非 HIL 模式的「原点定高」设定点恒有效：RC 油门/模式/已锁基准
