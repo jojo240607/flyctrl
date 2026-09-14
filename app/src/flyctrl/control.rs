@@ -300,10 +300,11 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
                 Some(v) => (v, 1u8),
                 None => ([0.0, 0.0, 0.0], 0u8),
             };
-            info!(tag: "ctrl", "hb seq={} armed={} crit={} alt={:.2} imu_ok={} gps={} gps_v={} gv=({:.2},{:.2},{:.2}) baro={} gz={:.2} m=[{:.3},{:.3},{:.3},{:.3}]",
+            info!(tag: "ctrl", "hb seq={} armed={} crit={} alt={:.2} imu_ok={} gps={} gps_v={} gv=({:.2},{:.2},{:.2}) baro={} baro_h={:.2} gpsd={:.2} gz={:.2} m=[{:.3},{:.3},{:.3},{:.3}]",
                   seq, armed_eff, health == Health::Critical, est.pos[2].0,
                   imu.is_some(), gps.is_some(), gv_n, gv[0], gv[1], gv[2],
-                  baro_alt.is_some(), est.vel[2].0,
+                  baro_alt.is_some(), baro_alt.unwrap_or(0.0),
+                  gps.map(|g| g.pos[2].0).unwrap_or(0.0), est.vel[2].0,
                   cmd.motor[0], cmd.motor[1], cmd.motor[2], cmd.motor[3]);
         }
 
