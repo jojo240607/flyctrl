@@ -293,9 +293,17 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
                   est.vel[0].0, est.vel[1].0, est.vel[2].0, fin, imu.is_some());
         }
         if seq % 250 == 0 {
-            info!(tag: "ctrl", "hb seq={} armed={} crit={} alt={:.2} imu_ok={} gps={} baro={} gz={:.2} m=[{:.3},{:.3},{:.3},{:.3}]",
+            // [DIAG] hb + GPS Doppler 速度（验证 RMC 速度链路：gps_v 为 SENSOR_FRAME
+            // 中 PosSample.vel，Some 表示固件解析到了 $GNRMC 的速度字段）
+            let gps_v = gps.and_then(|g| g.vel).map(|v| [v[0].0, v[1].0, v[2].0]);
+            let (gv, gv_n) = match gps_v {
+                Some(v) => (v, 1u8),
+                None => ([0.0, 0.0, 0.0], 0u8),
+            };
+            info!(tag: "ctrl", "hb seq={} armed={} crit={} alt={:.2} imu_ok={} gps={} gps_v={} gv=({:.2},{:.2},{:.2}) baro={} gz={:.2} m=[{:.3},{:.3},{:.3},{:.3}]",
                   seq, armed_eff, health == Health::Critical, est.pos[2].0,
-                  imu.is_some(), gps.is_some(), baro_alt.is_some(), est.vel[2].0,
+                  imu.is_some(), gps.is_some(), gv_n, gv[0], gv[1], gv[2],
+                  baro_alt.is_some(), est.vel[2].0,
                   cmd.motor[0], cmd.motor[1], cmd.motor[2], cmd.motor[3]);
         }
 

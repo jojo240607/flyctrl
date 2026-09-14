@@ -745,9 +745,15 @@ impl EkfEstimator {
         }
     }
 
-    /// 速度观测更新（GPS Doppler，默认噪声 `r_vel`）。等价于 `update_vel_r(vel, self.r_vel)`。
+    /// 速度观测更新（GPS Doppler，默认噪声 `r_vel`）。
+    ///
+    /// **只观测水平分量**：NMEA RMC 仅提供水平地速（无垂直速度），GPS Doppler
+    /// 的垂向分量无物理意义（固件 GpsUblox 对 RMC 的 D 分量置 0）。若把 0 当
+    /// 垂向速度观测注入，会与 baro 高度 + IMU 垂向融合冲突 → 高度环振荡发散
+    /// （实测：RMC 激活后 pos[2] 在 ±11m 剧烈振荡）。垂向速度/零偏由 baro 与
+    /// IMU 路径估计，水平速度由 GPS Doppler 约束（悬停水平漂移根治）。
     pub fn update_vel(&mut self, vel: [f32; 3]) {
-        self.update_vel_r(vel, self.r_vel);
+        self.update_vel_r([vel[0], vel[1], self.x[5]], self.r_vel);
     }
 
     /// 高度观测更新步（气压计）：气压计测得**向上**高度 `alt`，而状态 D 轴向下为正，

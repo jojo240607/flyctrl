@@ -36,14 +36,17 @@ fn msleep(ms: u32) {
 }
 
 /// 行内 NMEA 解析状态机：累积一行，遇 `\n` 完成。
+///
+/// 缓冲需容纳一**次 read 内**的全部拼接帧（GGA+RMC ≈ 131B），否则中途溢出重置
+/// 会破坏整批解析。160B 富余。
 struct NmeaLine {
-    buf: [u8; 82],
+    buf: [u8; 160],
     len: usize,
 }
 
 impl NmeaLine {
     fn new() -> Self {
-        Self { buf: [0u8; 82], len: 0 }
+        Self { buf: [0u8; 160], len: 0 }
     }
     /// 喂入一个字节；返回 Some(行) 表示收到完整一行（不含 `\n`），否则 None。
     fn push(&mut self, b: u8) -> Option<usize> {
@@ -143,6 +146,8 @@ pub struct GpsUblox {
     ref_lat: Option<f32>,
     ref_lon: Option<f32>,
     ref_alt: Option<f32>,
+    /// 最近一次 GGA 的海拔（RMC 无 alt 字段，位置 D 复用最近 GGA alt）。
+    last_alt: f32,
 }
 
 impl GpsUblox {
@@ -175,16 +180,24 @@ impl GpsUblox {
             ref_lat: None,
             ref_lon: None,
             ref_alt: None,
+            last_alt: 0.0,
         })
     }
 
-    /// 从设备字节流抽取并解析一帧位置；返回 (lat_deg, lon_deg, alt_m, valid)。
-    fn drain(&mut self) -> Option<(f32, f32, f32, bool)> {
-        let mut rb = [0u8; 64];
+    /// 从设备字节流抽取并解析一帧位置；返回 (lat_deg, lon_deg, alt_m, valid, vel_ned)。
+    /// `vel_ned` 为 Doppler 速度（NED m/s；GGA 无速度 → None，RMC 有 → Some）。
+    ///
+    /// 【整批处理】GGA(66B)+RMC(65B) 同周期推送共 ~131B。读缓冲取 128B ≥ 两帧和，
+    /// 一次 `dev.read` 拿到整批后**逐字节处理所有完整行**（GGA 与 RMC 均在本批内
+    /// 完成），返回最后一个有效样本。若缓冲过小（如 64B）帧跨批分割：先到的帧完成
+    /// 即返回会丢弃同批后续字节（RMC 头丢失 → 帧永不完整，实测 gps_v=0）。
+    fn drain(&mut self) -> Option<(f32, f32, f32, bool, Option<[f32; 3]>)> {
+        let mut rb = [0u8; 128];
         let n = self.dev.read(&mut rb);
         if n <= 0 {
             return None;
         }
+        let mut last: Option<(f32, f32, f32, bool, Option<[f32; 3]>)> = None;
         for &b in &rb[..n as usize] {
             if let Some(linelen) = self.line.push(b) {
                 let line = &self.line.buf[..linelen];
@@ -201,29 +214,38 @@ impl GpsUblox {
                     // GGA: f2=lat f3=N/S f4=lon f5=E/W f6=quality(0=invalid) f9=alt
                     let quality = field_f32(line, 6);
                     if quality < 1.0 {
-                        return None; // 未定位
+                        last = None; // 未定位
+                        continue;
                     }
                     let lat = dm_to_deg(field_f32(line, 2));
                     let lat = if field_char(line, 3) == b'S' { -lat } else { lat };
                     let lon = dm_to_deg(field_f32(line, 4));
                     let lon = if field_char(line, 5) == b'W' { -lon } else { lon };
                     let alt = field_f32(line, 9);
-                    return Some((lat, lon, alt, true));
+                    self.last_alt = alt; // 供后续 RMC 复用（RMC 无 alt 字段）
+                    last = Some((lat, lon, alt, true, None));
                 } else {
-                    // RMC: f3=status(A/V) f4=lat f5=N/S f6=lon f7=E/W
-                    let status = field_char(line, 3);
+                    // RMC: f2=status(A/V) f3=lat f4=N/S f5=lon f6=E/W f7=speed(knots) f8=course(deg)
+                    let status = field_char(line, 2);
                     if status != b'A' {
-                        return None; // 无效/Void
+                        last = None; // 无效/Void
+                        continue;
                     }
-                    let lat = dm_to_deg(field_f32(line, 4));
-                    let lat = if field_char(line, 5) == b'S' { -lat } else { lat };
-                    let lon = dm_to_deg(field_f32(line, 6));
-                    let lon = if field_char(line, 7) == b'W' { -lon } else { lon };
-                    return Some((lat, lon, 0.0, true));
+                    let lat = dm_to_deg(field_f32(line, 3));
+                    let lat = if field_char(line, 4) == b'S' { -lat } else { lat };
+                    let lon = dm_to_deg(field_f32(line, 5));
+                    let lon = if field_char(line, 6) == b'W' { -lon } else { lon };
+                    // Doppler 速度：地速(节)×航向(真北顺时针) → NED 北/东分量（下向无观测，置 0）
+                    let speed_ms = field_f32(line, 7) * 0.514_444; // knot → m/s
+                    let course_rad = field_f32(line, 8).to_radians();
+                    let vn = speed_ms * libm::cosf(course_rad);
+                    let ve = speed_ms * libm::sinf(course_rad);
+                    // RMC 无 alt：复用最近 GGA 海拔，保证位置 D 与 GGA 一致
+                    last = Some((lat, lon, self.last_alt, true, Some([vn, ve, 0.0])));
                 }
             }
         }
-        None
+        last
     }
 }
 
@@ -270,7 +292,7 @@ fn hex_val(b: u8) -> i32 {
 fn probe_baud(dev: &mut Device, budget_ms: u32) -> bool {
     let mut line = NmeaLine::new();
     let mut waited: u32 = 0;
-    let mut rb = [0u8; 64];
+    let mut rb = [0u8; 128];
     while waited < budget_ms {
         let n = dev.read(&mut rb);
         if n > 0 {
@@ -293,14 +315,17 @@ fn probe_baud(dev: &mut Device, budget_ms: u32) -> bool {
 
 impl GpsSensor for GpsUblox {
     fn read(&mut self) -> Option<PosSample> {
-        let (lat, lon, alt, valid) = self.drain()?;
+        let (lat, lon, alt, valid, vel) = self.drain()?;
         if !valid {
             return None;
         }
-        // 建立 NED 原点
+        // 建立 NED 原点（首次有效定位；必须来自 GGA：RMC 高度字段为 0）
         let (ref_lat, ref_lon, ref_alt) = match (self.ref_lat, self.ref_lon, self.ref_alt) {
             (Some(a), Some(b), Some(c)) => (a, b, c),
             _ => {
+                if alt <= 0.0 {
+                    return None; // RMC 先到：等待 GGA 携带高度再锁原点
+                }
                 self.ref_lat = Some(lat);
                 self.ref_lon = Some(lon);
                 self.ref_alt = Some(alt);
@@ -316,7 +341,17 @@ impl GpsSensor for GpsUblox {
         let n = d_lat * R_EARTH;
         let e = d_lon * R_EARTH * libm::cosf(ref_lat * DEG2RAD);
         let d = -(alt - ref_alt); // 向下为正
-        Some(PosSample::pos_only([Meter(n), Meter(e), Meter(d)]))
+        match vel {
+            // RMC 附带 Doppler 速度：位置 + 速度观测（EKF update_vel 约束水平速度）
+            Some(v) => {
+                use flyctrl_core::units::MeterPerSecond;
+                Some(PosSample::with_vel(
+                    [Meter(n), Meter(e), Meter(d)],
+                    [MeterPerSecond(v[0]), MeterPerSecond(v[1]), MeterPerSecond(v[2])],
+                ))
+            }
+            None => Some(PosSample::pos_only([Meter(n), Meter(e), Meter(d)])),
+        }
     }
 
     fn healthy(&self) -> bool {
