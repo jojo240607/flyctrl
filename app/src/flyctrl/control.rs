@@ -322,10 +322,12 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
                 Some(v) => (v, 1u8),
                 None => ([0.0, 0.0, 0.0], 0u8),
             };
-            info!(tag: "ctrl", "hb seq={} armed={} crit={} alt={:.2} imu_ok={} mag={} gps={} gps_v={} gv=({:.2},{:.2},{:.2}) baro={} baro_h={:.2} gpsd={:.2} gz={:.2} m=[{:.3},{:.3},{:.3},{:.3}]",
+            // 精简行：日志缓冲 180B（SDK emit 截断点）——去掉冗余 gps_v/baro_h，
+            // 行末 m=[...] 不再被截断（此前 19 参数 ≈186B 尾部被截，见 SDK 越界修复）。
+            info!(tag: "ctrl", "hb seq={} armed={} crit={} alt={:.1} imu_ok={} mag={} gps={} gv=({:.1},{:.1},{:.1}) baro={} gpsd={:.1} gz={:.1} m=[{:.2},{:.2},{:.2},{:.2}]",
                   seq, armed_eff, health == Health::Critical, est.pos[2].0,
-                  imu.is_some(), mag.is_some(), gps.is_some(), gv_n, gv[0], gv[1], gv[2],
-                  baro_alt.is_some(), baro_alt.unwrap_or(0.0),
+                  imu.is_some(), mag.is_some(), gps.is_some(),
+                  gv[0], gv[1], gv[2], baro_alt.is_some(),
                   gps.map(|g| g.pos[2].0).unwrap_or(0.0), est.vel[2].0,
                   cmd.motor[0], cmd.motor[1], cmd.motor[2], cmd.motor[3]);
         }
