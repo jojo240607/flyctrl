@@ -1,0 +1,14 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: flyctrl core lib 测试
+        run: cargo test --lib
+      # 注：app.bin 构建（build_app.py）依赖兄弟仓库 joc-rtos-app-sdk 的
+      # linker/app.ld，不在本仓库内——由壳工程 integration job 的
+      # `integrate.sh firmware`（完整 submodule 布局）覆盖。
