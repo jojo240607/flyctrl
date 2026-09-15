@@ -34,7 +34,10 @@ pub struct RcSbus {
     fill: usize,
     /// 最近一次解出的 16 通道（原始 0..2047）。
     ch: [u16; 16],
+    /// 本拍是否解出有效新帧（帧间为 false，RC 链路"新帧"标记）。
     fresh: bool,
+    /// 是否收到过至少一帧有效 SBUS（帧间锁存 armed/throttle 的依据）。
+    received: bool,
     lost: bool,
 }
 
@@ -70,6 +73,7 @@ impl RcSbus {
             fill: 0,
             ch: [0u16; 16],
             fresh: false,
+            received: false,
             lost: false,
         })
     }
@@ -130,6 +134,9 @@ impl RcSbus {
         let flags = self.buf[23];
         self.lost = (flags & 0x10) != 0 || (flags & 0x08) != 0;
         self.fresh = !self.lost;
+        if !self.lost {
+            self.received = true;
+        }
     }
 
     /// 单通道原始值 → 归一化 [-1,1]（油门映射到 [0,1] 由调用方处理）。
@@ -148,9 +155,14 @@ impl RcSbus {
 impl RcReceiver for RcSbus {
     fn read(&mut self) -> RcInput {
         self.drain();
-        if !self.fresh {
+        // 从未收到过有效帧：中性安全默认（解锁前无 RC 时不得误解锁）。
+        if !self.received {
             return RcInput::neutral();
         }
+        // 【帧间锁存】SBUS 帧周期（真机 ~10ms / 本模拟器 50ms）远大于控制拍 4ms：
+        // 若帧间返回 neutral，armed/throttle 会在 20Hz 帧间隙瞬时归零 → 控制环
+        // 大部分拍闸门关闭、电机零输出（解锁飞行不可用）。正确语义：通道值/解锁
+        // 锁存最近有效帧，fresh 仅标记"本拍是否有新帧"（RC 链路活性，供失联检测）。
         let throttle = (Self::norm(self.ch[3]) + 1.0) * 0.5; // [-1,1]→[0,1]
         let armed = self.ch[4] > 1700;
         let mode = if self.ch[5] < 600 {
