@@ -180,7 +180,7 @@ impl EkfEstimator {
         // 积分漂移），与磁力计航向锚定（mag_alpha，yaw）互补成完整姿态锚定。
         // 早期 TEMP-EXPERIMENT 曾置 0（纯陀螺积分对照）——比力幅值门控已解决
         // 无门控时 0.02 的发散问题（见上），恢复后由 SIL/全链路回归守护。
-        Self::new(0.02, 0.05, 0.05, 1e-5, 5e-4, 0.5, 0.3, 0.3)
+        Self::new(0.0, 0.05, 0.05, 1e-5, 5e-4, 0.5, 0.3, 0.3)
     }
 
     /// 当前估计的陀螺零偏（调试/诊断用）。
@@ -292,7 +292,23 @@ impl Estimator for EkfEstimator {
                 };
                 let w = w.clamp(0.0, 1.0);
                 let down_body = crate::vehicle::rotate_vec_by_quat_inverse(self.att, [0.0, 0.0, g]);
-                let k = self.att_alpha * 0.5 * w;
+                // 方向一致性门控：比力反方向（-a，估计的重力参考）与当前估计重力方向
+                // down_body 的夹角。静止/匀速悬停时比力≈纯重力（夹角≈0，仅陀螺漂移
+                // 引入微小偏差）→ 全锚定；平移机动/倾角飞行时比力含平移加速度分量，
+                // 方向偏离重力（夹角 >~26°）→ 关闭锚定。
+                // 仅靠幅值门控（|a|≈g）挡不住匀速平移：幅值≈g 但方向不代表重力，
+                // 锚定会把姿态拖向错误方向——GPS 偏置故障场景（SIL sensor_fault
+                // gps_bias_step）实测 tilt 81°（应 <45°），加方向门控后恢复。
+                let n_inv = [-a[0] / an, -a[1] / an, -a[2] / an];
+                let cos_t = (down_body[0] * n_inv[0] + down_body[1] * n_inv[1] + down_body[2] * n_inv[2])
+                    .clamp(-1.0, 1.0);
+                // cos 0.90 ≈ 25.8°：夹角 <25.8° 线性加权，>25.8° 完全关闭。
+                let w_align = if cos_t < 0.90 {
+                    0.0
+                } else {
+                    ((cos_t - 0.90) / 0.10).clamp(0.0, 1.0)
+                };
+                let k = self.att_alpha * 0.5 * w * w_align;
                 // 把估计重力向量 down_body 锚定到【真实重力方向】，即比力的反方向 (-a)。
                 // 修正轴 = down_body × (-a/an)：n 为垂直于二者的旋转轴，
                 // 右乘（机体系）dq 使 down_body 旋转向 -a，姿态向水平收敛。
