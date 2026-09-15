@@ -300,7 +300,7 @@ where
         baro_alt: Option<f32>,
         vio: Option<VioSample>,
         rtk: Option<RtkSample>,
-        mag_available: bool,
+        mag: Option<[f32; 3]>,
         setpoint: &Setpoint,
         setpoint_valid: bool,
         armed: bool,
@@ -417,7 +417,7 @@ where
             ],
             gyro: imu_sample.gyro,
         };
-        let health = self.fdir.update(&fdir_imu, gps.is_some(), baro_alt.is_some(), mag_available);
+        let health = self.fdir.update(&fdir_imu, gps.is_some(), baro_alt.is_some(), mag.is_some());
 
         // 6) 控制环健康闸：估计/设定点含非有限值（NaN/Inf）、未解锁、链路不新鲜、
         //    FDIR 关键故障、或 EKF 尚未完成姿态/位置初始化时输出零指令，阻断 NaN
@@ -514,7 +514,7 @@ mod tests {
 
         // 阶段 1：HIL 链路未建立（imu/gps/baro 全 None → SimImu 回退）。
         for it in 0..50 {
-            let r = ctx.step_hil(None, None, None, None, None, true, &sp, false, true, true, &mut sim_imu);
+            let r = ctx.step_hil(None, None, None, None, None, None, &sp, false, true, true, &mut sim_imu);
             assert!(state_finite(&r.est), "链路未建立阶段 NaN at iter {}: {:?}", it, r.est.att);
             assert!(!ctx.hil_att_inited, "SimImu 回退不得触发姿态初始化");
             assert!(!ctx.hil_pos_inited, "回退设定点不得触发位置初始化");
@@ -534,7 +534,7 @@ mod tests {
             Meter(0.0), Meter(0.0), Meter(-5.0),
         ]));
         for it in 0..300 {
-            let r = ctx.step_hil(Some(frd_hover), gps, Some(5.0), None, None, true, &sp, true, true, true, &mut sim_imu);
+            let r = ctx.step_hil(Some(frd_hover), gps, Some(5.0), None, None, Some([0.2, 0.0, 0.4]), &sp, true, true, true, &mut sim_imu);
             if it % 2 == 0 {
                 let a = r.est.att;
                 eprintln!(
@@ -581,7 +581,7 @@ mod tests {
             accel: [MeterPerSecondSquared(0.0), MeterPerSecondSquared(0.0), MeterPerSecondSquared(-9.81)],
             gyro: [RadianPerSecond(0.0); 3],
         };
-        let _ = ctx.step_hil(Some(init), None, None, None, None, true, &sp, false, true, true, &mut sim_imu);
+        let _ = ctx.step_hil(Some(init), None, None, None, None, None, &sp, false, true, true, &mut sim_imu);
         assert!(ctx.hil_att_inited);
 
         // 物理真值：绕机体 X 轴（roll）恒定角速度旋转，比力 = Rx(roll)⁻¹·(0,0,-9.81)。
@@ -603,7 +603,7 @@ mod tests {
             } else {
                 None
             };
-            let r = ctx.step_hil(imu, None, None, None, None, true, &sp, false, true, true, &mut sim_imu);
+            let r = ctx.step_hil(imu, None, None, None, None, None, &sp, false, true, true, &mut sim_imu);
             assert!(state_finite(&r.est), "NaN at iter {}", it);
             max_err = max_err.max((r.est.att.roll() - roll_true).abs());
         }
@@ -688,8 +688,8 @@ mod tests {
         let mut max_d = 0.0f32;
         let mut beats = 0u32;
         for it in 0..1000 {
-            let r_mcu = mcu_ctx.step_hil(Some(imu), gps, Some(5.0), None, None, true, &sp, true, true, true, &mut mcu_sim);
-            let r_sil = sil_ctx.step_hil(Some(imu), gps, Some(5.0), None, None, true, &sp, true, true, true, &mut sil_sim);
+            let r_mcu = mcu_ctx.step_hil(Some(imu), gps, Some(5.0), None, None, Some([0.2, 0.0, 0.4]), &sp, true, true, true, &mut mcu_sim);
+            let r_sil = sil_ctx.step_hil(Some(imu), gps, Some(5.0), None, None, Some([0.2, 0.0, 0.4]), &sp, true, true, true, &mut sil_sim);
             assert!(state_finite(&r_mcu.est) && state_finite(&r_sil.est), "NaN at iter {}", it);
             for i in 0..4 {
                 max_d = max_d.max((r_mcu.cmd.motor[i] - r_sil.cmd.motor[i]).abs());
@@ -726,8 +726,8 @@ mod tests {
         );
         let mut ref_sim = SimImu::new();
         for it in 0..1000 {
-            let r_a = cfg2.step_hil(Some(imu), gps, Some(5.0), None, None, true, &sp, true, true, true, &mut cfg2_sim);
-            let r_b = ref_ctx.step_hil(Some(imu), gps, Some(5.0), None, None, true, &sp, true, true, true, &mut ref_sim);
+            let r_a = cfg2.step_hil(Some(imu), gps, Some(5.0), None, None, Some([0.2, 0.0, 0.4]), &sp, true, true, true, &mut cfg2_sim);
+            let r_b = ref_ctx.step_hil(Some(imu), gps, Some(5.0), None, None, Some([0.2, 0.0, 0.4]), &sp, true, true, true, &mut ref_sim);
             for i in 0..4 {
                 assert_eq!(r_a.cmd.motor[i], r_b.cmd.motor[i], "part2 逐位不一致 at iter {} m{}", it, i);
             }

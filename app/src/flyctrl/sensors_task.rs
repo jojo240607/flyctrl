@@ -68,6 +68,10 @@ impl Sensors {
                 let baro_sample: Option<f32> = Some(stack.read_altitude());
                 let gps_sample: Option<PosSample> = stack.read_gps();
                 let rc_input: RcInput = stack.read_rc();
+                // 磁力计：real-sensors 经 I2C 读 QMC5883L（0x0D），虚拟源直出。
+                // read() 内部失败会置 unhealthy；读后 health 反映链路真实状态。
+                let mag_sample: [f32; 3] = stack.read_mag();
+                let mag_ok = stack.health().mag;
 
                 if WRITE_FRAME {
                     unsafe {
@@ -76,19 +80,21 @@ impl Sensors {
                         f.imu = imu_sample;
                         f.baro_alt = baro_sample;
                         f.gps = gps_sample;
+                        f.mag = if mag_ok { Some(mag_sample) } else { None };
                         f.rc = rc_input;
                         f.armed = rc_input.armed;
                         f.imu_ok = imu_sample.is_some();
                         f.baro_ok = baro_sample.is_some();
                         f.gps_ok = gps_sample.is_some();
+                        f.mag_ok = mag_ok;
                         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
                         SENSOR_SEQ = SENSOR_SEQ.wrapping_add(1); // 偶：写入完成
                     }
                 }
 
                 if loop_cnt % 500 == 0 {
-                    info!(tag: "sensor", "loop {} gps_w={} imu_w={} baro_w={}",
-                          loop_cnt, gps_sample.is_some(), imu_sample.is_some(), baro_sample.is_some());
+                    info!(tag: "sensor", "loop {} gps_w={} imu_w={} baro_w={} mag_w={}",
+                          loop_cnt, gps_sample.is_some(), imu_sample.is_some(), baro_sample.is_some(), mag_ok);
                 }
             }
 

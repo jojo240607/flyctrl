@@ -102,13 +102,14 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         // 写者被本任务抢占在置奇与置偶之间），忙等会让低优先级写者永远得不到调度，
         // control 无限自旋 → 整机卡死（HIL 注入期间已实测复现：运行数秒后日志/下行全停）。
         // 正确处理：直接采用本拍快照（可能新老混合/略旧），下一 4ms 拍自然取得一致新帧。
-        let (imu, rc, gps, baro_alt, armed);
+        let (imu, rc, gps, baro_alt, mag, armed);
         unsafe {
             let f = &mut *core::ptr::addr_of_mut!(SENSOR_FRAME);
             imu = f.imu;
             rc = f.rc;
             gps = f.gps;
             baro_alt = f.baro_alt;
+            mag = f.mag;
             armed = f.armed;
             // 【HIL 关键】IMU 单次消费：PC 每 ~32ms 才注入一帧 HIL_SENSOR，而本任务 4ms 一拍，
             // 若读后不清空，同一陀螺样本会被连续积分 8 拍（重复积分同一角速度 → 姿态过积分发散）。
@@ -232,7 +233,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         // SimImu 回退、姿态/位置初始化门控、EKF 估计 + 气压观测、FDIR、控制环健康闸、
         // 执行器限幅全部在 `step_hil` 内部完成，与 SIL（fly-sim-core）完全一致。
         let r = hil.step_hil(
-            imu, gps, baro_alt, None, None, &setpoint, setpoint_valid, armed_eff, rc.fresh, &mut sim_imu,
+            imu, gps, baro_alt, None, None, mag, &setpoint, setpoint_valid, armed_eff, rc.fresh, &mut sim_imu,
         );
         let est = r.est;
         let health = r.health;
@@ -321,12 +322,12 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
                 Some(v) => (v, 1u8),
                 None => ([0.0, 0.0, 0.0], 0u8),
             };
-            info!(tag: "ctrl", "hb seq={} armed={} crit={} alt={:.2} imu_ok={} gps={} gps_v={} gv=({:.2},{:.2},{:.2}) baro={} baro_h={:.2} gpsd={:.2} gz={:.2} m=[{:.3},{:.3},{:.3},{:.3}]",
+            info!(tag: "ctrl", "hb seq={} armed={} crit={} alt={:.2} imu_ok={} gps={} gps_v={} gv=({:.2},{:.2},{:.2}) baro={} baro_h={:.2} gpsd={:.2} gz={:.2} mag={} m=[{:.3},{:.3},{:.3},{:.3}]",
                   seq, armed_eff, health == Health::Critical, est.pos[2].0,
                   imu.is_some(), gps.is_some(), gv_n, gv[0], gv[1], gv[2],
                   baro_alt.is_some(), baro_alt.unwrap_or(0.0),
                   gps.map(|g| g.pos[2].0).unwrap_or(0.0), est.vel[2].0,
-                  cmd.motor[0], cmd.motor[1], cmd.motor[2], cmd.motor[3]);
+                  mag.is_some(), cmd.motor[0], cmd.motor[1], cmd.motor[2], cmd.motor[3]);
         }
 
         // 【HIL 事件驱动】不依赖 control 自身 4ms 时钟：阻塞等待下一帧 HIL_SENSOR

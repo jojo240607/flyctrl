@@ -43,6 +43,8 @@ pub struct SensorFrame {
     pub rc: RcInput,
     pub gps: Option<PosSample>,
     pub baro_alt: Option<f32>,
+    /// 机体系三轴磁场（QMC5883L 读数；缺失降级为 None）。
+    pub mag: Option<[f32; 3]>,
     pub imu_ok: bool,
     pub gps_ok: bool,
     pub baro_ok: bool,
@@ -57,6 +59,7 @@ impl SensorFrame {
             rc: RcInput { roll: 0.0, pitch: 0.0, yaw: 0.0, throttle: 0.0, armed: false, mode: 0, fresh: false },
             gps: None,
             baro_alt: None,
+            mag: None,
             imu_ok: false,
             gps_ok: false,
             baro_ok: false,
