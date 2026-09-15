@@ -96,6 +96,8 @@ pub struct EkfEstimator {
     r_rtk: f32,         // RTK-GPS 位置观测噪声（m）^2（厘米级，远强于普通 GPS）
     att_alpha: f32,     // 姿态重力修正强度（0 = 纯积分）
     mag_alpha: f32,     // 磁力计航向锚定强度（0 = 不锚定 yaw；纯陀螺积分 yaw 会漂移）
+    mag_ref: [f32; 2],  // 世界系水平参考地磁方向（单位向量）：默认 (1,0)=地理北；
+                        // 有磁偏角时 set_mag_declination 旋转该参考 → 磁航向转地理航向
     airspeed_est: f32,  // 估计空速 (m/s)，由空速计融合得到
     accel_lp: [f32; 3],  // 加计低通滤波（滤除高频振动，用于重力锚定）
 }
@@ -151,6 +153,7 @@ impl EkfEstimator {
             r_rtk: 0.0025,    // ~0.05 m RMS：RTK 厘米级绝对位置，权重最强
             att_alpha,
             mag_alpha: 0.05,  // 微弱航向锚定：yaw 误差每拍吸收 2.5%（0.05*0.5）
+            mag_ref: [1.0, 0.0], // 默认磁北=地理北（无偏角）
             airspeed_est: 0.0,
             accel_lp: [0.0; 3],
         }
@@ -904,6 +907,14 @@ impl EkfEstimator {
         self.airspeed_est = sqrt(self.x[3] * self.x[3] + self.x[4] * self.x[4]);
     }
 
+    /// 设置磁偏角（度，东偏为正）：磁北相对地理北（世界 +X）的偏角。
+    /// 0 = 磁北即地理北（默认）。EKF 用该角度旋转参考地磁方向，使磁力计
+    /// 航向锚定对准【地理北】而非磁北（磁航向 decl 修正，对标真机导航）。
+    pub fn set_mag_declination(&mut self, decl_deg: f32) {
+        let (s, c) = crate::math::sin_cos(decl_deg.to_radians());
+        self.mag_ref = [c, s];
+    }
+
     /// 磁力计航向锚定：把世界系水平磁场方向拉回磁北参考（+X），锚定四元数 yaw。
     ///
     /// 与 `att_alpha` 重力修正对称：重力锚 roll/pitch（世界系重力 → +Z），
@@ -931,7 +942,13 @@ impl EkfEstimator {
         if mh < 1e-3 {
             return;
         }
-        let yaw_err = crate::math::atan2(-m_world[1], m_world[0]);
+        // 世界系水平磁场相对【参考地磁方向（磁北）】的偏角 = yaw 估计误差。
+        // mag_ref=(cos decl, sin decl)：把 m_world 水平分量旋转 -decl 投影到参考系，
+        // 再取 atan2 —— 机头指向磁北（地理北+decl）时误差为 0，实现磁航向→地理航向。
+        let (rx, ry) = (self.mag_ref[0], self.mag_ref[1]);
+        let cx = m_world[0] * rx + m_world[1] * ry;
+        let cy = -m_world[0] * ry + m_world[1] * rx;
+        let yaw_err = crate::math::atan2(-cy, cx);
         // 归一化到 [-π, π]：atan2 已保证，无需 wrap。
         let k = self.mag_alpha * 0.5;
         let dq = Quaternion::from_axis_angle([0.0, 0.0, 1.0], Radian(yaw_err * k));
@@ -948,6 +965,35 @@ mod tests {
     use crate::units::*;
     use crate::vehicle::{Airspeed, AirspeedSample, ImuSample, MeterPerSecond, RadianPerSecond};
 
+
+
+    #[test]
+    fn mag_declination_aligns_yaw_to_true_north() {
+        // 磁北偏东 15°（decl=15°）。真实机头地理航向 15°（=磁北）时机体系
+        // 水平磁场沿 +X（磁北方向旋转到机体系）。估计 yaw=0（偏差 -15°）。
+        // EKF 应把 yaw 从 0 收敛到 +15°（地理航向），而非 0°（磁航向）。
+        let mut ekf = EkfEstimator::default_quad();
+        ekf.set_mag_declination(15.0);
+        // 真实机头地理 yaw=15°：机体系磁场 = R^T(15°)·[0.2,0,0.4]（世界系磁场在 +15°）
+        // 水平分量旋转到机体系后沿 +X → 读数即 [0.2, 0, 0.4]。
+        let m_body = [0.2f32, 0.0, 0.4];
+        for _ in 0..500 {
+            ekf.update_mag(Some(m_body));
+        }
+        let yaw_deg = ekf.att.yaw().to_degrees();
+        assert!(
+            (yaw_deg - 15.0).abs() < 3.0,
+            "decl=15° 时 yaw 应收敛到 15°（地理北），实际 {yaw_deg}°"
+        );
+
+        // 对照：decl=0（默认）时同一读数（磁北=地理北场景）收敛到 0°。
+        let mut ekf0 = EkfEstimator::default_quad();
+        for _ in 0..500 {
+            ekf0.update_mag(Some(m_body));
+        }
+        let yaw0 = ekf0.att.yaw().to_degrees();
+        assert!(yaw0.abs() < 3.0, "decl=0 时 yaw 应收敛到 0°，实际 {yaw0}°");
+    }
 
     #[test]
     fn mag_heading_correction_converges_yaw() {
