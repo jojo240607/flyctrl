@@ -396,6 +396,8 @@ where
         // 位置观测更紧（r_vio_pos/r_rtk）→ realistic 噪声下位置估计收敛更快、漂移更小。
         self.est.update_vio(vio);
         self.est.update_rtk(rtk);
+        // 磁力计航向锚定（EKF yaw 观测；None 时无动作，其他估计器默认 no-op）。
+        self.est.update_mag(mag);
 
         // 5) FDIR 健康监控：磁力计可用性由调用方给出（SIL 有磁力计 → true；
         //    MCU HIL 接入时按实机磁力计健康状态传入，不再硬编码 false——

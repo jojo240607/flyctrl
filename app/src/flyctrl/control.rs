@@ -322,12 +322,12 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
                 Some(v) => (v, 1u8),
                 None => ([0.0, 0.0, 0.0], 0u8),
             };
-            info!(tag: "ctrl", "hb seq={} armed={} crit={} alt={:.2} imu_ok={} gps={} gps_v={} gv=({:.2},{:.2},{:.2}) baro={} baro_h={:.2} gpsd={:.2} gz={:.2} mag={} m=[{:.3},{:.3},{:.3},{:.3}]",
+            info!(tag: "ctrl", "hb seq={} armed={} crit={} alt={:.2} imu_ok={} mag={} gps={} gps_v={} gv=({:.2},{:.2},{:.2}) baro={} baro_h={:.2} gpsd={:.2} gz={:.2} m=[{:.3},{:.3},{:.3},{:.3}]",
                   seq, armed_eff, health == Health::Critical, est.pos[2].0,
-                  imu.is_some(), gps.is_some(), gv_n, gv[0], gv[1], gv[2],
+                  imu.is_some(), mag.is_some(), gps.is_some(), gv_n, gv[0], gv[1], gv[2],
                   baro_alt.is_some(), baro_alt.unwrap_or(0.0),
                   gps.map(|g| g.pos[2].0).unwrap_or(0.0), est.vel[2].0,
-                  mag.is_some(), cmd.motor[0], cmd.motor[1], cmd.motor[2], cmd.motor[3]);
+                  cmd.motor[0], cmd.motor[1], cmd.motor[2], cmd.motor[3]);
         }
 
         // 【HIL 事件驱动】不依赖 control 自身 4ms 时钟：阻塞等待下一帧 HIL_SENSOR

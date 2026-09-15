@@ -95,6 +95,7 @@ pub struct EkfEstimator {
     r_vio_vel: f32,     // VIO 速度观测噪声（m/s）^2（光流高精度，强于 GPS Doppler）
     r_rtk: f32,         // RTK-GPS 位置观测噪声（m）^2（厘米级，远强于普通 GPS）
     att_alpha: f32,     // 姿态重力修正强度（0 = 纯积分）
+    mag_alpha: f32,     // 磁力计航向锚定强度（0 = 不锚定 yaw；纯陀螺积分 yaw 会漂移）
     airspeed_est: f32,  // 估计空速 (m/s)，由空速计融合得到
     accel_lp: [f32; 3],  // 加计低通滤波（滤除高频振动，用于重力锚定）
 }
@@ -149,6 +150,7 @@ impl EkfEstimator {
             r_vio_vel: 0.04,
             r_rtk: 0.0025,    // ~0.05 m RMS：RTK 厘米级绝对位置，权重最强
             att_alpha,
+            mag_alpha: 0.05,  // 微弱航向锚定：yaw 误差每拍吸收 2.5%（0.05*0.5）
             airspeed_est: 0.0,
             accel_lp: [0.0; 3],
         }
@@ -901,6 +903,40 @@ impl EkfEstimator {
         // 估计空速 = 水平速度幅值（融合后）
         self.airspeed_est = sqrt(self.x[3] * self.x[3] + self.x[4] * self.x[4]);
     }
+
+    /// 磁力计航向锚定：把世界系水平磁场方向拉回磁北参考（+X），锚定四元数 yaw。
+    ///
+    /// 与 `att_alpha` 重力修正对称：重力锚 roll/pitch（世界系重力 → +Z），
+    /// 磁力计锚 yaw（世界系水平磁场 → 磁北）。纯陀螺积分时 yaw 无观测会缓慢漂移
+    /// （陀螺零偏残余 → yaw 积分漂移），磁力计提供绝对航向参考。
+    ///
+    /// 原理：机体系磁场 `m` 经**估计**姿态旋转到世界系 `m_world`；若估计 yaw 偏差
+    /// δ，`m_world` 水平分量相对磁北偏转 δ。`yaw_err = atan2(-my, mx)` 即该偏差，
+    /// 绕世界 Z 轴按 `mag_alpha` 强度修正（符号：yaw 偏大 → 磁场偏东 → yaw_err<0
+    /// → 绕 -Z 修正，yaw 减小）。roll/pitch 分量不受影响（绕世界 Z 纯 yaw 修正）。
+    fn update_mag(&mut self, mag: Option<[f32; 3]>) {
+        if self.mag_alpha <= 0.0 {
+            return;
+        }
+        let m = match mag {
+            Some(m) => m,
+            None => return,
+        };
+        if !m.iter().all(|v| v.is_finite()) {
+            return;
+        }
+        let m_world = rotate_vec_by_quat(self.att, m);
+        let mh = sqrt(m_world[0] * m_world[0] + m_world[1] * m_world[1]);
+        // 水平磁场过弱（磁力计几乎指向天顶/地磁水平分量≈0）→ 无法提供航向参考。
+        if mh < 1e-3 {
+            return;
+        }
+        let yaw_err = crate::math::atan2(-m_world[1], m_world[0]);
+        // 归一化到 [-π, π]：atan2 已保证，无需 wrap。
+        let k = self.mag_alpha * 0.5;
+        let dq = Quaternion::from_axis_angle([0.0, 0.0, 1.0], Radian(yaw_err * k));
+        self.att = (dq * self.att).normalize();
+    }
 }
 
 #[cfg(test)]
@@ -911,6 +947,42 @@ mod tests {
     use crate::config::VehicleConfig;
     use crate::units::*;
     use crate::vehicle::{Airspeed, AirspeedSample, ImuSample, MeterPerSecond, RadianPerSecond};
+
+
+    #[test]
+    fn mag_heading_correction_converges_yaw() {
+        // 初始估计 yaw 偏 30°（纯偏航误差，roll/pitch=0）。真实 yaw=0 时机体系
+        // 磁场 = 北向参考 [0.2, 0, 0.4]（水平 +X 磁北）。update_mag 应把 yaw
+        // 从 30° 收敛回 0°，且不动 roll/pitch。
+        let mut ekf = EkfEstimator::default_quad();
+        ekf.att = Quaternion::from_axis_angle([0.0, 0.0, 1.0], Radian(30f32.to_radians()));
+        let m_body = [0.2f32, 0.0, 0.4];
+        for _ in 0..400 {
+            ekf.update_mag(Some(m_body));
+        }
+        let yaw_deg = ekf.att.yaw().to_degrees();
+        assert!(yaw_deg.abs() < 3.0, "yaw 应收敛到 0°，实际 {yaw_deg}°");
+        assert!(ekf.att.roll().abs() < 1e-3, "磁力计不应扰动 roll");
+        assert!(ekf.att.pitch().abs() < 1e-3, "磁力计不应扰动 pitch");
+
+        // mag=None / 全零 / 非有限 → 不应改变姿态。
+        let att_before = ekf.att;
+        ekf.update_mag(None);
+        assert_eq!(ekf.att, att_before);
+        ekf.update_mag(Some([0.0, 0.0, 0.0]));
+        assert_eq!(ekf.att, att_before);
+        ekf.update_mag(Some([f32::NAN, 0.0, 0.4]));
+        assert_eq!(ekf.att, att_before);
+
+        // 反向偏置（yaw=-30°）同样收敛回 0°。
+        let mut ekf2 = EkfEstimator::default_quad();
+        ekf2.att = Quaternion::from_axis_angle([0.0, 0.0, 1.0], Radian(-30f32.to_radians()));
+        for _ in 0..400 {
+            ekf2.update_mag(Some(m_body));
+        }
+        let yaw2 = ekf2.att.yaw().to_degrees();
+        assert!(yaw2.abs() < 3.0, "反向 yaw 应收敛到 0°，实际 {yaw2}°");
+    }
 
     #[test]
     fn airspeed_fusion_constrains_horizontal_speed() {

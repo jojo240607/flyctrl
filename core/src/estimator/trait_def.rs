@@ -47,6 +47,10 @@ pub trait Estimator {
     /// 默认 no-op（无气压融合的估计器不受影响）。
     fn update_alt(&mut self, _alt: f32) {}
 
+    /// 注入磁力计观测（机体系三轴磁场，任意单位）：锚定航向（yaw）到磁北。
+    /// 默认 no-op（无磁力计/无航向融合的估计器不受影响）。
+    fn update_mag(&mut self, _mag: Option<[f32; 3]>) {}
+
     /// 当前估计状态（不推进），供诊断读取（已含所有已融合观测）。
     fn state(&self) -> VehicleState;
 
