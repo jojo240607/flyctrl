@@ -24,6 +24,25 @@ use core::sync::atomic::Ordering;
 /// 设备串口 TX 缓冲、导致同期的传感器任务日志被丢弃（误判传感器任务“死亡”）。
 /// 正常验证时关闭。
 const VERBOSE: bool = false;
+
+// --- 非 HIL 飞行参数（演示/调参常量，后续可收敛到 core config） ---
+/// 速率模式（STABILIZE/ALT_HOLD）：摇杆满偏 → 期望水平速度 (m/s)。
+/// 实测期望→真值速度放大 ~1.84×（EKF 速度标定 vs 物理），×1.7 → 杆 0.4
+/// 期望 0.68 → 实际 ~1.25m/s → 8 字半径 1.25×16/2π ≈ 3.2m。
+#[cfg(not(feature = "hil"))]
+const RATE_XY_GAIN: f32 = 1.7;
+/// 速率模式：EKF 位置预测外推时间 (s)——用"速度外推的预测位置"补偿位置估计延迟。
+#[cfg(not(feature = "hil"))]
+const VEL_PRED_HORIZON: f32 = 0.25;
+/// LAND / RTL 到位后：每拍垂向下降量 (m，D 向下为正，4ms 拍 → 5m/s 缓降)。
+#[cfg(not(feature = "hil"))]
+const LAND_DESCENT_PER_TICK: f32 = 0.02;
+/// RTL：水平距原点小于该值 (m) 视为到位，开始缓降。
+#[cfg(not(feature = "hil"))]
+const RTL_ARRIVE_RADIUS: f32 = 1.0;
+/// LOITER：RC 摇杆叠加的水平微调速度 (m/s 满偏)。
+#[cfg(not(feature = "hil"))]
+const LOITER_NUDGE_GAIN: f32 = 0.3;
 #[cfg(feature = "hil")]
 use crate::flyctrl::HIL_EVT;
 use crate::flyctrl::{make_name, EST_MTX, EST_STATE, SENSOR_FRAME, SENSOR_SEQ};
@@ -52,12 +71,9 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         PidController::default_quad(),
         Second(4.0 / 1000.0),
     );
-    // 非 HIL（real-sensors）演示：速率模式（摇杆 → 期望速度，位置外环旁路），
-    // 大疆/航模手感（推杆飞、松杆停）。HIL 保持位置模式（setpoint 来自 PC 轨迹）。
-    #[cfg(not(feature = "hil"))]
-    {
-        hil.ctrl.set_rate_mode_xy(true);
-    }
+    // 非 HIL 飞行模式：rate_mode_xy 按模式每拍设置（见循环内 setpoint 构造），
+    // 速率模式（STABILIZE/ALT_HOLD）旁路位置外环，位置模式（LOITER/GUIDED/RTL/LAND）
+    // 启用位置跟踪。HIL 保持位置模式（setpoint 来自 PC 轨迹）。
     // 共享单步回退 IMU（与 SIL 同源实现，保证注入饥饿时回退数据完全一致）。
     let mut sim_imu = SimImu::new();
     let mut hold_alt = Meter(0.0);
@@ -186,43 +202,84 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
             #[cfg(not(feature = "hil"))]
             {
                 use flyctrl_core::units::Radian;
+                use flyctrl_core::comm::mavlink::enums::{
+                    COPTER_MODE_ALT_HOLD, COPTER_MODE_GUIDED, COPTER_MODE_LAND,
+                    COPTER_MODE_LOITER, COPTER_MODE_RTL, COPTER_MODE_STABILIZE,
+                };
                 let cmd_mode = crate::flyctrl::uplink::G_CMD_MODE.load(Ordering::Relaxed);
-                use flyctrl_core::comm::mavlink::enums::COPTER_MODE_LAND;
+                // 模式 → 位置外环开关（每拍设置）：速率模式（STABILIZE/ALT_HOLD）旁路
+                // 位置外环（期望速度=摇杆直通），位置模式（LOITER/GUIDED/RTL/LAND）
+                // 启用位置跟踪（位置 P + 速度前馈）。
+                let rate_mode = matches!(cmd_mode, COPTER_MODE_STABILIZE | COPTER_MODE_ALT_HOLD);
+                hil.ctrl.set_rate_mode_xy(rate_mode);
                 let thr_off = (rc.throttle - 0.5) * 2.0;
-                // 默认目标：锁定高度基准（原点）。LAND 模式触发持续缓降。
-                let mut target_alt = hold_alt.0 - thr_off * 2.0;
-                if cmd_mode == COPTER_MODE_LAND {
-                    // LAND：在基准高度上每周期降 0.02m，趋向地面（D 向下，地面=0）。
-                    let cur_z = last_est.map(|e| e.pos[2].0).unwrap_or(hold_alt.0);
-                    target_alt = (cur_z - 0.02).max(0.0);
-                }
-                // 【速率模式·大疆手感】摇杆 roll/pitch → 期望水平速度（×1.7m/s 满偏）：
-                // 推杆飞机以对应速度飞、松杆停；pos 用"速度外推的预测位置"（补偿 EKF
-                // 位置估计延迟）。实测期望→真值速度放大 ~1.84×（EKF 速度标定 vs 物理），
-                // ×1.7 → 杆 0.4 期望 0.68 → 实际 ~1.25m/s → 8 字半径 1.25×16/2π ≈ 3.2m。
-                // 高度仍由油门定高（vel_z=0 → 高度位置环）。
-                let pred = last_est.map(|e| {
-                    [
-                        Meter(e.pos[0].0 + e.vel[0].0 * 0.25),
-                        Meter(e.pos[1].0 + e.vel[1].0 * 0.25),
-                        e.pos[2],
-                    ]
-                }).unwrap_or([Meter(0.0); 3]);
+                // 当前估计位置（NED；无估计时回退 hold_alt 基准）。
+                let cur = last_est
+                    .map(|e| (e.pos[0].0, e.pos[1].0, e.pos[2].0))
+                    .unwrap_or((0.0, 0.0, hold_alt.0));
+                // 模式 → 期望目标（NED 位置 + 期望速度 + 是否速率模式）：
+                let (tx, ty, tz, vx, vy, use_rc_vel) = match cmd_mode {
+                    // LAND：当前位置水平保持，垂向每拍缓降趋向地面（D 向下，地面=0）。
+                    COPTER_MODE_LAND => (
+                        cur.0, cur.1,
+                        (cur.2 - LAND_DESCENT_PER_TICK).max(0.0),
+                        0.0, 0.0, false,
+                    ),
+                    // RTL：水平回原点 (0,0) 定高（起飞基准 hold_alt）；水平到位后缓降。
+                    COPTER_MODE_RTL => {
+                        let horiz = libm::sqrtf(cur.0 * cur.0 + cur.1 * cur.1);
+                        let tz = if horiz < RTL_ARRIVE_RADIUS {
+                            (cur.2 - LAND_DESCENT_PER_TICK).max(0.0)
+                        } else {
+                            hold_alt.0
+                        };
+                        (0.0, 0.0, tz, 0.0, 0.0, false)
+                    }
+                    // 定点：原点定高；LOITER 允许 RC 摇杆叠加水平微调速度
+                    // （GUIDED 无目标通道时原点保持，后续接入 SET_POSITION_TARGET）。
+                    COPTER_MODE_LOITER | COPTER_MODE_GUIDED => (
+                        0.0, 0.0, hold_alt.0,
+                        rc.pitch * LOITER_NUDGE_GAIN,
+                        -rc.roll * LOITER_NUDGE_GAIN,
+                        false,
+                    ),
+                    // STABILIZE / ALT_HOLD / 默认：速率模式（摇杆 → 期望速度）+ 定高，
+                    // 大疆手感（推杆飞、松杆停）；pos 用速度外推预测位置补偿 EKF 延迟。
+                    _ => (
+                        0.0, 0.0, hold_alt.0 - thr_off * 2.0,
+                        rc.pitch * RATE_XY_GAIN,
+                        -rc.roll * RATE_XY_GAIN,
+                        true,
+                    ),
+                };
+                // 速率模式：速度外推的预测位置（补偿 EKF 位置估计延迟）；位置模式：绝对目标。
+                let pos = if use_rc_vel {
+                    let pred = last_est.map(|e| {
+                        [
+                            Meter(e.pos[0].0 + e.vel[0].0 * VEL_PRED_HORIZON),
+                            Meter(e.pos[1].0 + e.vel[1].0 * VEL_PRED_HORIZON),
+                            Meter(tz),
+                        ]
+                    }).unwrap_or([Meter(0.0); 3]);
+                    [pred[0], pred[1], Meter(tz)]
+                } else {
+                    [Meter(tx), Meter(ty), Meter(tz)]
+                };
                 (
                     Setpoint {
-                        pos: [pred[0], pred[1], Meter(target_alt)],
+                        pos,
                         yaw: Radian(rc.yaw * 0.5),
                         vel: [
-                            MeterPerSecond(rc.pitch * 1.7),
-                            MeterPerSecond(-rc.roll * 1.7),
+                            MeterPerSecond(vx),
+                            MeterPerSecond(vy),
                             MeterPerSecond(0.0),
                         ],
                         acc: [MeterPerSecondSquared(0.0); 3],
                     },
-                    // 非 HIL 模式的「原点定高」设定点恒有效：RC 油门/模式/已锁基准
-                    // 构成的 setpoint 是真实控制目标。若传 false，`hil_pos_inited`
-                    // 永不置位（step_hil 位置闸要求 setpoint_valid），执行器恒零——
-                    // 正是联调 F 的「非 HIL 无 PWM」阻塞根因（旧版临时放宽绕开的点）。
+                    // 非 HIL 模式的设定点恒有效：RC 油门/模式/已锁基准构成的 setpoint
+                    // 是真实控制目标。若传 false，`hil_pos_inited` 永不置位（step_hil
+                    // 位置闸要求 setpoint_valid），执行器恒零——正是联调 F 的
+                    // 「非 HIL 无 PWM」阻塞根因（旧版临时放宽绕开的点）。
                     true,
                 )
             }
@@ -240,8 +297,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         let cmd = r.cmd;
         last_est = Some(est);
 
-        // 解锁瞬间锁定高度基准
-        // [BISECT] armed_eff 已退化为 armed
+        // 解锁瞬间锁定高度基准（armed_eff = RC 解锁 或 地面站 COMMAND_LONG 解锁）
         if armed_eff && !alt_locked {
             hold_alt = est.pos[2];
             alt_locked = true;
@@ -257,7 +313,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
 
         // --- 输出 PWM（4 路 ioctl 设占空比 ticks） ---
         if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: before pwm"); }
-        // [联调诊断] 指令观测（静态，无栈开销；测试直读定位无推力来源）
+        // 指令观测（静态，无栈开销；虚拟外设测试定位"无推力来源"用）
         unsafe {
             DBG_MOTOR = cmd.motor;
         }
@@ -283,7 +339,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
             if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: in est-guard"); }
             let s = unsafe { &mut *core::ptr::addr_of_mut!(EST_STATE) };
             if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: est-addr got"); }
-            s.armed = armed_eff; // [BISECT] 退化为 armed
+            s.armed = armed_eff;
             if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: est-armed written"); }
             s.est = est;
             s.health = health;
@@ -302,8 +358,8 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
                   imu.is_some(), armed_eff, health == Health::Critical, est.pos[2].0);
         }
         if seq % 25 == 0 {
-            // [DIAG] EKF 状态演变诊断：每次 25 拍(≈100ms) 打印姿态/位置/速度/有限性，
-            // 定位 NaN 出现的时刻与当时的 EKF 状态（闭环发散排查用，定位后移除）。
+            // EKF 状态观察日志（10Hz）：姿态/位置/速度/有限性——调试/虚拟外设验证用，
+            // 量产后可经 VERBOSE 门控关闭。
             let (r, p, y) = (est.att.roll(), est.att.pitch(), est.att.yaw());
             let fin = est.att.w.is_finite() && est.att.x.is_finite()
                 && est.att.y.is_finite() && est.att.z.is_finite()
@@ -315,8 +371,8 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
                   est.vel[0].0, est.vel[1].0, est.vel[2].0, fin, imu.is_some());
         }
         if seq % 250 == 0 {
-            // [DIAG] hb + GPS Doppler 速度（验证 RMC 速度链路：gps_v 为 SENSOR_FRAME
-            // 中 PosSample.vel，Some 表示固件解析到了 $GNRMC 的速度字段）
+            // hb 心跳：gv/gpsd 验证 RMC 速度链路（gps_v 为 SENSOR_FRAME 中
+            // PosSample.vel，Some 表示固件解析到了 $GNRMC 的速度字段）
             let gps_v = gps.and_then(|g| g.vel).map(|v| [v[0].0, v[1].0, v[2].0]);
             let (gv, gv_n) = match gps_v {
                 Some(v) => (v, 1u8),
