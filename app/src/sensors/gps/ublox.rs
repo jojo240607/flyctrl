@@ -187,16 +187,20 @@ impl GpsUblox {
     /// 从设备字节流抽取并解析一帧位置；返回 (lat_deg, lon_deg, alt_m, valid, vel_ned)。
     /// `vel_ned` 为 Doppler 速度（NED m/s；GGA 无速度 → None，RMC 有 → Some）。
     ///
-    /// 【整批处理】GGA(66B)+RMC(65B) 同周期推送共 ~131B。读缓冲取 128B ≥ 两帧和，
+    /// 【整批处理】GGA(66B)+RMC(65B) 同周期推送共 ~130B。读缓冲取 256B ≥ 整批，
     /// 一次 `dev.read` 拿到整批后**逐字节处理所有完整行**（GGA 与 RMC 均在本批内
-    /// 完成），返回最后一个有效样本。若缓冲过小（如 64B）帧跨批分割：先到的帧完成
-    /// 即返回会丢弃同批后续字节（RMC 头丢失 → 帧永不完整，实测 gps_v=0）。
+    /// 完成），返回最后一个有效样本。
+    /// 【历史教训】曾用 128B < 130B：帧跨批分割（128B 内 GGA 完整 + RMC 前 62B，
+    /// 尾部 2B 下批到达）。跨批时若下批与下一帧拼接错位，NmeaLine 状态机卡住，
+    /// GPS 观测间歇失效（虚拟时钟校准后帧率 20Hz 暴露：gps false 恒、baro 阶跃
+    /// 不被吸收、pos 漂移 14m）。256B 一次收整帧，GPS 稳定。
     fn drain(&mut self) -> Option<(f32, f32, f32, bool, Option<[f32; 3]>)> {
-        let mut rb = [0u8; 128];
+        let mut rb = [0u8; 256];
         let n = self.dev.read(&mut rb);
         if n <= 0 {
             return None;
         }
+
         let mut last: Option<(f32, f32, f32, bool, Option<[f32; 3]>)> = None;
         for &b in &rb[..n as usize] {
             if let Some(linelen) = self.line.push(b) {
@@ -315,7 +319,9 @@ fn probe_baud(dev: &mut Device, budget_ms: u32) -> bool {
 
 impl GpsSensor for GpsUblox {
     fn read(&mut self) -> Option<PosSample> {
-        let (lat, lon, alt, valid, vel) = self.drain()?;
+        let Some((lat, lon, alt, valid, vel)) = self.drain() else {
+            return None;
+        };
         if !valid {
             return None;
         }

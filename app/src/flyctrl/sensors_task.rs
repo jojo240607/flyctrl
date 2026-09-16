@@ -53,6 +53,14 @@ impl Sensors {
 
         let mut first = true;
         let mut loop_cnt: u32 = 0;
+        // GPS 样本保持：真实 GPS 20Hz 帧，两次帧之间 read_gps 返回 None；若每拍
+        // 直接把 None 写进 SENSOR_FRAME，control(4ms) 只在 2ms Some 窗口内读到样本
+        // （约一半拍），FDIR 的 pos_available 大面积 false → gps_lost_steps 累积
+        // → 误判 GPS 丢失降级（虚拟时钟校准后实测 baro_step health=1）。
+        // 修复：无新帧时保持最近有效样本，超过 GPS_VALID_STEPS（500ms）无新帧才
+        // 置 None（真实飞控 GPS 短暂丢帧不降级语义）。
+        const GPS_VALID_STEPS: u32 = 250; // 250 × 2ms = 500ms
+        let mut gps_stale: u32 = 0;
         loop {
             // 非 HIL：采样 + 写共享帧（seqlock：sensors 单写、control 单读，control 优先级更高）。
             #[cfg(not(feature = "hil"))]
@@ -67,6 +75,13 @@ impl Sensors {
                 let imu_sample: Option<ImuSample> = Some(stack.read_imu());
                 let baro_sample: Option<f32> = Some(stack.read_altitude());
                 let gps_sample: Option<PosSample> = stack.read_gps();
+                // GPS 样本保持（见循环外注释）：无新帧时保持最近有效样本
+                // （超时清理由下方写段按 gps_stale 处理，这里只维护过期计数）。
+                if gps_sample.is_some() {
+                    gps_stale = 0;
+                } else {
+                    gps_stale += 1;
+                }
                 let rc_input: RcInput = stack.read_rc();
                 // 磁力计：real-sensors 经 I2C 读 QMC5883L（0x0D），虚拟源直出。
                 // read() 内部失败会置 unhealthy；读后 health 反映链路真实状态。
@@ -79,13 +94,20 @@ impl Sensors {
                         let f = &mut *core::ptr::addr_of_mut!(SENSOR_FRAME);
                         f.imu = imu_sample;
                         f.baro_alt = baro_sample;
-                        f.gps = gps_sample;
+                        // GPS 样本保持：有新帧更新；无新帧且未超时保持旧样本
+                        // （避免 control 拍错过 2ms 窗口导致 pos_available 大面积
+                        // false → FDIR 误判 GPS lost）；超时（500ms 无帧）置 None。
+                        if gps_sample.is_some() {
+                            f.gps = gps_sample;
+                        } else if gps_stale > GPS_VALID_STEPS {
+                            f.gps = None;
+                        }
                         f.mag = if mag_ok { Some(mag_sample) } else { None };
                         f.rc = rc_input;
                         f.armed = rc_input.armed;
                         f.imu_ok = imu_sample.is_some();
                         f.baro_ok = baro_sample.is_some();
-                        f.gps_ok = gps_sample.is_some();
+                        f.gps_ok = f.gps.is_some();
                         f.mag_ok = mag_ok;
                         core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
                         SENSOR_SEQ = SENSOR_SEQ.wrapping_add(1); // 偶：写入完成
