@@ -136,6 +136,11 @@ pub extern "C" fn telemetry_entry(_arg: *mut c_void) {
             let _ = d.write(&frame_buf[..nh]);
         }
 
+        // HIL 共享内存直连（SRAM3）：回写 mcu_seq + 执行器 + 诊断区，PC 读回驱动
+        // plant（与 USB HIL_ACTUATOR_CONTROLS 并存，无 USB 时仍可闭环）。
+        #[cfg(feature = "hil")]
+        crate::flyctrl::hil_shmem::shmem_write_back(&est, health, armed);
+
         seq = seq.wrapping_add(1);
         if seq == 1 {
             info!(tag: "telem", "first loop done; armed={}", armed);

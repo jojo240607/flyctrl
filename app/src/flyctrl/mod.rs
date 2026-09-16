@@ -24,6 +24,8 @@
 //! 不实际发起读事务，避免拖垮采样线程。
 
 pub mod control;
+#[cfg(feature = "hil")]
+pub mod hil_shmem;
 pub mod sensors_task;
 pub mod telemetry;
 pub mod uplink;
