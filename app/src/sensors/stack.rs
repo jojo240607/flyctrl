@@ -30,7 +30,7 @@ pub type RcSource = crate::sensors::sim::VirtualRc;
 pub type MagSource = crate::sensors::sim::VirtualMag;
 
 #[cfg(feature = "real-sensors")]
-pub type ImuSource = crate::sensors::imu::ImuMpu6050;
+pub type ImuSource = crate::sensors::imu::ImuBmi088;
 #[cfg(feature = "real-sensors")]
 pub type BaroSource = crate::sensors::baro::BaroBmp280;
 #[cfg(feature = "real-sensors")]
@@ -77,7 +77,7 @@ impl SensorStack {
             // 探测/打开失败 → None（传感器缺失/断线），不 panic；health() 报 false
             // 由 FDIR 降级（历史：ImuMpu6050 唤醒写 NACK 直接 expect panic，启动即崩）。
             Self {
-                imu: crate::sensors::imu::ImuMpu6050::new("i2c0", 0x68),
+                imu: crate::sensors::imu::ImuBmi088::new("bmi088"),
                 baro: crate::sensors::baro::BaroBmp280::new("i2c0", 0x76),
                 gps: crate::sensors::gps::GpsUblox::new("uart1"),
                 rc: crate::sensors::rc::RcSbus::new("uart2"),
