@@ -312,7 +312,25 @@ impl Estimator for EkfEstimator {
                 } else {
                     ((cos_t - 0.90) / 0.10).clamp(0.0, 1.0)
                 };
-                let k = self.att_alpha * 0.5 * w * w_align;
+                // 陀螺幅值门控：机动/协调转弯时关闭重力锚定。
+                // 协调转弯的向心加速度由 roll 平衡 → 比力方向≈竖直（幅值≈g），
+                // 幅值/方向门控都无法区分"水平加速"与"重力"——锚定会把协调转弯
+                // 的 roll 错误拉向 0（虚拟外设实测稳态 2.2° vs 真值 27°）。|omega|
+                // 大 → 关闭锚定（纯陀螺积分跟踪机动姿态）；悬停/平稳（|omega|≈
+                // 陀螺噪声量级）→ 全锚定（抑制纯陀螺积分漂移）。
+                let om = sqrt(
+                    imu.gyro[0].0 * imu.gyro[0].0
+                        + imu.gyro[1].0 * imu.gyro[1].0
+                        + imu.gyro[2].0 * imu.gyro[2].0,
+                );
+                let w_gyro = if om < 0.25 {
+                    1.0
+                } else if om < 0.6 {
+                    (0.6 - om) / 0.35
+                } else {
+                    0.0
+                };
+                let k = self.att_alpha * 0.5 * w * w_align * w_gyro;
                 // 把估计重力向量 down_body 锚定到【真实重力方向】，即比力的反方向 (-a)。
                 // 修正轴 = down_body × (-a/an)：n 为垂直于二者的旋转轴，
                 // 右乘（机体系）dq 使 down_body 旋转向 -a，姿态向水平收敛。
