@@ -72,6 +72,9 @@ impl SensorFrame {
 }
 
 /// 最新估计状态 + 健康（control 写、telemetry/monitor 读）。
+///
+/// `#[repr(C)]`：布局固定（与 [`VehicleState`] 同为外部内存读取寻址）。
+#[repr(C)]
 pub struct EstState {
     pub est: VehicleState,
     pub health: Health,

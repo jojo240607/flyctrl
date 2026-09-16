@@ -83,6 +83,18 @@ where
     pub hil_att_inited: bool,
     /// HIL 位置初始化门控：首个有限设定点到达、EKF 位置对齐物理真值后置位。
     pub hil_pos_inited: bool,
+    /// 气压高度基准（m，向上为正）：GPS 首次有效定位（fix）时锁定，此后
+    /// `update_alt` 观测用 `baro_alt - baro_ref`（相对量）与 posD 同基准。
+    ///
+    /// 背景：`update_alt` 把气压高度当作 posD（NED 下向）的绝对观测（z=-alt），
+    /// 而 posD 原点实为 GPS NED 原点（起飞点绝对高度，如 4m）——baro 绝对高度
+    /// 与 GPS 相对原点高度基准不一致 → 双观测冲突，EKF 高度收敛到加权偏置
+    /// （虚拟外设实测：真值 0m、baro/GPS 均 4m 时稳态 posD ≈ -3.1m）。fix 时刻
+    /// 的 baro 高度即真实绝对高度，锁为基准后两者一致。fix 前 baro_ref=0，
+    /// 行为与旧版一致（baro 绝对高度直接观测）。
+    pub baro_ref: f32,
+    /// `baro_ref` 是否已锁定（首次 GPS fix 置位，之后不再变更）。
+    pub baro_locked: bool,
     /// 最近一帧**真实** IMU（sample-and-hold 回退源）。
     ///
     /// HIL 中 PC 每 ~32ms 才注入一帧 HIL_SENSOR，而本步 4ms 一拍，注入间隔内
@@ -131,6 +143,8 @@ where
             failsafe_engaged: false,
             hil_att_inited: false,
             hil_pos_inited: false,
+            baro_ref: 0.0,
+            baro_locked: false,
             last_real_imu: None,
             // 陷波 @40Hz、Q=5：带宽 8Hz（36~44Hz）覆盖振动能量集中带；
             // 低通截止对齐姿态环带宽之上（accel 20Hz，Butterworth）：衰减 accel 白噪声，
@@ -388,7 +402,12 @@ where
         // → 注入饥饿时 SimImu 反向重力把高度估计拖低（实测 5.99m vs 3.42m 滞后
         // 2.5m → 位置环加推 → 物理爬升 → 发散）。
         if let Some(alt) = baro_alt {
-            self.est.update_alt(alt);
+            // GPS 首次有效定位时锁定气压基准（与 GPS NED 原点对齐，见字段注释）。
+            if gps.is_some() && !self.baro_locked {
+                self.baro_ref = alt;
+                self.baro_locked = true;
+            }
+            self.est.update_alt(alt - self.baro_ref);
         }
         // VIO/RTK 多源融合（P3-B1）：与 `HilContext::step` 旧路径保持一致——SIL 注入
         // 模拟 VIO/RTK 观测（含噪声），MCU HIL 无此通道则传 None（`update_vio`/

@@ -12,6 +12,7 @@ use crate::vehicle::{ImuSample, Ned};
 
 /// 传感器健康等级。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
 pub enum Health {
     /// 正常。
     Nominal,

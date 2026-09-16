@@ -90,6 +90,12 @@ impl core::ops::Mul for Quaternion {
 }
 
 /// 飞行器完整运动状态（世界系 NED：北-X，东-Y，下-Z）。
+///
+/// `#[repr(C)]`：布局固定为字段声明顺序，供跨语言/外部内存读取
+/// （mcu_simulater 环境测试、真机调试器、共享内存诊断区）稳定寻址——
+/// 此前 `repr(Rust)` 布局未定义，编译器实测把 `att` 重排到 `+0`，
+/// 外部按源码顺序读取会错位（time_boot_ms 读到 1.0f32）。
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VehicleState {
     /// 系统启动以来的启动时长（ms），MAVLink 多消息 time_boot_ms 字段共用，便于地面站对齐时序。
