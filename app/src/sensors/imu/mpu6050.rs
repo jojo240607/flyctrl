@@ -23,14 +23,16 @@ impl ImuMpu6050 {
 
     pub fn new(bus_name: &str, addr: u16) -> Option<Self> {
         let bus = Device::open(bus_name)?;
-        let s = Self { bus, addr, healthy: true };
+        let mut s = Self { bus, addr, healthy: true };
         // 唤醒（清零 PWR_MGMT_1 的 SLEEP 位）
         let mut tx = [Self::PWR_MGMT_1, 0x00];
         let mut w = I2cXfer { addr, buf: tx.as_mut_ptr(), len: 2, result: 0 };
         if s.bus.ioctl(ioctl::I2C_IOCTL_MASTER_WRITE, &mut w as *mut I2cXfer as *mut c_void) != 0
             || w.result != 0
         {
-            return None;
+            // 传感器无响应（断线/未上电/NACK）：总线已在，降级创建（healthy=false）。
+            // 后续 read 返回零值、healthy()=false → FDIR 降级，而非启动 panic。
+            s.healthy = false;
         }
         Some(s)
     }
