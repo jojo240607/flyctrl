@@ -20,6 +20,13 @@ impl BaroBmp280 {
     pub fn new(bus_name: &str, addr: u16) -> Option<Self> {
         let bus = Device::open(bus_name)?;
         // 简化：假设传感器已配置为正常模式（CTRL_MEAS 由 board/初始化完成）。
+        // [I2C DMA] 总线切换 STREAM_MODE_DMA：驱动层事务经 DMA 引擎搬运（固件
+        // SET_MODE + 模拟器 I2cDma 事件 → DMA1 流）；失败则保持 POLL（不阻塞启动）。
+        let mode = rtos_app_sdk::ioctl::STREAM_MODE_DMA;
+        let _ = bus.ioctl(
+            rtos_app_sdk::ioctl::STREAM_IOCTL_SET_MODE,
+            &mode as *const u32 as *mut core::ffi::c_void,
+        );
         Some(Self { bus, addr, healthy: true })
     }
 

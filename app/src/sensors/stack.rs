@@ -78,10 +78,10 @@ impl SensorStack {
             // 由 FDIR 降级（历史：ImuMpu6050 唤醒写 NACK 直接 expect panic，启动即崩）。
             Self {
                 imu: crate::sensors::imu::ImuBmi088::new("bmi088"),
-                baro: crate::sensors::baro::BaroBmp280::new("i2c0", 0x76),
+                baro: crate::sensors::baro::BaroBmp280::new("i2c2", 0x76),
                 gps: crate::sensors::gps::GpsUblox::new("uart1"),
                 rc: crate::sensors::rc::RcSbus::new("uart2"),
-                mag: crate::sensors::mag::MagQmc5883::new("i2c0", 0x0D),
+                mag: crate::sensors::mag::MagQmc5883::new("i2c2", 0x0D),
             }
         }
     }

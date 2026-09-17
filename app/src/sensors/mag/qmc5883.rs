@@ -16,7 +16,15 @@ impl MagQmc5883 {
     const DATA_X_L: u8 = 0x00;
 
     pub fn new(bus_name: &str, addr: u16) -> Option<Self> {
-        Device::open(bus_name).map(|bus| Self { bus, addr, healthy: true })
+        Device::open(bus_name).map(|bus| {
+            // [I2C DMA] 总线切换 STREAM_MODE_DMA（失败保持 POLL，不阻塞启动）。
+            let mode = rtos_app_sdk::ioctl::STREAM_MODE_DMA;
+            let _ = bus.ioctl(
+                rtos_app_sdk::ioctl::STREAM_IOCTL_SET_MODE,
+                &mode as *const u32 as *mut core::ffi::c_void,
+            );
+            Self { bus, addr, healthy: true }
+        })
     }
 
     pub fn read_raw(&self) -> Option<[f32; 3]> {
