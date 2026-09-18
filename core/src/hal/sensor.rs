@@ -185,7 +185,7 @@ impl AirspeedSensor for MockAirspeed {
         let noise = crate::math::sin(self.t * 50.0) * 0.05;
         Some(AirspeedSample {
             speed: Airspeed((self.speed + noise).max(0.0)),
-            timestamp_s: self.t as f64,
+            timestamp_s: self.t,
         })
     }
     fn healthy(&self) -> bool { self.healthy }

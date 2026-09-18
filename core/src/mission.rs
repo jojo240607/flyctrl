@@ -279,7 +279,7 @@ impl<const N: usize> MissionRunner<N> {
         } else {
             let dx = goal[0].0 - self.target[0].0;
             let dy = goal[1].0 - self.target[1].0;
-            let dh = libm::sqrtf(dx * dx + dy * dy).max(1e-6);
+            let dh = crate::math::sqrt(dx * dx + dy * dy).max(1e-6);
             (
                 dx / dh * self.max_speed.0,
                 dy / dh * self.max_speed.0,

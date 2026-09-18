@@ -78,7 +78,7 @@ impl Quaternion {
     pub fn pitch(self) -> f32 {
         let (w, x, y, z) = (self.w, self.x, self.y, self.z);
         let v = 2.0 * (w * y - z * x);
-        crate::math::asin(libm::fmaxf(-1.0, libm::fminf(1.0, v)))
+        crate::math::asin((-1.0f32).max((1.0f32).min(v)))
     }
 }
 
@@ -142,7 +142,7 @@ impl Ned {
     pub fn horizontal(&self, other: Ned) -> f32 {
         let dn = self.0[0].0 - other.0[0].0;
         let de = self.0[1].0 - other.0[1].0;
-        libm::sqrtf(dn * dn + de * de)
+        crate::math::sqrt(dn * dn + de * de)
     }
 }
 
@@ -180,7 +180,7 @@ impl PosSample {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AirspeedSample {
     pub speed: Airspeed,
-    pub timestamp_s: f64,
+    pub timestamp_s: f32,
 }
 
 /// 视觉里程计（VIO）单次测量：机载相机 + IMU 融合出的**相对**运动增量。

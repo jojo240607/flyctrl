@@ -269,9 +269,9 @@ impl Controller for PidController {
 
         // 关键：机体倾斜后推力竖直分量 = T·cos(φ)，必须按 1/cos(φ) 放大总推力，
         // 否则一倾斜就掉高 -> 高度环进一步减推力 -> 死亡螺旋翻滚。
-        let tilt_mag = libm::sqrtf(tilt_n * tilt_n + tilt_e * tilt_e);
+        let tilt_mag = crate::math::sqrt(tilt_n * tilt_n + tilt_e * tilt_e);
         let cos_tilt = if tilt_mag < 1.55 {
-            libm::cosf(tilt_mag).max(0.2)
+            crate::math::cos(tilt_mag).max(0.2)
         } else {
             0.2
         };

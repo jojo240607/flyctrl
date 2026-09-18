@@ -40,6 +40,11 @@ use rtos_app_sdk::rtos::{spawn_rt, Mutex, Semaphore, RTOS_RT_HARD, RTOS_RT_NONE}
 /// [性能测量] 控制拍计数器（固定 VMA 0x2000F000，测试直读）。见 linker/app.ld。
 #[link_section = ".app_ctrltick"]
 pub static mut CTRL_TICKS: u32 = 0;
+/// [PERF] 控制循环分段标记（0=帧读后 1=设定点后 2=step_hil后 3=PWM后 4=循环末）。
+/// 测试挂写钩子取两次写之间的 retired 差，定位单拍耗时归属。
+#[used]
+#[link_section = ".app_ctrltick"]
+pub static mut CTRL_PHASE: u32 = 0;
 
 /* ===================== 共享数据 ===================== */
 

@@ -179,7 +179,7 @@ impl Controller for TecsController {
         // 稳态顶风（地速→0、v_rel→-wind）时持续顶风倾角抵消风载。
         // 0.5 m/s 以下不激活，避免近悬停数值噪声。
         let vr = self.meas_v_rel;
-        let v_rel_mag = libm::sqrtf(vr[0] * vr[0] + vr[1] * vr[1]);
+        let v_rel_mag = crate::math::sqrt(vr[0] * vr[0] + vr[1] * vr[1]);
         let mut drag_a = [0.0f32; 2];
         if v_rel_mag > 0.5 {
             let k = self.drag_k * v_rel_mag; // k·|v_rel|
@@ -189,14 +189,14 @@ impl Controller for TecsController {
         acc_n += drag_a[0];
         acc_e += drag_a[1];
         self.dbg_airspeed = v_rel_mag;
-        self.dbg_drag_a = libm::sqrtf(drag_a[0] * drag_a[0] + drag_a[1] * drag_a[1]);
+        self.dbg_drag_a = crate::math::sqrt(drag_a[0] * drag_a[0] + drag_a[1] * drag_a[1]);
 
         // --- 垂直环：总能量高度 PI（NED 下 d_eq = d - v_h²/(2g)） ---
         // 比能量 E = g·h + ½v_h²（h=-d 向上），等效高度 h_eq = E/g = h + v_h²/(2g)，
         // 转 NED（d=-h）即 d_eq = d - v_h²/(2g)。期望动能高度用设定点水平速度；
         // 实际动能高度用地速（机体世界系动能，与风无关）。
-        let vh_est = libm::sqrtf(est.vel[0].0 * est.vel[0].0 + est.vel[1].0 * est.vel[1].0);
-        let vh_sp = libm::sqrtf(sp.vel[0].0 * sp.vel[0].0 + sp.vel[1].0 * sp.vel[1].0);
+        let vh_est = crate::math::sqrt(est.vel[0].0 * est.vel[0].0 + est.vel[1].0 * est.vel[1].0);
+        let vh_sp = crate::math::sqrt(sp.vel[0].0 * sp.vel[0].0 + sp.vel[1].0 * sp.vel[1].0);
         let sp_d_eq = sp.pos[2].0 - (vh_sp * vh_sp) / (2.0 * g);
         let est_d_eq = est_d - (vh_est * vh_est) / (2.0 * g);
         let ez = sp_d_eq - est_d_eq; // 能量高度误差（向下正）
@@ -221,9 +221,9 @@ impl Controller for TecsController {
         // --- 期望姿态 + 油门（与 PID 相同映射） ---
         let tilt_n = clampf(acc_n / g, -self.tilt_max, self.tilt_max);
         let tilt_e = clampf(acc_e / g, -self.tilt_max, self.tilt_max);
-        let tilt_mag = libm::sqrtf(tilt_n * tilt_n + tilt_e * tilt_e);
+        let tilt_mag = crate::math::sqrt(tilt_n * tilt_n + tilt_e * tilt_e);
         let cos_tilt = if tilt_mag < 1.55 {
-            libm::cosf(tilt_mag).max(0.2)
+            crate::math::cos(tilt_mag).max(0.2)
         } else {
             0.2
         };

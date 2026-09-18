@@ -90,7 +90,7 @@ pub fn encode_vfr_hud(
     seq: u8,
     out: &mut [u8; MAX_FRAME_LEN],
 ) -> usize {
-    let gnd = libm::sqrtf(state.vel[0].0 * state.vel[0].0 + state.vel[1].0 * state.vel[1].0);
+    let gnd = crate::math::sqrt(state.vel[0].0 * state.vel[0].0 + state.vel[1].0 * state.vel[1].0);
     let heading_cdeg = (state.att.yaw_deg() * 100.0) as i16;
     encode_vfr_hud_raw(gnd, heading_cdeg, throttle_pct, -state.pos[2].0, state.vel[2].0, seq, out)
 }

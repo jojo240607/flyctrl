@@ -108,9 +108,9 @@ pub fn stabilize(rc: &RcInput, est: &VehicleState, p: &ManualParams) -> Actuator
     // 垂直速度环：期望爬升率 - 实测 → 期望下垂加速度 → 推力（符号同 pid.rs）。
     let acc_d = p.kv_z * (vz_des - est.vel[2].0);
     // 倾斜后按 1/cos(φ) 放大总推力，避免一倾斜就掉高（同 pid.rs 防死亡螺旋）。
-    let tilt_mag = libm::sqrtf(roll_t * roll_t + pitch_t * pitch_t);
+    let tilt_mag = crate::math::sqrt(roll_t * roll_t + pitch_t * pitch_t);
     let cos_tilt = if tilt_mag < 1.55 {
-        libm::cosf(tilt_mag).max(0.2)
+        crate::math::cos(tilt_mag).max(0.2)
     } else {
         0.2
     };

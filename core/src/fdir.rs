@@ -103,7 +103,7 @@ impl Fdir {
         // （如全 0 或噪声断流），故冻结判据要求：(a) 连续不变；(b) 加速度范数明显
         // 偏离"合理静态重力区间"（[6, 14] m/s²，覆盖失重/过载/断流等异常）。
         let a = [imu.accel[0].0, imu.accel[1].0, imu.accel[2].0];
-        let norm = libm::sqrtf(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
+        let norm = crate::math::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
         let frozen = (norm < 6.0 || norm > 14.0)
             && a[0] == self.last_acc[0]
             && a[1] == self.last_acc[1]
@@ -200,7 +200,7 @@ impl RtlHome {
         if !self.locked { return 1e9; }
         let dx = current.0[0].0 - self.pos.0[0].0;
         let dy = current.0[1].0 - self.pos.0[1].0;
-        libm::sqrtf(dx * dx + dy * dy)
+        crate::math::sqrt(dx * dx + dy * dy)
     }
 }
 

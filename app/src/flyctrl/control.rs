@@ -161,6 +161,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         // 指令解锁：与地面站上行命令做逻辑或（RC 解锁 或 指令解锁 任一为真）。
         let cmd_armed = crate::flyctrl::uplink::G_CMD_ARMED.load(Ordering::Relaxed);
         let armed_eff = armed || cmd_armed;
+        unsafe { crate::flyctrl::CTRL_PHASE = 0; }
         if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: sen-mtx got"); }
 
         // 地面站 RC 通道覆盖（RC_CHANNELS_OVERRIDE）：生效时以地面站通道优先于 sim RC。
@@ -305,6 +306,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
             }
         };
 
+        unsafe { crate::flyctrl::CTRL_PHASE = 1; }
         // --- 共享单步（SIL/HIL 同一份编排，见 `flyctrl_core::hil::step_hil`） ---
         // IMU 单次消费已在上方 SENSOR_FRAME 读取时完成（HIL 下 `f.imu = None`）；
         // SimImu 回退、姿态/位置初始化门控、EKF 估计 + 气压观测、FDIR、控制环健康闸、
@@ -316,6 +318,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         let health = r.health;
         let cmd = r.cmd;
         last_est = Some(est);
+        unsafe { crate::flyctrl::CTRL_PHASE = 2; }
 
         // 解锁瞬间锁定高度基准（armed_eff = RC 解锁 或 地面站 COMMAND_LONG 解锁）
         if armed_eff && !alt_locked {
@@ -347,6 +350,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
                 if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: pwm{} rc={} ticks={}", i, rc, ticks); }
             }
         }
+        unsafe { crate::flyctrl::CTRL_PHASE = 3; }
         if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: after pwm"); }
         if VERBOSE && seq == 0 {
             let ec = unsafe { EST_MTX.debug_count() };
@@ -414,6 +418,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         // 差异（93.2% 控制拍缺 IMU 回退陈旧数据 → 姿态发散）。非 HIL 保持 4ms 周期轮询。
         #[cfg(feature = "hil")]
         unsafe { HIL_EVT.wait(); }
+        unsafe { crate::flyctrl::CTRL_PHASE = 4; }
         #[cfg(not(feature = "hil"))]
         delay_until(&mut wake_tick, CONTROL_PERIOD_TICKS);
         if VERBOSE && seq < 5 {
