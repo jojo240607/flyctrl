@@ -37,6 +37,10 @@ use flyctrl_core::units::{Meter, MeterPerSecond, RadianPerSecond};
 use rtos_app_sdk::abi::RTOS_PRIO_BH_HIGH;
 use rtos_app_sdk::rtos::{spawn_rt, Mutex, Semaphore, RTOS_RT_HARD, RTOS_RT_NONE};
 
+/// [性能测量] 控制拍计数器（固定 VMA 0x2000F000，测试直读）。见 linker/app.ld。
+#[link_section = ".app_ctrltick"]
+pub static mut CTRL_TICKS: u32 = 0;
+
 /* ===================== 共享数据 ===================== */
 
 /// 最新传感器样本帧（sensors 写、control 读）。mag 缺失时为 None。

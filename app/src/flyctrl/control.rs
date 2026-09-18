@@ -113,6 +113,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         // （实测注入恒定陀螺 1.0rad/s、SysTick 走 1000ms，EKF 姿态只积到 0.407rad →
         // 实际周期 ~9.8ms）。EKF/控制若用常量 dt=4ms，会按标称拍数积分而系统性少积。
         // 这里用「本轮与上轮的 tick 差」作真实 dt，拍率变化时估计/积分仍正确。
+        unsafe { crate::flyctrl::CTRL_TICKS = crate::flyctrl::CTRL_TICKS.wrapping_add(1); }
         let now_ticks = tick_count();
         let dt_ms = now_ticks.wrapping_sub(last_ticks).clamp(1, 50) as f32;
         last_ticks = now_ticks;
