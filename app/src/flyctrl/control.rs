@@ -17,7 +17,7 @@ use rtos_app_sdk::device::Device;
 use rtos_app_sdk::ioctl;
 use rtos_app_sdk::{info, warn};
 #[cfg(not(feature = "hil"))]
-use rtos_app_sdk::rtos::msleep;
+use rtos_app_sdk::rtos::{msleep, tick_count};
 use core::sync::atomic::Ordering;
 
 /// 诊断开关：开启后会在启动前几圈打印大量 dbg 行，极易压垮开机瞬间的
@@ -105,8 +105,18 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
     }
 
     let mut first = true;
+    let mut last_ticks = tick_count();
     loop {
-        let _dt = Second(4.0 / 1000.0);
+        // 实测控制周期（RTOS tick = 1ms）：控制/EKF 的工作量常超 4ms 预算，实际拍率会掉
+        // （实测注入恒定陀螺 1.0rad/s、SysTick 走 1000ms，EKF 姿态只积到 0.407rad →
+        // 实际周期 ~9.8ms）。EKF/控制若用常量 dt=4ms，会按标称拍数积分而系统性少积。
+        // 这里用「本轮与上轮的 tick 差」作真实 dt，拍率变化时估计/积分仍正确。
+        let now_ticks = tick_count();
+        let dt_ms = now_ticks.wrapping_sub(last_ticks).clamp(1, 50) as f32;
+        last_ticks = now_ticks;
+        let dt = Second(dt_ms / 1000.0);
+        hil.dt = dt;
+        let _dt = dt;
         // 应用地面站参数（每周期原子读 G_PARAM_VALS -> pid 增益；PARAM_SET 即时生效）。
         crate::flyctrl::uplink::sync_gains_to_pid(&mut hil.ctrl);
         if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: loop enter"); }
