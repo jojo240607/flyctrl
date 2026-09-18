@@ -143,7 +143,7 @@ pub static mut HIL_EVT: Semaphore = Semaphore::uninit();
 
 /* ===================== 任务栈 ===================== */
 
-const STACK_CTRL: usize = 12288; // 控制律含 EKF+PID：EKF step 各更新函数有 4x400B 局部矩阵（a/ap/apat/krkt=1.6KB）
+const STACK_CTRL: usize = 8192; // 控制律含 EKF+PID：EKF step 各更新函数有 4x400B 局部矩阵（a/ap/apat/krkt=1.6KB）
                                // + propagate 1.2KB + 对象本身与调用链，峰值实测 >3KB；3072 时栈溢出→返回地址
                                // 被数据覆盖→UsageFault(UNDEFINSTR/INVSTATE)→USB EP0 失服→HIL 端口 SetCommState 超时。
                                // 8KB 含 GPS 更新路径余量充足（APP_RAM 余 ~103KB）。

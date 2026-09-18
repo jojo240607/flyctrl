@@ -49,11 +49,6 @@ pub struct PidController {
     // 阶段 11-A：EKF 估计的垂直速度/位置一阶低通（EMA）状态，滤除 IMU 高频噪声。
     // 噪声经 EKF 估计后直接驱动油门会导致悬停发散；LPF 时间常数由 vel_lpf_tau 控制（0=不过滤）。
     vel_lpf_tau: f32,
-    /// 速率环（内环 omega）一阶低通时间常数（s）。omega = EKF 的 gyro-bias，其噪声
-    /// 直达内环 D 项会自激（x_hover_noise 实测 w_y ±1.4、电机差动饱和）。0=不过滤。
-    rate_lpf_tau: f32,
-    filt_w: [f32; 3], // 滤波后的机体角速度
-    rate_filt_init: bool,
     filt_vd: f32,   // 滤波后的垂直速度（NED，向下正）
     filt_d: f32,    // 滤波后的垂直位置（NED，向下正）
     filt_init: bool, // 首帧直接赋值避免启动瞬态
@@ -141,9 +136,6 @@ impl PidController {
                       // 反而更小（0.094m vs 0.131m），稳态偏差均≈0，未牺牲抗风性能
             iz: 0.0,
             vel_lpf_tau: 0.15,
-            rate_lpf_tau: 0.02, // 50Hz：抑噪为主，相位滞后小
-            filt_w: [0.0; 3],
-            rate_filt_init: false,
             filt_vd: 0.0,
             filt_d: 0.0,
             filt_init: false,
@@ -304,28 +296,12 @@ impl Controller for PidController {
         // 复用共享姿态内环 `attitude::attitude_rates`（P3-A3 提取，与 TECS 完全一致）。
         // 含：q_err = q_est^-1 ⊗ q_des、误差旋转向量 ≈ 2·sign(w)·(x,y,z)、
         //     期望机体角速度 = Kp_att·误差向量 - Kd_att·当前角速度（阻尼）。
-        // 速率环低通：omega 直接来自 EKF(gyro-bias)，噪声直达内环 D 项会自激。
-        // 一阶低通 rate_lpf_tau（0=不过滤）。首帧直接赋值避免启动瞬态。
-        let omega_f = if self.rate_lpf_tau > 0.0 {
-            let a = (dt / (self.rate_lpf_tau + dt)).clamp(0.0, 1.0);
-            if !self.rate_filt_init {
-                self.filt_w = [est.omega[0].0, est.omega[1].0, est.omega[2].0];
-                self.rate_filt_init = true;
-            } else {
-                for k in 0..3 {
-                    self.filt_w[k] += a * (est.omega[k].0 - self.filt_w[k]);
-                }
-            }
-            self.filt_w
-        } else {
-            [est.omega[0].0, est.omega[1].0, est.omega[2].0]
-        };
         let att_out = super::attitude::attitude_rates(
             est.att,
             q_des,
             self.att_kp,
             self.att_kd,
-            omega_f,
+            [est.omega[0].0, est.omega[1].0, est.omega[2].0],
         );
         self.dbg_err = att_out.err;
         self.dbg_pqr = att_out.rates;
@@ -353,8 +329,6 @@ impl Controller for PidController {
         // 阶段 11-A：重置 EMA 滤波状态，避免跨任务/重启残留
         self.filt_vd = 0.0;
         self.filt_d = 0.0;
-        self.filt_w = [0.0; 3];
-        self.rate_filt_init = false;
         self.filt_init = false;
         self.dbg_step = 0;
     }
