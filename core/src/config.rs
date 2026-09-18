@@ -48,6 +48,10 @@ pub struct VehicleConfig {
     pub rotor_downwash_coupling: f32,
     /// 机体阻力系数（前/右/下三轴，N/(m/s)^2），描述机身/机臂外露气动阻力。
     pub drag_coeff: [f32; 3],
+    /// 转动气动阻尼系数（机体 roll/pitch/yaw 三轴，N·m·s/rad）。真实四旋翼的
+    /// 螺旋桨/机体角阻尼；等价角速度时间常数 τ_i = inertia_i / angular_drag_i
+    /// （默认 ~0.3s）。仿真侧在 `step()` 以 τ = -c·ω_body 施加。0 关闭该项。
+    pub angular_drag: [f32; 3],
     /// 诱导阻力系数（无量纲），旋翼向下诱导速度产生的附加阻力。
     pub induced_drag_coeff: f32,
     /// 桨盘面积 (m^2)，动量理论诱导速度计算用。
@@ -113,6 +117,9 @@ impl VehicleConfig {
             rotor_downwash_coupling: 0.25,
             // 机身/机臂外露阻力（前向略大，向下最小）：N/(m/s)^2 × v^2
             drag_coeff: [0.18, 0.18, 0.10],
+            // 转动气动阻尼：真实螺旋桨/机体角阻尼，角速度时间常数 ~0.3s
+            // → c = inertia/0.3 = [0.02,0.02,0.04]/0.3 = [0.067,0.067,0.133]
+            angular_drag: [0.20, 0.20, 0.40],
             // 诱导阻力：与总推力平方根成正比（动量理论），无量纲标定
             induced_drag_coeff: 0.12,
             // 450mm 四旋翼等效桨盘面积（4× 桨盘），约 0.19 m^2
