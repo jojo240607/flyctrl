@@ -17,7 +17,9 @@ use rtos_app_sdk::device::Device;
 use rtos_app_sdk::ioctl;
 use rtos_app_sdk::{info, warn};
 #[cfg(not(feature = "hil"))]
-use rtos_app_sdk::rtos::{msleep, tick_count};
+use rtos_app_sdk::rtos::msleep;
+// 控制循环用 tick_count 量实测周期（HIL/非 HIL 都要）
+use rtos_app_sdk::rtos::tick_count;
 use core::sync::atomic::Ordering;
 
 /// 诊断开关：开启后会在启动前几圈打印大量 dbg 行，极易压垮开机瞬间的
