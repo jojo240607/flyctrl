@@ -17,7 +17,7 @@ use rtos_app_sdk::device::Device;
 use rtos_app_sdk::ioctl;
 use rtos_app_sdk::{info, warn};
 #[cfg(not(feature = "hil"))]
-use rtos_app_sdk::rtos::msleep;
+use rtos_app_sdk::rtos::delay_until;
 // 控制循环用 tick_count 量实测周期（HIL/非 HIL 都要）
 use rtos_app_sdk::rtos::tick_count;
 use core::sync::atomic::Ordering;
@@ -45,6 +45,10 @@ const RTL_ARRIVE_RADIUS: f32 = 1.0;
 /// LOITER：RC 摇杆叠加的水平微调速度 (m/s 满偏)。
 #[cfg(not(feature = "hil"))]
 const LOITER_NUDGE_GAIN: f32 = 0.3;
+/// 控制周期（RTOS tick = 1ms）。配合 `delay_until` 做**绝对节拍**：周期恒为 4ms，
+/// 不随控制体执行时间 / 被占用时间漂移（相对 msleep(4) 实测被拉长到 ~6.1ms）。
+#[cfg(not(feature = "hil"))]
+const CONTROL_PERIOD_TICKS: u32 = 4;
 #[cfg(feature = "hil")]
 use crate::flyctrl::HIL_EVT;
 use crate::flyctrl::{make_name, EST_MTX, EST_STATE, SENSOR_FRAME, SENSOR_SEQ};
@@ -108,6 +112,9 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
 
     let mut first = true;
     let mut last_ticks = tick_count();
+    // 绝对节拍基准（仅非 HIL；HIL 由 HIL_EVT 事件驱动，不用节拍）。
+    #[cfg(not(feature = "hil"))]
+    let mut wake_tick = last_ticks;
     loop {
         // 实测控制周期（RTOS tick = 1ms）：控制/EKF 的工作量常超 4ms 预算，实际拍率会掉
         // （实测注入恒定陀螺 1.0rad/s、SysTick 走 1000ms，EKF 姿态只积到 0.407rad →
@@ -408,7 +415,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         #[cfg(feature = "hil")]
         unsafe { HIL_EVT.wait(); }
         #[cfg(not(feature = "hil"))]
-        msleep(4);
+        delay_until(&mut wake_tick, CONTROL_PERIOD_TICKS);
         if VERBOSE && seq < 5 {
             info!(tag: "ctrl", "dbg: after sleep seq={}", seq);
         }

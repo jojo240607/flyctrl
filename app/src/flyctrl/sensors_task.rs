@@ -53,6 +53,8 @@ impl Sensors {
 
         let mut first = true;
         let mut loop_cnt: u32 = 0;
+        // 绝对节拍基准：周期恒为 sample_dt，不被 control 抢占"吸附"。
+        let mut wake_tick = rtos_app_sdk::rtos::tick_count();
         // GPS 样本保持：真实 GPS 20Hz 帧，两次帧之间 read_gps 返回 None；若每拍
         // 直接把 None 写进 SENSOR_FRAME，control(4ms) 只在 2ms Some 窗口内读到样本
         // （约一半拍），FDIR 的 pos_available 大面积 false → gps_lost_steps 累积
@@ -126,11 +128,7 @@ impl Sensors {
             }
             loop_cnt += 1;
 
-            unsafe {
-                if let Some(f) = g_app_slot.msleep {
-                    f((sample_dt * 1000.0) as u32);
-                }
-            }
+            rtos_app_sdk::rtos::delay_until(&mut wake_tick, (sample_dt * 1000.0) as u32);
         }
     }
 }
