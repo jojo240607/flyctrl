@@ -143,7 +143,7 @@ pub static mut HIL_EVT: Semaphore = Semaphore::uninit();
 
 /* ===================== 任务栈 ===================== */
 
-const STACK_CTRL: usize = 8192; // 控制律含 EKF+PID：EKF step 各更新函数有 4x400B 局部矩阵（a/ap/apat/krkt=1.6KB）
+const STACK_CTRL: usize = 12288; // 控制律含 EKF+PID：EKF step 各更新函数有 4x400B 局部矩阵（a/ap/apat/krkt=1.6KB）
                                // + propagate 1.2KB + 对象本身与调用链，峰值实测 >3KB；3072 时栈溢出→返回地址
                                // 被数据覆盖→UsageFault(UNDEFINSTR/INVSTATE)→USB EP0 失服→HIL 端口 SetCommState 超时。
                                // 8KB 含 GPS 更新路径余量充足（APP_RAM 余 ~103KB）。
@@ -151,13 +151,13 @@ const STACK_SENS: usize = 3584; // 采样含回放+帧拷贝：实测峰值 > 30
 const STACK_TELEM: usize = 4096; // 遥测 encode 3 个 MAVLink 帧(heartbeat/local_pos/sys_status)栈使用大，1024 疑似栈溢出导致 telem 卡住不写 usb0，提到 4096
 const STACK_UPLINK: usize = 4096; // 上行 poll_read+feed+decode 栈使用大，实测 1024 栈溢出导致系统 fault，提到 4096
 
-#[link_section = ".rust_bss"]
+#[link_section = ".app_stacks"]
 static mut STACK_CTRL_BUF: [u8; STACK_CTRL] = [0u8; STACK_CTRL];
-#[link_section = ".rust_bss"]
+#[link_section = ".app_stacks"]
 static mut STACK_SENS_BUF: [u8; STACK_SENS] = [0u8; STACK_SENS];
-#[link_section = ".rust_bss"]
+#[link_section = ".app_stacks"]
 static mut STACK_TELEM_BUF: [u8; STACK_TELEM] = [0u8; STACK_TELEM];
-#[link_section = ".rust_bss"]
+#[link_section = ".app_stacks"]
 static mut STACK_UPLINK_BUF: [u8; STACK_UPLINK] = [0u8; STACK_UPLINK];
 
 /* ===================== 启动 ===================== */
