@@ -20,6 +20,7 @@ pub mod fdir;
 pub mod bus;
 pub mod flightmode;
 pub mod hil;
+pub mod perf;
 pub mod invariants;
 pub mod mission;
 pub mod swarm;

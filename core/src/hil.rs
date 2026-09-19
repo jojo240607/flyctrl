@@ -126,6 +126,8 @@ where
     pub imu_gyro_notch: [Biquad; 3],
 }
 
+use crate::perf::probe;
+
 impl<E, C> HilContext<E, C>
 where
     E: Estimator,
@@ -321,6 +323,7 @@ where
         rc_fresh: bool,
         sim_imu: &mut SimImu,
     ) -> StepResult {
+        probe(0); // 进入 step_hil
         // 1) IMU：有真实帧用真实帧（单次消费由调用方保证），无则回退最近真实帧
         //    （sample-and-hold，角速度继续积分、比力继续锚定）；从未收到真实帧
         //    （链路未建立）才回退 SimImu（零陀螺，不外推）。
@@ -357,6 +360,8 @@ where
                 .last_real_imu
                 .unwrap_or_else(|| sim_imu.next(self.dt.0)),
         };
+
+        probe(1); // IMU 预处理（陷波/低通滤波）完成
 
         // 2) 姿态初始化门控：仅当本拍拿到**真实** IMU 帧才做 tilt alignment。
         //    悬停/静止时比力 a=(0,0,-9.81)（FRD，z 向下），重力方向即 -a：
@@ -395,8 +400,11 @@ where
             self.hil_pos_inited = true;
         }
 
+        probe(2); // 姿态/位置初始化门控完成
+
         // 4) 状态估计（predict-then-correct；HIL 无空速通道 → airspeed=None）。
         let est_state = self.est.step(self.dt, imu_sample, gps, None);
+        probe(3); // EKF 预测+更新完成
         // 气压高度观测（垂直通道最紧锚）：在 step 之后注入（predict-then-correct），
         // 下一拍预测从修正后状态出发。此前 baro 只进 FDIR、垂直通道仅靠 GPS 锚定
         // → 注入饥饿时 SimImu 反向重力把高度估计拖低（实测 5.99m vs 3.42m 滞后
@@ -417,6 +425,7 @@ where
         self.est.update_rtk(rtk);
         // 磁力计航向锚定（EKF yaw 观测；None 时无动作，其他估计器默认 no-op）。
         self.est.update_mag(mag);
+        probe(4); // 外部观测（baro/vio/rtk/mag）注入完成
 
         // 5) FDIR 健康监控：磁力计可用性由调用方给出（SIL 有磁力计 → true；
         //    MCU HIL 接入时按实机磁力计健康状态传入，不再硬编码 false——
@@ -439,6 +448,7 @@ where
             gyro: imu_sample.gyro,
         };
         let health = self.fdir.update(&fdir_imu, gps.is_some(), baro_alt.is_some(), mag.is_some());
+        probe(5); // FDIR 完成
 
         // 6) 控制环健康闸：估计/设定点含非有限值（NaN/Inf）、未解锁、链路不新鲜、
         //    FDIR 关键故障、或 EKF 尚未完成姿态/位置初始化时输出零指令，阻断 NaN
@@ -480,6 +490,8 @@ where
             ActuatorCmd::zero()
         };
 
+        probe(6); // 健康闸 + 控制律完成
+
         // 7) 执行器限幅（单向记录失控保护）。
         if health == Health::Critical {
             self.failsafe_engaged = true;
@@ -489,6 +501,7 @@ where
             cmd.motor[i] = clamp_thrust(raw_cmd.motor[i]);
         }
 
+        probe(7); // 执行器限幅完成
         StepResult { est: est_state, health, cmd }
     }
 
