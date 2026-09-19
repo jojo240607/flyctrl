@@ -112,11 +112,19 @@ pub extern "C" fn telemetry_entry(_arg: *mut c_void) {
             if kg > 0 { total += kg; }
             total
         };
+        // 一期固件不带机载电脑 → 默认不做 usb0 下行（见 Cargo.toml `usb-link` 说明）。
+        #[cfg(feature = "usb-link")]
         if let Some(d) = usb_dev.as_ref() {
             // usb0 与 uplink 共享：RTOS 侧 TX ring 写无锁（假设单生产者），
             // 必须用 USB_TX_MTX 串行化，否则两任务写帧会在 ring 中交错损坏。
             let _g = unsafe { USB_TX_MTX.guard() };
             wrote_usb = send(d, frame_buf, seq, &est, armed, health != Health::Critical, cmd_mode);
+        }
+        #[cfg(not(feature = "usb-link"))]
+        {
+            // 保持变量被使用，且明确记录"本配置不下行"
+            let _ = (usb_dev.as_ref(), seq, &est, armed, health, cmd_mode);
+            wrote_usb = 0;
         }
 
         // HIL：回传执行器指令（HIL_ACTUATOR_CONTROLS(93)），PC 端仿真器据此驱动 plant。

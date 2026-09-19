@@ -841,7 +841,11 @@ pub extern "C" fn uplink_task(_arg: *mut c_void) {
     let mut loops: u32 = 0;
     loop {
         // 非阻塞轮询 usb0.read + 增量解析 + 路由（RX ring 空时返回 0，不阻塞）。
+        // 一期固件不带机载电脑 → 默认不轮询 usb0（见 Cargo.toml `usb-link` 说明）。
+        #[cfg(feature = "usb-link")]
         tx.poll_read(&mut rx_buf);
+        #[cfg(not(feature = "usb-link"))]
+        let _ = (&tx, &mut rx_buf);
 
         // HIL 共享内存直连（SRAM3）：PC 仿真器每 4ms 写 pc_seq，本任务 1ms 轮询
         // 检测变化后全量注入 SENSOR_FRAME 并唤醒 control。与 USB 注入并存：

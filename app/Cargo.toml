@@ -43,7 +43,18 @@ real-sensors = []
 # 启用硬件在环（HIL）：PC 仿真器经 USB 注入传感器真值（HIL_SENSOR）+ 设定点
 # （SET_POSITION_TARGET_LOCAL_NED），飞控回传执行器指令（HIL_ACTUATOR_CONTROLS）。
 # 与 real-sensors 互斥（HIL 数据源替代传感器采样）；默认关闭。
-hil = []
+# HIL 的传感器真值注入与执行器回传都走 usb0，故隐含 usb-link。
+hil = ["usb-link"]
 # 集成测试：Rust 侧经 g_app_slot 验证 ABI 兼容链路（配合 verify_app.py）。
 integration-test = []
+# 启用 USB CDC 链路（usb0）：telemetry 下行写 + uplink 轮询读。
+#
+# **默认关闭**——一期固件不带机载电脑，机载侧没有 USB 主机消费 IN 传输。
+# 实测（900 步 Turn 场景长跑）：固件一旦经 usb0 收发，控制任务会在运行 8~10s 后
+# 永久阻塞（CTRL_TICKS 停增而 SENSOR_SEQ/g_tick 仍正常）；把 telemetry 的 usb0 写
+# 与 uplink 的 usb0 读都关掉后，控制任务跑满 900 步不卡。USB 通路细节本身开销约 0
+# （三组受控 A/B 实测 +0.5% 退休字节、控制频率逐拍一致），问题在"用了 USB"这一
+# 条件本身，机制待查（见 joc-base usb_tx_pump / console 的每 1ms TX_PUMP）。
+# 接机载电脑的链路放到后续计划，届时打开本 feature 并解决该阻塞。
+usb-link = []
 panic-test = []
