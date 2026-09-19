@@ -91,6 +91,7 @@ version = "0.1.0"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",
+ "fpmath",
  "libm",
  "mavlink-core",
  "stm32f4",
@@ -110,6 +111,12 @@ dependencies = [
  "flyctrl-core",
  "flyctrl-sim",
 ]
+
+[[package]]
+name = "fpmath"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f617488244e3bd5aa86da93efaf4072579a301832ca5a9c7e3493563b509a43d"
 
 [[package]]
 name = "libm"

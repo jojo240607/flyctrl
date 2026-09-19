@@ -8,7 +8,6 @@ license.workspace = true
 # 本 crate 是飞控核心逻辑：单位系统、状态机、估计算法、控制律。
 # 设计为 no_std 友好（不依赖 std/alloc），可在 host 与嵌入式固件间共享。
 [dependencies]
-libm = "0.2"
 
 # 共用 MAVLink v2 编解码核心（帧层 + codec 全消息 + 地面站兼容层）。
 # 单一事实来源：本 crate 不再手搓帧层/编解码，只保留 VehicleState 便捷封装。
@@ -19,6 +18,17 @@ mavlink-core = { path = "../../mavlink-core" }
 stm32f4 = { version = "0.16", features = ["stm32f407"], optional = true }
 cortex-m = { version = "0.7", optional = true }
 cortex-m-rt = { version = "0.7", optional = true }
+# 数学库按【目标平台】分离——固件与 host(SIL) 各用一套，互不牵连：
+#  - 固件（no_std 交叉编译，target_os = "none"）：fpmath，**纯 f32 实现**，
+#    不会把 double 软件运行时拉进固件（libm 的 sinf/cosf/atan2f 内部走 f64）。
+#    用默认的 host_f32（soft-float 会拉进 rustc_apfloat/smallvec，需要 alloc，
+#    固件是零堆 no_std 用不了）。
+#  - host（SIL/单元测试）：libm，宿主有完整 f64，无需担心。
+[target.'cfg(target_os = "none")'.dependencies]
+fpmath = "0.1.1"
+
+[target.'cfg(not(target_os = "none"))'.dependencies]
+libm = "0.2"
 
 [features]
 # 启用具体芯片实现（HAL 的 stm32f407 真实寄存器级驱动）。host/SIL 默认关闭。

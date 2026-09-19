@@ -248,7 +248,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
                     ),
                     // RTL：水平回原点 (0,0) 定高（起飞基准 hold_alt）；水平到位后缓降。
                     COPTER_MODE_RTL => {
-                        let horiz = libm::sqrtf(cur.0 * cur.0 + cur.1 * cur.1);
+                        let horiz = flyctrl_core::math::sqrt(cur.0 * cur.0 + cur.1 * cur.1);
                         let tz = if horiz < RTL_ARRIVE_RADIUS {
                             (cur.2 - LAND_DESCENT_PER_TICK).max(0.0)
                         } else {

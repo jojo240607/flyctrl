@@ -113,9 +113,9 @@ fn main() -> ! {
         let t = (seq as f32) * (LOOP_MS as f32) / 1000.0;
         let imu = ImuSample {
             accel: [
-                MeterPerSecondSquared(0.01 * libm::sinf(t)),
+                MeterPerSecondSquared(0.01 * flyctrl_core::math::sin(t)),
                 MeterPerSecondSquared(0.0),
-                MeterPerSecondSquared(9.8 + 0.01 * libm::cosf(t)),
+                MeterPerSecondSquared(9.8 + 0.01 * flyctrl_core::math::cos(t)),
             ],
             gyro: [RadianPerSecond(0.0); 3],
         };

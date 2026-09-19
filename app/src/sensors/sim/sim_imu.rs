@@ -21,9 +21,9 @@ impl SimImu {
         self.t += dt;
         ImuSample {
             accel: [
-                MeterPerSecondSquared(0.05 * libm::sinf(self.t)),
+                MeterPerSecondSquared(0.05 * flyctrl_core::math::sin(self.t)),
                 MeterPerSecondSquared(0.0),
-                MeterPerSecondSquared(-9.81 + 0.05 * libm::cosf(self.t)),
+                MeterPerSecondSquared(-9.81 + 0.05 * flyctrl_core::math::cos(self.t)),
             ],
             gyro: [RadianPerSecond(0.0); 3],
         }

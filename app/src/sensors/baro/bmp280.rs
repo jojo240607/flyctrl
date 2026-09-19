@@ -39,7 +39,7 @@ impl BaroBmp280 {
         let p = (((raw[0] as u32) << 16) | ((raw[1] as u32) << 8) | (raw[2] as u32)) >> 4;
         let p_pa = p as f32; // 占位：未做校准
         // 气压→高度（ISA 近似，海平面 101325 Pa）
-        let h = 44330.0 * (1.0 - libm::powf(p_pa / 101325.0, 0.1903));
+        let h = 44330.0 * (1.0 - flyctrl_core::math::pow(p_pa / 101325.0, 0.1903));
         Some(Meter(h)) // 向上为正：step_hil 经 update_alt 内部取负转 D 向下状态
     }
 }

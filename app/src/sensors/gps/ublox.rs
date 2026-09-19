@@ -242,8 +242,8 @@ impl GpsUblox {
                     // Doppler 速度：地速(节)×航向(真北顺时针) → NED 北/东分量（下向无观测，置 0）
                     let speed_ms = field_f32(line, 7) * 0.514_444; // knot → m/s
                     let course_rad = field_f32(line, 8).to_radians();
-                    let vn = speed_ms * libm::cosf(course_rad);
-                    let ve = speed_ms * libm::sinf(course_rad);
+                    let vn = speed_ms * flyctrl_core::math::cos(course_rad);
+                    let ve = speed_ms * flyctrl_core::math::sin(course_rad);
                     // RMC 无 alt：复用最近 GGA 海拔，保证位置 D 与 GGA 一致
                     last = Some((lat, lon, self.last_alt, true, Some([vn, ve, 0.0])));
                 }
@@ -345,7 +345,7 @@ impl GpsSensor for GpsUblox {
         let d_lat = (lat - ref_lat) * DEG2RAD;
         let d_lon = (lon - ref_lon) * DEG2RAD;
         let n = d_lat * R_EARTH;
-        let e = d_lon * R_EARTH * libm::cosf(ref_lat * DEG2RAD);
+        let e = d_lon * R_EARTH * flyctrl_core::math::cos(ref_lat * DEG2RAD);
         let d = -(alt - ref_alt); // 向下为正
         match vel {
             // RMC 附带 Doppler 速度：位置 + 速度观测（EKF update_vel 约束水平速度）
