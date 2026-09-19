@@ -57,20 +57,6 @@ fn mat_mul(a: &[f32], b: &[f32], c: &mut [f32], na: usize, nk: usize, nb: usize)
     }
 }
 
-// C = A^T * B (na x nk)^T * (na x nb) -> (nk x nb)
-#[inline]
-fn mat_mul_at(a: &[f32], b: &[f32], c: &mut [f32], na: usize, nk: usize, nb: usize) {
-    for i in 0..nk {
-        for j in 0..nb {
-            let mut s = 0.0f32;
-            for k in 0..na {
-                s += a[k * nk + i] * b[k * nb + j];
-            }
-            c[i * nb + j] = s;
-        }
-    }
-}
-
 #[inline]
 fn mat_add(a: &[f32], b: &[f32], c: &mut [f32], n: usize) {
     for i in 0..n {
@@ -248,6 +234,7 @@ impl Estimator for EkfEstimator {
         // 防御：IMU 输入非有限（HIL 注入异常/总线噪声）直接放弃本拍积分，返回上一状态。
         // 否则 att.integrate(NaN) 会把姿态四元数直接污染为 NaN（历史教训：电机指令 NaN
         // 即由状态/姿态 NaN 传播而来），进而经位置预测/观测更新污染整个状态向量。
+        crate::perf::probe(8); // EKF::step 入口
         let gyro_finite = imu.gyro.iter().all(|g| g.0.is_finite());
         let accel_finite = imu.accel.iter().all(|a| a.0.is_finite());
         if !gyro_finite || !accel_finite {
@@ -371,7 +358,9 @@ impl Estimator for EkfEstimator {
 
         // 协方差预测（独立方法，栈数组作用域限于该方法内，返回后栈槽被回收，
         // 避免与下方观测更新步的栈数组同时存活导致调用方任务栈溢出）。
+        crate::perf::probe(9); // 姿态积分 + 重力锚定完成
         self.predict_cov(dt);
+        crate::perf::probe(10); // 协方差预测完成
 
         // 观测更新（位置 + 可选 Doppler 速度）：H = [I3 0 0]（独立方法，如上拆分）。
         if let Some(z) = gps {
@@ -386,6 +375,8 @@ impl Estimator for EkfEstimator {
         if let Some(a) = airspeed {
             self.update_airspeed(a.speed.0);
         }
+
+        crate::perf::probe(11); // 观测更新（GPS 位置/速度）完成
 
         // 加计零偏（世界 D 轴）物理上界夹取（消费级 IMU 零偏通常 < 0.3 m/s²，真值仅 0.05）。
         // 该状态仅由速度观测（Doppler）驱动，正常收敛不受影响；夹取仅作发散兜底。
@@ -508,18 +499,29 @@ impl EkfEstimator {
         // F = I + A*dt
         // - [pos][vel] = I（位置由速度推进）
         // - [vel][accel_bias] = -R*dt（加计零偏直接影响速度，使其经速度观测可估计）
-        let mut f = [0.0f32; N * N];
-        mat_ident(&mut f);
-        for i in 0..3 {
-            f[i * N + (3 + i)] = dt;
-        }
-        // 垂向速度对世界 D 轴加计零偏 ab_z=x[9] 的偏导 = -1：
-        // az_w = a_world[2] + g - ab_z，故 vel_z_dot 对 ab_z 的偏导为 -1。
-        f[5 * N + 9] = -dt;
+        // F 只有 4 个非单位元（其余为单位阵）：
+        //   F[0][3] = F[1][4] = F[2][5] = dt（pos ← vel）
+        //   F[5][9] = -dt               （vel_z ← accel_bias_z；
+        //                                 az_w = a_world[2] + g - ab_z ⇒ ∂vel_z/∂ab_z = -1）
+        // 因此 Fᵀ·P 只改 4 行、F·(FᵀP) 只改 4 行，用稠密 10³ 乘是白算 25 倍。
+        // 下面按稀疏结构展开，结果与 `mat_mul_at(f,p)` / `mat_mul(f,ft)` 等价。
+        let p = &self.p;
         let mut ft = [0.0f32; N * N];
-        mat_mul_at(&f, &self.p, &mut ft, N, N, N);
+        ft.copy_from_slice(p);
+        // ft = Fᵀ P：row3 += dt·row0, row4 += dt·row1, row5 += dt·row2, row9 -= dt·row5
+        for (dst, src, coef) in [(3usize, 0usize, dt), (4, 1, dt), (5, 2, dt), (9, 5, -dt)] {
+            for j in 0..N {
+                ft[dst * N + j] += coef * p[src * N + j];
+            }
+        }
+        // p_pred = F ft：row0 += dt·row3, row1 += dt·row4, row2 += dt·row5, row5 -= dt·row9
         let mut p_pred = [0.0f32; N * N];
-        mat_mul(&f, &ft, &mut p_pred, N, N, N);
+        p_pred.copy_from_slice(&ft);
+        for (dst, src, coef) in [(0usize, 3usize, dt), (1, 4, dt), (2, 5, dt), (5, 9, -dt)] {
+            for j in 0..N {
+                p_pred[dst * N + j] += coef * ft[src * N + j];
+            }
+        }
         let qv = self.q_vel * dt;
         let qvz = self.q_vel_z * dt;
         let qb = self.q_bias * dt;
@@ -549,6 +551,95 @@ impl EkfEstimator {
             }
         }
         self.p = p_pred;
+    }
+
+    /// 协方差更新步（与原实现的代数**逐项一致**，只是利用观测矩阵的稀疏结构省掉零元乘法）。
+    ///
+    /// 原实现写的是：
+    /// ```text
+    ///   ap   = A * P                    // A = I - K H
+    ///   apat = mat_mul_at(ap, A)        // 注释写 "A P A^T"，但 mat_mul_at(x,y)=x^T*y，
+    ///                                   // 实际算的是 ap^T * A = P A^T A
+    ///   P    = apat + K R K^T ;  再对称化
+    /// ```
+    /// 本方法**复现这个代数**（含对称化），以保证本次改动只带来速度、不改变滤波行为。
+    /// 注：`A = I-KH` 不对称，故 `P A^T A != A P A^T`；教科书 Joseph 形式应为后者。
+    /// 该差异是原实现的潜在缺陷，另行评估（见 `P A^T A` 与 `A P A^T` 的对照测试）。
+    ///
+    /// 稀疏化依据：`H` 是"只在状态列 `c..c+ncols` 上取单位观测"的窄观测矩阵，
+    /// 故 `A` 只在列 `c..c+ncols` 偏离单位阵，`ap` 与 `apat` 都只需 O(N²·ncols)：
+    /// ```text
+    ///   ap[i][j]    = P[i][j] - Σ_l K[i][l]·P[c+l][j]
+    ///   apat[i][j]  = ap[j][i] - [j∈观测列]·g[i][j-c] ,  g = ap^T K
+    /// ```
+    ///
+    /// `k` 为 N×ncols 行主序卡尔曼增益（已限幅/已清零不可观行）。
+    /// `nan_reset`/`clamp_max` 保留各调用点原有的对角处理策略
+    /// （`update_vel_r` 只做下限，位置/气压更新额外夹 P_MAX）。
+    fn joseph_update_cov(
+        &mut self,
+        k: &[f32],
+        ncols: usize,
+        c: usize,
+        r: f32,
+        nan_reset: bool,
+        clamp_max: bool,
+    ) {
+        let p = &self.p;
+        // 1) ap = (I - K H) P
+        let mut ap = [0.0f32; N * N];
+        for i in 0..N {
+            let ki = &k[i * ncols..i * ncols + ncols];
+            for j in 0..N {
+                let mut acc = p[i * N + j];
+                for (l, kl) in ki.iter().enumerate() {
+                    acc -= kl * p[(c + l) * N + j];
+                }
+                ap[i * N + j] = acc;
+            }
+        }
+        // 2) g = ap^T K  （N×ncols）
+        let mut g = [[0.0f32; 3]; N];
+        for i in 0..N {
+            for l in 0..ncols {
+                let mut acc = 0.0f32;
+                for kk in 0..N {
+                    acc += ap[kk * N + i] * k[kk * ncols + l];
+                }
+                g[i][l] = acc;
+            }
+        }
+        // 3) P = apat + K R K^T，apat[i][j] = ap[j][i] - [j 在观测列]·g[i][j-c]
+        for i in 0..N {
+            let ki = &k[i * ncols..i * ncols + ncols];
+            for j in 0..N {
+                let mut acc = ap[j * N + i];
+                if j >= c && j < c + ncols {
+                    acc -= g[i][j - c];
+                }
+                let kj = &k[j * ncols..j * ncols + ncols];
+                for (l, kl) in ki.iter().enumerate() {
+                    acc += r * kl * kj[l];
+                }
+                self.p[i * N + j] = acc;
+            }
+        }
+        // 4) 对称化（消除尾差）+ 对角线处理
+        for i in 0..N {
+            for j in (i + 1)..N {
+                let avg = 0.5 * (self.p[i * N + j] + self.p[j * N + i]);
+                self.p[i * N + j] = avg;
+                self.p[j * N + i] = avg;
+            }
+            let d = self.p[i * N + i];
+            if nan_reset && !d.is_finite() {
+                self.p[i * N + i] = 1e-6; // 非有限(NaN/Inf) 重置，阻断协方差 NaN 传播
+            } else if d < 1e-6 {
+                self.p[i * N + i] = 1e-6;
+            } else if clamp_max && d > P_MAX {
+                self.p[i * N + i] = P_MAX;
+            }
+        }
     }
 
     /// 位置观测更新步（Joseph 形式）：S = HPH^T+R、K = P H^T S^-1、x += K y、
@@ -621,49 +712,8 @@ impl EkfEstimator {
             self.x[i] += corr;
         }
 
-        // P 更新用 Joseph 形式：P = (I - K H) P (I - K H)^T + K R K^T
-        // 1) A = I - K H （9x9，H 仅前三行非零）
-        let mut a = [0.0f32; N * N];
-        for i in 0..N {
-            for j in 0..N {
-                let kh = if j < 3 { k[i * 3 + j] } else { 0.0 }; // (K H)[i][j] = K[i][j] (j<3)
-                a[i * N + j] = if i == j { 1.0 - kh } else { -kh };
-            }
-        }
-        // 2) A P A^T
-        let mut ap = [0.0f32; N * N];
-        mat_mul(&a, &self.p, &mut ap, N, N, N);
-        let mut apat = [0.0f32; N * N];
-        mat_mul_at(&ap, &a, &mut apat, N, N, N);
-        // 3) K R K^T （R = r * I3）
-        let mut krkt = [0.0f32; N * N];
-        for i in 0..N {
-            for j in 0..N {
-                let mut acc = 0.0;
-                for l in 0..3 {
-                    acc += k[i * 3 + l] * k[j * 3 + l];
-                }
-                krkt[i * N + j] = acc * r;
-            }
-        }
-        // 4) P = A P A^T + K R K^T，并对称化（消除尾差）
-        for i in 0..(N * N) {
-            self.p[i] = apat[i] + krkt[i];
-        }
-        for i in 0..N {
-            for j in (i + 1)..N {
-                let avg = 0.5 * (self.p[i * N + j] + self.p[j * N + i]);
-                self.p[i * N + j] = avg;
-                self.p[j * N + i] = avg;
-            }
-            // 对角线上下限夹取，杜绝负方差并阻断不可观状态协方差发散。
-            let d = self.p[i * N + i];
-            if !d.is_finite() || d < 1e-6 {
-                self.p[i * N + i] = 1e-6; // 非有限(NaN/Inf) 重置，阻断协方差 NaN 传播
-            } else if d > P_MAX {
-                self.p[i * N + i] = P_MAX;
-            }
-        }
+        // P 更新用 Joseph 形式（H 观测状态 0..3）
+        self.joseph_update_cov(&k, 3, 0, r, true, true);
     }
 
     /// 位置观测更新（GPS，默认噪声 `r_pos`）。等价于 `update_pos_r(z, self.r_pos)`。
@@ -754,41 +804,8 @@ impl EkfEstimator {
             self.x[9] = -0.3;
         }
 
-        // Joseph 形式：P = (I - K H) P (I - K H)^T + K R K^T，H 仅 3..6 行非零
-        let mut a = [0.0f32; N * N];
-        for i in 0..N {
-            for j in 0..N {
-                let kh = if (3..6).contains(&j) { k[i * 3 + (j - 3)] } else { 0.0 };
-                a[i * N + j] = if i == j { 1.0 - kh } else { -kh };
-            }
-        }
-        let mut ap = [0.0f32; N * N];
-        mat_mul(&a, &self.p, &mut ap, N, N, N);
-        let mut apat = [0.0f32; N * N];
-        mat_mul_at(&ap, &a, &mut apat, N, N, N);
-        let mut krkt = [0.0f32; N * N];
-        for i in 0..N {
-            for j in 0..N {
-                let mut acc = 0.0;
-                for l in 0..3 {
-                    acc += k[i * 3 + l] * k[j * 3 + l];
-                }
-                krkt[i * N + j] = acc * r;
-            }
-        }
-        for i in 0..(N * N) {
-            self.p[i] = apat[i] + krkt[i];
-        }
-        for i in 0..N {
-            for j in (i + 1)..N {
-                let avg = 0.5 * (self.p[i * N + j] + self.p[j * N + i]);
-                self.p[i * N + j] = avg;
-                self.p[j * N + i] = avg;
-            }
-            if self.p[i * N + i] < 1e-6 {
-                self.p[i * N + i] = 1e-6;
-            }
-        }
+        // Joseph 形式（H 观测状态 3..6）；对角策略沿用本方法原有的"只做下限"
+        self.joseph_update_cov(&k, 3, 3, r, false, false);
     }
 
     /// 速度观测更新（GPS Doppler，默认噪声 `r_vel`）。
@@ -841,40 +858,9 @@ impl EkfEstimator {
         for i in 0..N {
             self.x[i] += k[i] * y;
         }
-        // Joseph 形式：P = (I - K H) P (I - K H)^T + K R K^T
-        let mut a = [0.0f32; N * N];
-        for i in 0..N {
-            for j in 0..N {
-                let kh = if j == 2 { k[i] } else { 0.0 };
-                a[i * N + j] = if i == j { 1.0 - kh } else { -kh };
-            }
-        }
-        let mut ap = [0.0f32; N * N];
-        mat_mul(&a, &self.p, &mut ap, N, N, N);
-        let mut apat = [0.0f32; N * N];
-        mat_mul_at(&ap, &a, &mut apat, N, N, N);
-        let mut krkt = [0.0f32; N * N];
-        for i in 0..N {
-            for j in 0..N {
-                krkt[i * N + j] = k[i] * k[j] * self.r_alt;
-            }
-        }
-        for i in 0..(N * N) {
-            self.p[i] = apat[i] + krkt[i];
-        }
-        for i in 0..N {
-            for j in (i + 1)..N {
-                let avg = 0.5 * (self.p[i * N + j] + self.p[j * N + i]);
-                self.p[i * N + j] = avg;
-                self.p[j * N + i] = avg;
-            }
-            let d = self.p[i * N + i];
-            if !d.is_finite() || d < 1e-6 {
-                self.p[i * N + i] = 1e-6; // 非有限(NaN/Inf) 重置，阻断协方差 NaN 传播
-            } else if d > P_MAX {
-                self.p[i * N + i] = P_MAX;
-            }
-        }
+        // Joseph 形式（标量气压高度观测，H 只看状态 2）
+        let r = self.r_alt;
+        self.joseph_update_cov(&k, 1, 2, r, true, true);
     }
 
     /// 空速观测更新步（标量）：空速计测得水平气流速度幅值 `v_as = |v_h|`，
@@ -1269,12 +1255,5 @@ mod tests {
         let mut c = [0.0f32; 4];
         mat_mul(&a, &b, &mut c, 2, 2, 2);
         println!("A*B      = {:?}  (expect [19,22,43,50])", c);
-        let mut d = [0.0f32; 4];
-        mat_mul_at(&a, &b, &mut d, 2, 2, 2);
-        println!("mat_mul_at(A,B) = {:?}  (A^T*B expect [26,30,38,44])", d);
-        // 换成第二个参数转置测一下：mat_mul_at(B,A) 应为 B^T*A
-        let mut e = [0.0f32; 4];
-        mat_mul_at(&b, &a, &mut e, 2, 2, 2);
-        println!("mat_mul_at(B,A) = {:?}  (B^T*A expect [26,38,30,44])", e);
     }
 }
