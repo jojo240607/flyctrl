@@ -41,6 +41,10 @@ pub static mut G_Q_VEL: f32 = 0.0;
 #[used]
 pub static mut G_R_VEL: f32 = 0.0;
 
+/// [标定] `r_pos`（GPS 位置观测噪声）运行时覆盖（0 = 用编译期值）。
+#[used]
+pub static mut G_R_POS: f32 = 0.0;
+
 /// 协方差对角线硬上限（m² / (m/s)² / (m/s²)²）。防止不可观状态协方差经 F 矩阵耦合
 /// 指数增长而至 Inf/NaN。正常可观测状态下协方差远小于此值。
 const P_MAX: f32 = 1e3;
@@ -187,7 +191,18 @@ impl EkfEstimator {
         // 积分），代价是正常悬停 roll/pitch 估计漂移 → HIL 闭环 4.8s 姿态发散
         // （mcu_p=+0.10 vs 物理 -0.54，推力饱和 0/1 边界翻滚）。门控本身已防
         // 平移误锚定，此处恢复 0.02（HIL/SIL 双回归守护）。
-        Self::new(0.02, 0.05, 0.05, 1e-5, 5e-4, 0.5, 0.3, 0.3)
+        // 【Joseph 形式重标定】`q_vel` 0.05 → 0.5。
+        //
+        // 协方差更新改成正确的 Joseph 形式后，P 不再被原误实现意外抬高，K 随之变小
+        // → 估计对观测的信任变弱。实测（x_hover_noise，逼真噪声 + ALT_HOLD）：
+        //   q_vel=0.05：机体获得约 1.8 m/s 水平漂移后速度环拉不回（估计算出 est_v≈0
+        //               → 控制以为没漂），位置漂到 15m，max|pitch|=19.47°（超 15° 界）
+        //   q_vel=0.5 ：峰值 0.64 m/s 且被拉回，位置有界 ±1.6m，max|pitch|=13.10° ✓
+        //   q_vel=2.0 ：过冲，max|roll| 17.17°、max|pitch| 16.42° ✗
+        // 即：把原先"白送"的协方差膨胀换成**显式的速度过程噪声裕度**。
+        // 注：`globe` 侧对 Q 不敏感的用例（x_env_noise_perturb::accel_bias_tolerated）
+        // 不随本项改善，另行处理。
+        Self::new(0.02, 0.5, 0.05, 1e-5, 5e-4, 0.5, 0.3, 0.3)
     }
 
     /// 当前估计的陀螺零偏（调试/诊断用）。
@@ -758,7 +773,11 @@ impl EkfEstimator {
 
     /// 位置观测更新（GPS，默认噪声 `r_pos`）。等价于 `update_pos_r(z, self.r_pos)`。
     pub fn update_pos(&mut self, z: PosSample) {
-        self.update_pos_r(z, self.r_pos);
+        let r_pos_eff = {
+            let ov = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_R_POS)) };
+            if ov != 0.0 { ov } else { self.r_pos }
+        };
+        self.update_pos_r(z, r_pos_eff);
     }
 
     /// 速度观测更新步（Doppler GPS）：H = [0 0 0 I3 0] 作用于状态 [pos, vel, bias]，
