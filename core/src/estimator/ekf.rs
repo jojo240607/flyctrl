@@ -24,6 +24,23 @@ use crate::vehicle::{
 
 const N: usize = 10; // pos(3) + vel(3) + gyro_bias(3) + accel_bias_z(1)
 
+/// [标定] `q_accel` 运行时覆盖（0 = 用 `EkfEstimator` 的编译期值）。
+///
+/// 用途：协方差更新改用 Joseph 形式后，位置/高度通道需要重标定——原误实现的协方差
+/// 膨胀曾意外充当鲁棒性拐杖。把 `q_accel`（加计零偏过程噪声）做成可运行时写入的旋钮，
+/// 即可在**不重编固件**的前提下扫描"加计偏置容忍度 vs 噪声鲁棒性"，用数据选值；
+/// 定稿后应写回 `default_quad()` 并把本旋钮保持 0。
+#[used]
+pub static mut G_Q_ACCEL: f32 = 0.0;
+
+/// [标定] `q_vel`（速度过程噪声）运行时覆盖（0 = 用编译期值）。
+#[used]
+pub static mut G_Q_VEL: f32 = 0.0;
+
+/// [标定] `r_vel`（Doppler 速度观测噪声）运行时覆盖（0 = 用编译期值）。
+#[used]
+pub static mut G_R_VEL: f32 = 0.0;
+
 /// 协方差对角线硬上限（m² / (m/s)² / (m/s²)²）。防止不可观状态协方差经 F 矩阵耦合
 /// 指数增长而至 Inf/NaN。正常可观测状态下协方差远小于此值。
 const P_MAX: f32 = 1e3;
@@ -522,10 +539,19 @@ impl EkfEstimator {
                 p_pred[dst * N + j] += coef * ft[src * N + j];
             }
         }
-        let qv = self.q_vel * dt;
+        let q_vel_eff = {
+            let ov = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_Q_VEL)) };
+            if ov != 0.0 { ov } else { self.q_vel }
+        };
+        let qv = q_vel_eff * dt;
         let qvz = self.q_vel_z * dt;
         let qb = self.q_bias * dt;
-        let qa = self.q_accel * dt;
+        // 易失读：标定旋钮由外部写入（见 G_Q_ACCEL），普通读会被常量折叠掉
+        let q_accel_eff = {
+            let ov = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_Q_ACCEL)) };
+            if ov != 0.0 { ov } else { self.q_accel }
+        };
+        let qa = q_accel_eff * dt;
         for i in 3..5 {
             p_pred[i * N + i] += qv;
         }
@@ -553,46 +579,47 @@ impl EkfEstimator {
         self.p = p_pred;
     }
 
-    /// 协方差更新步（与原实现的代数**逐项一致**，只是利用观测矩阵的稀疏结构省掉零元乘法）。
+    /// 协方差更新步：**Joseph 形式 `P = A P A^T + K R K^T`（A = I - KH）**。
     ///
-    /// 原实现写的是：
+    /// **【已决策：以 Joseph 形式为准，不得退回下列误实现】**
+    ///
+    /// 原实现是：
     /// ```text
-    ///   ap   = A * P                    // A = I - K H
-    ///   apat = mat_mul_at(ap, A)        // 注释写 "A P A^T"，但 mat_mul_at(x,y)=x^T*y，
-    ///                                   // 实际算的是 ap^T * A = P A^T A
+    ///   ap   = A * P
+    ///   apat = mat_mul_at(ap, A)   // 注释写 "A P A^T"，但 mat_mul_at(x,y)=x^T*y，
+    ///                              // 实际算的是 ap^T·A = P A^T A
     ///   P    = apat + K R K^T ;  再对称化
     /// ```
-    /// 本方法**复现这个代数**（含对称化），以保证本次改动只带来速度、不改变滤波行为。
-    /// 注：`A = I-KH` 不对称，故 `P A^T A != A P A^T`；教科书 Joseph 形式应为后者。
+    /// 该式既非简化式 `(I-KH)P` 也非 Joseph 式：`A` 不对称（`A[i][j] = -K[i][j-c]`
+    /// 而 `A[j][i] = 0`），等于把纠正项乘在错误的一侧，**得到的不是卡尔曼后验协方差**
+    /// （实测其 `P[9][9]` 偏大 5.4×、`P[0][0]` 偏大 16%）。
     ///
-    /// **【已评估：本实现刻意保留原代数，不要"顺手修成" A P A^T】**
+    /// 为何选 Joseph 式而非更省算力的简化式 `P - K H P`：
+    /// 1) 两者在 K 为最优增益时代数等价；但 Joseph 式是**两个对称半正定项之和**，
+    ///    舍入后仍保对称与半正定，而 `P - KHP` 会因大数相减失去半正定；
+    /// 2) Joseph 式对**非最优 K** 二次稳定 —— 本实现恰有 `K_MAX` 限幅与"不可观行清零"；
+    /// 3) 本实现的 `H` 是窄观测矩阵，稀疏化后 Joseph 式仍为 `O(N²·ncols)`，
+    ///    与简化式同算力等级，没有为省算力牺牲鲁棒性的理由。
+    /// （业界参考：PX4 ECL / ArduPilot NavEKF3 采用简化式并额外做对称化 + 方差下限
+    /// 钳制；教科书 Simon《Optimal State Estimation》§5.2、Maybeck 把 Joseph 式列为
+    /// 数值鲁棒首选。二者都远优于原误实现。）
     ///
-    /// 两者都是合法的协方差更新（都保持对称、都用 `KRK^T` 补偿），差别在于对不可观
-    /// 状态注入的不确定度：忠实版产生的协方差更大（实测 accel_bias_z 的 P[9][9] 大
-    /// 5.4×、P[0][0] 大 16%），因而增益更激进、对真实加计偏置/扰动的自适应更强。
-    /// 现有控制参数是围绕这一行为标定的，**换成教科书形式会让位置/高度通道变差**。
+    /// ⚠️ **该式会改变位置/高度通道行为，必须配套重标定**：原误实现的协方差膨胀曾
+    /// 意外充当鲁棒性拐杖，`EkfEstimator::default_quad()` 的 Q/R 是围绕它标定的。
+    /// 修正后（未重标定）的基线实测：`x_env_noise_perturb::accel_bias_tolerated` FAIL
+    /// （加计偏置下位置 5.52m > 5.0m 界）、`x_hover_noise` max|roll|=21.94°；修正前分别
+    /// PASS / 5.03°。补偿应把拐杖换成**显式的 Q/R 设计裕度**（优先增大 `q_accel`，让
+    /// 加计零偏状态的协方差按需增长），**不得退回错式**。
     ///
-    /// 实测（同固件仅切该处，2026-09 复验；模拟器 BASEPRI 缺陷已修，无污染）：
-    /// - `x_env_noise_perturb::accel_bias_tolerated`：忠实版 PASS；教科书版 FAIL
-    ///   （加计偏置下位置 5.52m，超 5.0m 界）
-    /// - `x_hover_noise`：忠实版 max|roll|=5.03°；教科书版 21.94°（明显更差）
-    /// - `x_hover_demo`：两者均 PASS
+    /// **姿态通道不受影响**：陀螺零偏 `x[6..8]` 从不被任何观测更新（观测只选
+    /// pos/vel/alt 列，增益恒为 0），且姿态是名义四元数积分、其重力/磁修正
+    /// （`att_alpha`/`mag_alpha`）在协方差之外做固定-α 直接修正。宿主对照（弱磁让零偏
+    /// 可观）显示两种式下姿态输出逐位相同。
     ///
-    /// **姿态解算与此无关**（勿据此怀疑姿态环）：
-    /// 1) 陀螺零偏 `x[6..8]` 只被读、**从不被任何观测更新**（观测只选 pos/vel/alt 列），
-    ///    增益恒为 0，与协方差无关；
-    /// 2) 姿态是名义四元数陀螺积分，其重力/磁修正（`att_alpha`/`mag_alpha`）是协方差
-    ///    **之外**的固定-α 直接修正。
-    /// 宿主侧对照（弱磁、让零偏可观）：两者姿态输出逐位相同（rpy 完全一致），仅
-    /// pos/vel 有 1e-3 量级差异。
-    ///
-    /// 故：若要改用教科书形式，属**需要重新标定**的独立课题，不是等价修复。
-    ///
-    /// 稀疏化依据：`H` 是"只在状态列 `c..c+ncols` 上取单位观测"的窄观测矩阵，
-    /// 故 `A` 只在列 `c..c+ncols` 偏离单位阵，`ap` 与 `apat` 都只需 O(N²·ncols)：
+    /// 稀疏化依据：`H` 只在状态列 `c..c+ncols` 上取单位观测，`A` 只在那些列偏离单位阵：
     /// ```text
-    ///   ap[i][j]    = P[i][j] - Σ_l K[i][l]·P[c+l][j]
-    ///   apat[i][j]  = ap[j][i] - [j∈观测列]·g[i][j-c] ,  g = ap^T K
+    ///   ap[i][j]    = P[i][j]    - Σ_l K[i][l]·P[c+l][j]
+    ///   (A P A^T)[i][j] = ap[i][j] - Σ_l K[i][l]·ap[c+l][j]
     /// ```
     ///
     /// `k` 为 N×ncols 行主序卡尔曼增益（已限幅/已清零不可观行）。
@@ -620,24 +647,15 @@ impl EkfEstimator {
                 ap[i * N + j] = acc;
             }
         }
-        // 2) g = ap^T K  （N×ncols）
-        let mut g = [[0.0f32; 3]; N];
-        for i in 0..N {
-            for l in 0..ncols {
-                let mut acc = 0.0f32;
-                for kk in 0..N {
-                    acc += ap[kk * N + i] * k[kk * ncols + l];
-                }
-                g[i][l] = acc;
-            }
-        }
-        // 3) P = apat + K R K^T，apat[i][j] = ap[j][i] - [j 在观测列]·g[i][j-c]
+        // 2) P = A P A^T + K R K^T（Joseph 形式）
+        //    (A P A^T)[i][j] = Σ_k A[i][k]·ap[k][j] = ap[i][j] - Σ_l K[i][l]·ap[c+l][j]
+        //    A = I - KH 只在列 c..c+ncols 偏离单位阵，故为 O(N²·ncols)。
         for i in 0..N {
             let ki = &k[i * ncols..i * ncols + ncols];
             for j in 0..N {
-                let mut acc = ap[j * N + i];
-                if j >= c && j < c + ncols {
-                    acc -= g[i][j - c];
+                let mut acc = ap[i * N + j];
+                for (l, kl) in ki.iter().enumerate() {
+                    acc -= kl * ap[(c + l) * N + j];
                 }
                 let kj = &k[j * ncols..j * ncols + ncols];
                 for (l, kl) in ki.iter().enumerate() {
@@ -838,7 +856,11 @@ impl EkfEstimator {
     /// （实测：RMC 激活后 pos[2] 在 ±11m 剧烈振荡）。垂向速度/零偏由 baro 与
     /// IMU 路径估计，水平速度由 GPS Doppler 约束（悬停水平漂移根治）。
     pub fn update_vel(&mut self, vel: [f32; 3]) {
-        self.update_vel_r([vel[0], vel[1], self.x[5]], self.r_vel);
+        let r_vel_eff = {
+            let ov = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_R_VEL)) };
+            if ov != 0.0 { ov } else { self.r_vel }
+        };
+        self.update_vel_r([vel[0], vel[1], self.x[5]], r_vel_eff);
     }
 
     /// 高度观测更新步（气压计）：气压计测得**向上**高度 `alt`，而状态 D 轴向下为正，
