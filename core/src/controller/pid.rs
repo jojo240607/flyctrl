@@ -32,6 +32,14 @@ pub static mut DBG_THR: f32 = 0.0;
 #[used]
 pub static mut DBG_TILT: [f32; 4] = [0.0; 4];
 
+/// [标定] `ki_xy`（**水平位置积分增益**）运行时覆盖。
+///
+/// ⚠️ 哨兵与 `G_MAG_ALPHA` 同规：**< 0（默认 -1）= 用编译期值**。
+/// 理由：`0` 是本旋钮的**有效取值**（= 关闭水平积分，即既有行为），
+/// 不能拿 0 当"未设置"，否则表达不了"显式关闭"。
+#[used]
+pub static mut G_KI_XY: f32 = -1.0;
+
 pub struct PidController {
     // 位置外环 P：位置误差 -> 期望速度（世界系）
     kp_xy: f32,
@@ -55,6 +63,18 @@ pub struct PidController {
     // 垂向位置积分项（消除传感器噪声下的稳态下沉）：iz 为积分累积，ki_z 为积分增益
     ki_z: f32,
     iz: f32,
+    // 水平位置积分项（抗**恒定扰动**下的稳态偏移，如侧风）：与垂向 iz **对称**。
+    //
+    // 为何需要：水平外环原为 **P-only** ⇒ 恒风下必须靠位置误差换稳态速度指令
+    // （`des_v = kp_xy·e`）⇒ 稳态偏移 `e = des_v/kp_xy`。实测 B3 风（5.4m/s、
+    // 位置环口径）漂移 **6.64m**，与 `2.0/0.3 = 6.67m` 吻合到 0.5%；仓库自己的
+    // 注释也记着这个特征（`mission.rs`："kp_xy=0.3、2m/s 巡航约 6.7m"）。
+    // 垂向早有 `iz` 正是为此（"抗稳态下沉"），水平此前没有 —— 这是能力缺口。
+    //
+    // **默认 0 = 关闭**（保持既有行为不变），取值由扫描数据定，不由实现者拍。
+    ki_xy: f32,
+    /// 水平位置积分累积（NED 北/东）。抗饱和与垂向同用**回算**（back-calculation）。
+    i_xy: [f32; 2],
     // 阶段 11-A：EKF 估计的垂直速度/位置一阶低通（EMA）状态，滤除 IMU 高频噪声。
     // 噪声经 EKF 估计后直接驱动油门会导致悬停发散；LPF 时间常数由 vel_lpf_tau 控制（0=不过滤）。
     vel_lpf_tau: f32,
@@ -149,6 +169,8 @@ impl PidController {
                       // 使相位裕度从 19.7° 提升到 36.0°（GM 保持 inf）；实测垂直抗扰峰值偏差
                       // 反而更小（0.094m vs 0.131m），稳态偏差均≈0，未牺牲抗风性能
             iz: 0.0,
+            ki_xy: 0.0, // 默认关：既有行为逐位不变；由 wind_turb_scan 扫出后再定
+            i_xy: [0.0; 2],
             vel_lpf_tau: 0.15,
             rate_lpf_tau: 0.02, // 50Hz：抑噪为主，相位滞后小
             filt_w: [0.0; 3],
@@ -191,6 +213,13 @@ impl PidController {
 
 impl Controller for PidController {
     fn control(&mut self, _dt: Second, sp: &Setpoint, est: &VehicleState) -> ActuatorCmd {
+        // 标定旋钮（易失读：由外部写入；0 是有效值故哨兵取 <0）
+        {
+            let ov = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_KI_XY)) };
+            if ov >= 0.0 {
+                self.ki_xy = ov;
+            }
+        }
         let g = self.gravity;
         let dt = _dt.0;
 
@@ -238,16 +267,39 @@ impl Controller for PidController {
             iz_final = clampf(-self.vmax_z - pre_iz, -2.0, 2.0);
         }
         self.iz = iz_final;
-        // 速率模式：位置外环旁路，期望速度 = sp.vel（摇杆直通）；否则位置 P + 速度前馈
+        // 水平位置积分（抗恒定扰动下的稳态偏移，如侧风）—— 与垂向 iz 对称：
+        // 同样用**回算**抗饱和（饱和时把积分置为"恰使 des_v 抵达边界"的值）。
+        // 积分上限 ±2.0 m/s，与垂向同口径。
+        const I_XY_MAX: f32 = 2.0;
+        let pre_ix = self.kp_xy * ex + sp.vel[0].0; // P 项 + 速度前馈（不含积分）
+        let pre_iy = self.kp_xy * ey + sp.vel[1].0;
+        let mut ix_final = clampf(self.i_xy[0] + self.ki_xy * ex * dt, -I_XY_MAX, I_XY_MAX);
+        let mut iy_final = clampf(self.i_xy[1] + self.ki_xy * ey * dt, -I_XY_MAX, I_XY_MAX);
+        if !self.rate_mode_xy {
+            let dx = pre_ix + ix_final;
+            if dx > self.vmax_xy {
+                ix_final = clampf(self.vmax_xy - pre_ix, -I_XY_MAX, I_XY_MAX);
+            } else if dx < -self.vmax_xy {
+                ix_final = clampf(-self.vmax_xy - pre_ix, -I_XY_MAX, I_XY_MAX);
+            }
+            let dy = pre_iy + iy_final;
+            if dy > self.vmax_xy {
+                iy_final = clampf(self.vmax_xy - pre_iy, -I_XY_MAX, I_XY_MAX);
+            } else if dy < -self.vmax_xy {
+                iy_final = clampf(-self.vmax_xy - pre_iy, -I_XY_MAX, I_XY_MAX);
+            }
+        }
+        self.i_xy = [ix_final, iy_final];
+        // 速率模式：位置外环旁路，期望速度 = sp.vel（摇杆直通）；否则 P + I + 速度前馈
         let des_vx = if self.rate_mode_xy {
             clampf(sp.vel[0].0, -self.vmax_xy, self.vmax_xy)
         } else {
-            clampf(self.kp_xy * ex + sp.vel[0].0, -self.vmax_xy, self.vmax_xy)
+            clampf(pre_ix + ix_final, -self.vmax_xy, self.vmax_xy)
         };
         let des_vy = if self.rate_mode_xy {
             clampf(sp.vel[1].0, -self.vmax_xy, self.vmax_xy)
         } else {
-            clampf(self.kp_xy * ey + sp.vel[1].0, -self.vmax_xy, self.vmax_xy)
+            clampf(pre_iy + iy_final, -self.vmax_xy, self.vmax_xy)
         };
         let des_vz = clampf(pre_iz + self.iz, -self.vmax_z, self.vmax_z);
 
