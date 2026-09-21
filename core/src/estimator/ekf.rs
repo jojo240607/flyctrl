@@ -45,6 +45,73 @@ pub static mut G_R_VEL: f32 = 0.0;
 #[used]
 pub static mut G_R_POS: f32 = 0.0;
 
+/// [标定] **GPS/Doppler 差分推导 `a_world`** 的开关（0 = 关，默认）。
+///
+/// 启用后，`update_vel_r` 会把相邻多普勒速度观测差分（一阶低通 tau=0.25s）
+/// 写入 `world_accel`，从而在重力锚定中扣除平移分量（阶段2 P4 方案 C）。
+///
+/// **为何默认关**：开启后它**能**修好阶段 4 的 `vel×att` 耦合、也能减少真实平移时的
+/// 姿态污染，**但在“本无平移”的场景全部变差，且 A9 自由落体是灾难级**。
+///
+/// **2026-09-21 全场景 A/B 复测**（`tests/att_est.rs::g_aw_gps_default_evaluation`，
+/// 姿态 RMSE；注：早期“A1 0.948°→0.558°、A3 6.10°→3.01°”那组数字取自 F1/F5
+/// 修复之前的版本，已过期，见下表。）：
+///
+/// | 场景 | 关 | 开 | |
+/// |---|---|---|---|
+/// | A3 急刹 0.5g | 23.42° | **18.59°** | ✅ +20.6%（low_noise 14.39°→2.67°，+81%）|
+/// | A7 慢转+0.5g | 38.64° | **29.70°** | ✅ +23%（但 max 50.5°→**93.8°**，峰值反而变差）|
+/// | A1/A2/A8 无平移 | — | — | ❌ 略变差（low_noise A2 0.017°→0.406°）|
+/// | **A9 自由落体** | 24.60° | **132.65°** | ❌❌ max 28°→**173.6°**（low_noise 0.023°→29.28°）|
+///
+/// ⇒ **只在“有真实平移”时帮忙（2/10），其余全变差**；而 **A9 自由落体是灾难级**：
+/// 扣除 `a_world` 后 `|a|≈g`，**把幅值门的失重保护骗开了**（本该生效的失效保护被绕过）。
+/// 自由落体/抛飞/强下洗是真实工况，估计器必须**优雅退化**而非发散 —— 这是
+/// “默认关”的**安全理由**。
+///
+/// 根因是 **`a_world` 源的质量**（噪声 + 0.15s 延迟 + 0.25s 低通 + 20Hz）。
+/// 待该源改善（延迟补偿/更强滤波/更高帧率）后重新评估；更稳的做法是
+/// **按飞行状态门控**（仅动力飞行、非失重时启用）。两者均记入阶段 6。
+///
+/// ⚠️ 历史：本静态初值曾为 `1.0`，与上面“为何默认关”的结论**自相矛盾**
+#[used]
+pub static mut G_AW_GPS: f32 = 0.0;
+
+/// [标定] `a_world` 差分低通时间常数（s）。运行时覆盖（0 = 用内置默认 0.25）。
+///
+/// 权衡：Doppler 速度噪声（消费级 ~0.1 m/s @20Hz）被差分放大 ⇒ 必须低通；
+/// 而低通带来滞后（叠加 GPS 0.15s 延迟）⇒ 平移补偿的定时误差。
+/// 本旋钮用于扫这条曲线（见 `docs/stage4-outer-loop-findings.md` P4）。
+#[used]
+pub static mut G_AW_TAU: f32 = 0.0;
+
+/// [标定] **垂向速度观测增益上限** `|k[5]|`。
+///
+/// 语义：`0` = 用**内置默认 0.1**；`<0` = **强制 0**（历史对照，垂速纯 IMU 积分）；
+/// `>0` = 覆盖。
+///
+/// 背景：`update_alt` 里长期写 `k[5] = 0.0`（气压/位置观测不修正垂速），
+/// 原因见下方注释（“单拍 +24.6 → 爆炸”）。后果是**垂速纯 IMU 积分**：
+/// 零偏/噪声留下稳态速度误差 → 高度环跟着走 → 真值持续漂移。
+///
+/// 2026-09-21 垂向专项（`pos_ctrl::outer_hover_vertical_sink_sixty_sec`）：
+/// 真值反馈下高度**完美保持**（下沉 -0.000m），而估计反馈 + realistic 悬停 60s
+/// 漂 **+2.642m**（max\|dz\| **15.529m**）⇒ 问题 100% 在垂向估计注入外环。
+///
+/// 扫描（`pos_ctrl::outer_vertical_kvz_sweep`，60s realistic 悬停）：
+///
+/// | \|k[5]\|上限 | 净漂移 | max\|dz\| |
+/// |---|---|---|
+/// | **0（历史）** | **+2.642m** | **15.529m** |
+/// | 0.02 | -0.724m | 1.549m |
+/// | **0.10** | **-0.486m** | **1.591m** |
+/// | 0.20 ~ 2.00 | -0.486m | 1.591m（**与 0.10 逐位相同**）|
+///
+/// ⇒ 0.10 以上结果不再变 ⇒ **实际 `|k[5]|` 从未超过 0.1**，
+/// 当年“爆炸”那种大修正有界增益下不会发生。故内置默认取 **0.1**。
+#[used]
+pub static mut G_KVZ_FROM_ALT: f32 = 0.0;
+
 /// 协方差对角线硬上限（m² / (m/s)² / (m/s²)²）。防止不可观状态协方差经 F 矩阵耦合
 /// 指数增长而至 Inf/NaN。正常可观测状态下协方差远小于此值。
 const P_MAX: f32 = 1e3;
@@ -105,8 +172,39 @@ pub struct EkfEstimator {
     mag_alpha: f32,     // 磁力计航向锚定强度（0 = 不锚定 yaw；纯陀螺积分 yaw 会漂移）
     mag_ref: [f32; 2],  // 世界系水平参考地磁方向（单位向量）：默认 (1,0)=地理北；
                         // 有磁偏角时 set_mag_declination 旋转该参考 → 磁航向转地理航向
+    /// 机体硬铁偏置（与磁力计同单位），由**离线标定**得到，默认零。
+    /// `update_mag` 使用前先从读数中扣除。
+    ///
+    /// 为何需要：硬铁是机体固定偏置，会使磁航向产生**与姿态相关的常数偏置**
+    /// （残余 b_h 时航向误差 ≈ atan(|b_h|/|B_h|)）。而它**无法被任何门控发现**
+    /// （静止时 |ω|≈0、偏置恒定时模长/方向也不变）→ 必须靠标定。（参见
+    /// `docs/stage1-attitude-findings.md` F7。）
+    ///
+    /// 注：工程上硬铁普遍用**离线标定**（多姿态采集取 min/max 中心）而非在线估计
+    /// ——后者在静止悬停下不可观。本字段即标定结果接口，与 `mag_ref` 同形态。
+    mag_hard_iron: [f32; 3],
+    /// **世界系平移加速度估计**（NED，m/s²）：用于从比力中扣除平移分量后再做重力锚定。
+    ///
+    /// 背景（`docs/stage2-attitude-ctrl-findings.md` P4）：比力 `a_body = R^T(a_world − g)`，
+    /// 重力锚直接把比力方向当重力方向。平移机动会污染它，而**两道门都盖不住**：
+    ///   - 幅值门从不关：平移时 `|a|/g` 最高仅 1.28（门限 [0.5,2.5]）；
+    ///   - 方向门不足：0.2g 平移只偏重力 11.3°（阈值 25.8°）。
+    /// 实测 A3 急刹：平移 0.2/0.5/0.8g → 姿态误差 **6.1/14.5/21.6°**（全在 pitch）。
+    ///
+    /// 补偿：`a_comp = a_body − R̂ᵀ·a_world`，其方向即真实重力方向、幅值≈g。
+    /// 默认 `[0,0,0]` → **与历史行为逐位一致**（零平移时补偿项为 0）。
+    ///
+    /// 注入源（由陷主决定）：仿真可用真值（oracle 实验）；实机可用 GPS/Doppler
+    /// 速度差分。本字段只提供接口，不隐含数据来源。
+    world_accel: [f32; 3],
+    /// `world_accel` 是否为**可信源**（如测试 oracle / 高质量外部估计）。
+    /// `false`（默认，含 Doppler 差分路径）→ 锚定侧施加**平移门控**。
+    world_accel_trusted: bool,
+    /// Doppler 差分用：上一次速度观测（`vel_obs_dt < 0` = 尚未初始化）。
+    prev_vel_obs: [f32; 3],
+    /// 自上次**新鲜**速度观测起累计的时间（s）；负值表示未初始化。
+    vel_obs_dt: f32,
     airspeed_est: f32,  // 估计空速 (m/s)，由空速计融合得到
-    accel_lp: [f32; 3],  // 加计低通滤波（滤除高频振动，用于重力锚定）
 }
 
 impl EkfEstimator {
@@ -161,8 +259,12 @@ impl EkfEstimator {
             att_alpha,
             mag_alpha: 0.05,  // 微弱航向锚定：yaw 误差每拍吸收 2.5%（0.05*0.5）
             mag_ref: [1.0, 0.0], // 默认磁北=地理北（无偏角）
+            mag_hard_iron: [0.0; 3], // 默认未标定（零偏置）
+            world_accel: [0.0; 3],   // 默认零平移（→ 与历史行为一致）
+            world_accel_trusted: false,
+            prev_vel_obs: [0.0; 3],
+            vel_obs_dt: -1.0,
             airspeed_est: 0.0,
-            accel_lp: [0.0; 3],
         }
     }
 
@@ -263,6 +365,10 @@ impl Estimator for EkfEstimator {
         airspeed: Option<AirspeedSample>,
     ) -> VehicleState {
         let dt = dt.0;
+        // 累计自上次新鲜速度观测的时间（供 `update_vel_r` 的 Doppler 差分用）。
+        if self.vel_obs_dt >= 0.0 {
+            self.vel_obs_dt += dt;
+        }
         // 防御：IMU 输入非有限（HIL 注入异常/总线噪声）直接放弃本拍积分，返回上一状态。
         // 否则 att.integrate(NaN) 会把姿态四元数直接污染为 NaN（历史教训：电机指令 NaN
         // 即由状态/姿态 NaN 传播而来），进而经位置预测/观测更新污染整个状态向量。
@@ -279,8 +385,7 @@ impl Estimator for EkfEstimator {
         let g = self.g_ref;
 
         // 去偏置角速度
-        let bx = self.x[6];
-        let by = self.x[7];
+        let bx = self.x[6];        let by = self.x[7];
         let bz = self.x[8];
         let wx = imu.gyro[0].0 - bx;
         let wy = imu.gyro[1].0 - by;
@@ -291,13 +396,59 @@ impl Estimator for EkfEstimator {
 
         // 可选微弱重力修正（锚定 roll/pitch 到重力方向）
         if self.att_alpha > 0.0 {
-            // 先对机体比力做一阶低通滤波，滤除 40Hz 高频振动，保留慢变重力方向。
-            let a_raw = [imu.accel[0].0, imu.accel[1].0, imu.accel[2].0];
-            let lp_coeff = 0.05f32; // ~20Hz 截止，滤除 40Hz 振动
-            for i in 0..3 {
-                self.accel_lp[i] += lp_coeff * (a_raw[i] - self.accel_lp[i]);
-            }
-            let a = self.accel_lp;
+            // 比力直接使用，**不做额外低通**。
+            //
+            // 历史：此处原有一级 `accel_lp`（`lp_coeff=0.05`，fc≈2.04Hz，注释称"滤 40Hz 振动"）。
+            // 实测证明它**冗余且是重力锚定相位滞后的唯一根因**：`step_hil` 在把 accel
+            // 交给 EKF **之前**已完成 40Hz 陷波 + 20Hz 低通，而锚定自身的低增益
+            // （`k≈0.01`/拍）本身就是低通。它使 roll/pitch 在 1Hz 滞后 27.4°、增益 0.790，
+            // 直接侵占姿态环相位裕度（`att_kp=3.0 rad/s ≈ 0.48Hz` 交叉频率）。
+            //
+            // 移除后（H 场实测，`docs/stage1-attitude-findings.md` F1）：
+            // |        | 0.5Hz | 1Hz | 2Hz | 3Hz | 纯静止振动 RMSE |
+            // |--------|-------|-----|-----|-----|-------|
+            // | 有低通 | 0.941/+15.1° | 0.790/+27.4° | 0.424/+34.8° | 0.255/— | 0.5301° |
+            // | 已移除 | 0.995/+2.1° | 0.982/+4.0° | 0.937/+7.0° | 0.881/+8.3° | 0.5343° |
+            // （增益/滞后）→ **抗振不变、漂移抑制不变**（`att_alpha` 未动），纯收益。
+            // 2–3Hz 残余滞后（7.0°/8.3°）来自 `step_hil` 上游 20Hz 低通，非此级。
+            //
+            // 回归守卫：
+            // - `att_est.rs::spec_attitude_estimator_frequency_response`（频响硬门槛）
+            //   —— 若有人重新加回慢低通，1Hz 滞后会立即超标、该门槛变红。
+            // - `att_est.rs::vibration_rejection_without_reference_lpf`（抗振不能退化）
+            let a = [imu.accel[0].0, imu.accel[1].0, imu.accel[2].0];
+            // ---- 平移补偿（见 `world_accel` 字段文档 / stage2 P4）----
+            // a_body = R^T(a_world − g)。扣除平移分量 R^T·a_world 后余下纯重力项
+            // R^T(−g)：其**方向**才是真实重力方向，其**幅值**也才真正≈g
+            // （使幅值门恢复有效性）。
+            // 默认 world_accel=[0,0,0] → 本块为 no-op，行为逐位不变。
+            let a = if self.world_accel[0] != 0.0
+                || self.world_accel[1] != 0.0
+                || self.world_accel[2] != 0.0
+            {
+                // 平移补偿：`a_comp = a_body − gate·R̂ᵀ·a_world`。
+                //
+                // **平移门控**：Doppler 差分的噪声/滞后在**小平移**时是纯负担
+                // （实测悬停 RMSE 0.95°→2.20°），而小平移本就无需补偿 ⇒ 按
+                // `|a_world|/g` 在 [0.05, 0.20] 线性开启（0.05≈3° 倾角）。
+                // 平移大时补偿收益远大于其噪声（实测 52~61%）。
+                // **可信源**（`set_world_accel`，如测试 oracle）免门控。
+                let aw = self.world_accel;
+                let gate = if self.world_accel_trusted {
+                    1.0
+                } else {
+                    let m = sqrt(aw[0] * aw[0] + aw[1] * aw[1] + aw[2] * aw[2]) / g;
+                    ((m - 0.05) / 0.15).clamp(0.0, 1.0)
+                };
+                let aw_b = crate::vehicle::rotate_vec_by_quat_inverse(self.att, aw);
+                [
+                    a[0] - gate * aw_b[0],
+                    a[1] - gate * aw_b[1],
+                    a[2] - gate * aw_b[2],
+                ]
+            } else {
+                a
+            };
             let an = sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
             // 比力幅值门控：仅当 |a| 接近 g 时才信任加速度计的「重力方向」参考。
             //   - 自由落体/失重 |a|≈0：比力方向无意义，若照常锚定会把姿态拖向随机方向
@@ -497,6 +648,24 @@ impl Estimator for EkfEstimator {
 
     fn update_alt(&mut self, alt: f32) {
         EkfEstimator::update_alt(self, alt);
+    }
+
+    /// 磁力计航向锚定（yaw）。
+    ///
+    /// ⚠️ **本委托不可删**：`update_mag` 的实现在下面的固有 impl 块
+    /// （"非 trait 方法"区），而 `HilContext<E: Estimator, C>` 持有的是泛型参数，
+    /// 方法解析只看 trait 方法。缺本委托时会命中 `trait_def.rs` 的默认空实现
+    /// （`fn update_mag(&mut self, _mag: Option<[f32;3]>) {}`）→
+    /// **磁航向锚定在整条 SIL/HIL/MCU 链路静默失效，yaw 退化为纯陀螺积分**。
+    ///
+    /// 历史教训：该 bug 曾长期存在而未被发现，因为
+    /// ① 单测直接对具体类型 `ekf.update_mag(...)` → 命中固有方法 → 全绿；
+    /// ② 集成测试用 `SensorConfig::default()`（零陀螺零偏）→ yaw 本就不漂 → 空过。
+    /// 回归守卫：`fly-sim-core/tests/att_est.rs::drift_rejection_still_works_after_fix`
+    /// （经 `step_hil` 注入非零陀螺零偏 + 磁力计，断言 yaw 仍有界）。
+    /// 与 `update_alt` 同一模式。
+    fn update_mag(&mut self, mag: Option<[f32; 3]>) {
+        EkfEstimator::update_mag(self, mag);
     }
 }
 
@@ -784,6 +953,46 @@ impl EkfEstimator {
     /// 直接观测速度分量 3..6。`r` 为观测噪声（m/s）²，供 GPS Doppler / VIO 以各自
     /// 精度融合。Joseph 形式，栈数组作用域限于本方法。
     pub fn update_vel_r(&mut self, vel: [f32; 3], r: f32) {
+        // ---- Doppler 差分 → 世界系平移加速度（重力锚定的平移补偿，阶段2 P4 方案 C）----
+        //
+        // 仅当 `G_AW_GPS > 0` 时启用。**静态初值 = 0.0（关）**，理由见该静态量的文档：
+        // 开启后在无平移场景（尤其**自由落体**）会把幅值门的失重保护骗开 → 姿态发散。
+        // 平移量大的任务可显式打开（旋钮保留）。
+        // 新鲜判据：观测相对上次发生变化（GPS 20Hz 而控制 250Hz → 大量重复样本；
+        // 对重复样本差分只会得到 0，对变化样本差分才是真实加速度）。
+        let enabled =
+            unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_AW_GPS)) } > 0.0;
+        if enabled {
+            if self.vel_obs_dt < 0.0 {
+                // 首次观测：只建立基准。
+                self.prev_vel_obs = vel;
+                self.vel_obs_dt = 0.0;
+            } else {
+                let fresh = (vel[0] - self.prev_vel_obs[0]).abs() > 1e-6
+                    || (vel[1] - self.prev_vel_obs[1]).abs() > 1e-6
+                    || (vel[2] - self.prev_vel_obs[2]).abs() > 1e-6;
+                if fresh && self.vel_obs_dt > 1e-4 {
+                    let inv = 1.0 / self.vel_obs_dt;
+                    // 一阶低通 tau=0.25s：Doppler 差分噪声大，且 GPS 有延迟。
+                    let tau = {
+                        let ov = unsafe {
+                            core::ptr::read_volatile(core::ptr::addr_of!(G_AW_TAU))
+                        };
+                        if ov > 0.0 { ov } else { 0.25f32 }
+                    };
+                    let alpha = (self.vel_obs_dt / (tau + self.vel_obs_dt)).clamp(0.0, 1.0);
+                    for k in 0..3 {
+                        let a = (vel[k] - self.prev_vel_obs[k]) * inv;
+                        self.world_accel[k] += alpha * (a - self.world_accel[k]);
+                    }
+                    // 标记为**非可信源**（噪声大）→ 锚定侧会施加平移门控。
+                    // 注：**不把门乘进 LPF 状态**（否则门控自锁：门压低 → 模长变小 → 门更低）。
+                    self.world_accel_trusted = false;
+                    self.prev_vel_obs = vel;
+                    self.vel_obs_dt = 0.0;
+                }
+            }
+        }
         // S = H P H^T + R (3x3)
         let mut s = [0.0f32; 9];
         for i in 0..3 {
@@ -906,10 +1115,25 @@ impl EkfEstimator {
         if !y.is_finite() {
             return;
         }
-        // 垂向速度状态 (5) 的增益行清零：气压同为位置观测，经非对角协方差 K[5]
-        // 会推爆垂向速度（hil 闭环回归：恒定比力+气压下 vel_z 单拍 +24.6 → 爆炸）。
-        // 垂向速度仅由加速度积分决定（同 update_pos 的处理），位置观测不直接修正它。
-        k[5] = 0.0;
+        // 垂向速度状态 (5) 的增益行。
+        //
+        // 历史（一直写到 2026-09-21）：清零——气压同为位置观测，经非对角协方差 K[5]
+        // 会推爆垂速（hil 闭环回归：恒定比力+气压下 vel_z 单拍 +24.6 → 爆炸）。
+        // **但清零的代价**：垂速退化为纯 IMU 积分 → 零偏留下稳态速度误差 →
+        // 高度环跟着走 → 真值持续漂移（实测 realistic 悬停漂 2.64m / max 15.5m）。
+        //
+        // 改为**有界增益**（内置默认 0.1）：实测 0.10 与 2.00 结果逐位相同 ⇒
+        // 实际 |k[5]| 从未超过 0.1，上限内就足以把垂速拉回来。
+        // `G_KVZ_FROM_ALT`：0 = 内置默认；<0 = 强制 0（历史对照）；>0 = 覆盖。
+        let kvz_ov = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_KVZ_FROM_ALT)) };
+        let kvz = if kvz_ov > 0.0 {
+            kvz_ov
+        } else if kvz_ov < 0.0 {
+            0.0
+        } else {
+            0.1f32
+        };
+        k[5] = k[5].clamp(-kvz, kvz);
         // 卡尔曼增益限幅（与 update_pos_r 一致，见 K_MAX 注释）：紧噪声观测下
         // 非对角增益可爆炸，限幅后 Joseph 协方差更新保持 PSD，阻断交叉项发散。
         for e in k.iter_mut() {
@@ -1005,6 +1229,32 @@ impl EkfEstimator {
         self.mag_ref = [c, s];
     }
 
+    /// 设置**离线标定**得到的机体硬铁偏置（与磁力计读数同单位）。
+    ///
+    /// `update_mag` 使用前会从读数中扣除。默认 `[0,0,0]`（不补偿）。
+    ///
+    /// 工程上硬铁用**离线标定**（多姿态采集取各轴 min/max 中心）而非在线估计：
+    /// 硬铁在静止悬停下不可观（无旋转 → 偏置与场无法区分）。与 `set_mag_declination`
+    /// 同形态：两者都是“把已标定的磁环境参数告诉 EKF”。参见
+    /// `docs/stage1-attitude-findings.md` F7。
+    pub fn set_mag_hard_iron(&mut self, hard_iron: [f32; 3]) {
+        self.mag_hard_iron = hard_iron;
+    }
+
+    /// 注入**世界系平移加速度估计**（NED，m/s²），用于重力锚定的平移补偿。
+    ///
+    /// 默认 `[0,0,0]`（不补偿，与历史行为一致）。详见字段文档与
+    /// `docs/stage2-attitude-ctrl-findings.md` P4。
+    pub fn set_world_accel(&mut self, a_world: [f32; 3]) {
+        self.world_accel = if a_world.iter().all(|v| v.is_finite()) {
+            a_world
+        } else {
+            [0.0; 3]
+        };
+        // 调用方直接注入 ⇒ 视为**可信源**（不经平移门控）。
+        self.world_accel_trusted = true;
+    }
+
     /// 磁力计航向锚定：把世界系水平磁场方向拉回磁北参考（+X），锚定四元数 yaw。
     ///
     /// 与 `att_alpha` 重力修正对称：重力锚 roll/pitch（世界系重力 → +Z），
@@ -1026,6 +1276,21 @@ impl EkfEstimator {
         if !m.iter().all(|v| v.is_finite()) {
             return;
         }
+        // [已回退 2026-09-20] 磁锚陀螺门控：曾与重力锚定对称加了一道门，
+        // 动机是追 M 场**闭环**测试 `x_hover_noise` 的劣化。但：
+        //   ① 阶段 1 的任何开环测试都不需要它；
+        //   ② 加入后 M 场 `x_env_faults::mag_disturb_keeps_attitude` 出现**固件崩溃**
+        //      （`UC_ERR_INSN_INVALID` @ step 307）；
+        //   ③ 属越出阶段 1 范围的改动。
+        // 故回退，连同 `x_hover_noise` 一并移交阶段 2/4。
+        // 详见 `docs/stage1-attitude-findings.md` F7。
+        const W_GYRO: f32 = 1.0;
+        // 扣除**离线标定**的硬铁偏置（默认零 = 不补偿）。
+        let m = [
+            m[0] - self.mag_hard_iron[0],
+            m[1] - self.mag_hard_iron[1],
+            m[2] - self.mag_hard_iron[2],
+        ];
         let m_world = rotate_vec_by_quat(self.att, m);
         let mh = sqrt(m_world[0] * m_world[0] + m_world[1] * m_world[1]);
         // 水平磁场过弱（磁力计几乎指向天顶/地磁水平分量≈0）→ 无法提供航向参考。
@@ -1040,7 +1305,17 @@ impl EkfEstimator {
         let cy = -m_world[0] * ry + m_world[1] * rx;
         let yaw_err = crate::math::atan2(-cy, cx);
         // 归一化到 [-π, π]：atan2 已保证，无需 wrap。
-        let k = self.mag_alpha * 0.5;
+        //
+        // 【已否决 B 方案：场模长一致性门控】2026-09-21
+        // 曾尝试：`|m_world|` 偏离慢 EMA 标称超容差 → 按比例关闭锚定。
+        // 实测否决（H 场扫容差，硬铁 `[0.3,-0.2,0.4]` + 10° 摆动）：
+        //   tol ≥ 0.02 → 门**从不触发**（10° 倾角下 |m| 仅变 ±1.1%）；
+        //   tol < 0.02 → 在噪声上乱触发，yaw RMSE 反而从 21.9° 劣化到 24.8°。
+        // 根因：硬铁是**方向**误差，不是模长误差 —— `|m_world| = |R^T·B + h|`
+        // 对小倾角只是二阶变化。⇒ 模长门控在原理上盖不住它。
+        // 正确修法是**离线标定扣除**（`mag_hard_iron` / `set_mag_hard_iron`）。
+        // 详见 `docs/stage1-attitude-findings.md` F7。
+        let k = self.mag_alpha * 0.5 * W_GYRO;
         let dq = Quaternion::from_axis_angle([0.0, 0.0, 1.0], Radian(yaw_err * k));
         self.att = (dq * self.att).normalize();
     }
@@ -1318,5 +1593,58 @@ mod tests {
         let mut c = [0.0f32; 4];
         mat_mul(&a, &b, &mut c, 2, 2, 2);
         println!("A*B      = {:?}  (expect [19,22,43,50])", c);
+    }
+
+    /// 磁硬铁**离线标定**的有效性：标定后航向偏置应被消除。
+    ///
+    /// 硬铁是机体固定偏置 → 磁航向产生常数偏置；且**无法被任何门控发现**
+    /// （静止时 |ω|≈0、偏置恒定时模长/方向也不变）。工程上靠离线标定扣除。
+    /// 本测试：传感器带硬铁 `hi`，把同一值经 `set_mag_hard_iron` 告知 EKF
+    /// （模拟标定结果）→ yaw 应≈0；不告知 → 明显偏。
+    fn mag_anchor_yaw(hard_iron: [f32; 3], calib: Option<[f32; 3]>, steps: u32) -> f32 {
+        let dt = 0.004f32;
+        let mut ekf = EkfEstimator::default_quad();
+        if let Some(c) = calib {
+            ekf.set_mag_hard_iron(c);
+        }
+        ekf.set_initial_attitude(Quaternion::IDENTITY);
+        // 世界系地磁（NED：水平指北 + 垂直向下为负，见 plant.rs 符号约定）
+        let field_world = [0.2f32, 0.0, -0.4];
+        for _ in 0..steps {
+            // 静止水平：比力 = [0,0,-9.81]，陀螺零（隔离出纯航向偏置）
+            let imu = ImuSample {
+                accel: [
+                    MeterPerSecondSquared(0.0),
+                    MeterPerSecondSquared(0.0),
+                    MeterPerSecondSquared(-9.81),
+                ],
+                gyro: [RadianPerSecond(0.0); 3],
+            };
+            // 机体磁场 = R^T(world)（att=identity → 等于 world）+ 硬铁
+            let m = [
+                field_world[0] + hard_iron[0],
+                field_world[1] + hard_iron[1],
+                field_world[2] + hard_iron[2],
+            ];
+            ekf.step(Second(dt), imu, None, None);
+            ekf.update_mag(Some(m));
+        }
+        ekf.state().att.yaw()
+    }
+
+    #[test]
+    fn mag_hard_iron_calibration_removes_heading_bias() {
+        let hi = [0.3f32, -0.2, 0.4];
+        let uncal = mag_anchor_yaw(hi, None, 2500).to_degrees();
+        let cal = mag_anchor_yaw(hi, Some(hi), 2500).to_degrees();
+        std::println!("[mag-calib] 未标定 yaw={uncal:.2}°  标定后 yaw={cal:.2}°");
+        assert!(
+            uncal.abs() > 10.0,
+            "未标定时硬铁应产生明显航向偏置，实际 {uncal:.2}°"
+        );
+        assert!(
+            cal.abs() < 2.0,
+            "标定后航向偏置应被消除（<2°），实际 {cal:.2}°"
+        );
     }
 }
