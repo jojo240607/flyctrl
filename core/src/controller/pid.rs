@@ -23,6 +23,15 @@ pub static mut DBG_PRE: f32 = 0.0;
 #[used]
 pub static mut DBG_THR: f32 = 0.0;
 
+/// [联调诊断] **倾角指令观测**：`[acc_n, acc_e, tilt_n, tilt_e]`（clamp 前后各两个）。
+///
+/// 用途（H2 专项）：判断倾角指令是否**顶满 `tilt_max`**。
+/// `tilt = clamp(acc/g, ±tilt_max)` —— 一旦顶满，倾角指令打满 ⇒ 姿态环被推到极限
+/// ⇒ 电机饱和 ⇒ 0.3~0.7Hz 极限环（见 `docs/stage4-outer-loop-findings.md` P14）。
+/// 不补这个观测点，就只能看到“电机饱和”这个下游现象，看不到根因那一步。
+#[used]
+pub static mut DBG_TILT: [f32; 4] = [0.0; 4];
+
 pub struct PidController {
     // 位置外环 P：位置误差 -> 期望速度（世界系）
     kp_xy: f32,
@@ -266,6 +275,15 @@ impl Controller for PidController {
         // 采用四元数误差内环（见下），这里把世界系期望加速度转换为期望姿态四元数。
         let tilt_n = clampf(acc_n / g, -self.tilt_max, self.tilt_max);
         let tilt_e = clampf(acc_e / g, -self.tilt_max, self.tilt_max);
+        // ⚠️ **有条件写**（重要）：每拍无条件写一个 16B 静态会把控制任务推过 4ms 预算
+        // ——实测同一固件仅加这条 store，`x_hover_noise` 就从 20.00°/28.64°（有界极限环）
+        // 变成 141.90°/87.38°（40s 后发散）。固件里已有 `DBG_PID`(48B)/`DBG_MOTOR`(16B)
+        // 等多个每拍诊断量，本条是压垮的那一根。
+        // 而 H2 专项真正要问的是"**倾角是否顶满**"，所以只在**顶满时**记录 ⇒ 正常情况
+        // 几乎零成本（一个可预测分支），且保留关键信息。
+        if tilt_n.abs() >= self.tilt_max - 1e-6 || tilt_e.abs() >= self.tilt_max - 1e-6 {
+            unsafe { DBG_TILT = [acc_n, acc_e, tilt_n, tilt_e]; }
+        }
 
         // 关键：机体倾斜后推力竖直分量 = T·cos(φ)，必须按 1/cos(φ) 放大总推力，
         // 否则一倾斜就掉高 -> 高度环进一步减推力 -> 死亡螺旋翻滚。
@@ -300,6 +318,54 @@ impl Controller for PidController {
         // 导致东向速度指令产生西向推力、东向持续漂移发散（Hover 逐秒诊断 y: 0→-65m）。
         let q_des = Quaternion::from_euler(Radian(tilt_e), Radian(-tilt_n), yaw);
 
+        self.control_attitude(_dt, q_des, des_thrust, est)
+    }
+
+    fn reset(&mut self) {
+        // 四元数误差内环无状态积分；清除垂向位置积分项防 windup 残留
+        self.iz = 0.0;
+        // 阶段 11-A：重置 EMA 滤波状态，避免跨任务/重启残留
+        self.filt_vd = 0.0;
+        self.filt_d = 0.0;
+        self.filt_w = [0.0; 3];
+        self.rate_filt_init = false;
+        self.filt_init = false;
+        self.dbg_step = 0;
+    }
+}
+
+#[inline]
+fn clampf(v: f32, lo: f32, hi: f32) -> f32 {
+    if v < lo {
+        lo
+    } else if v > hi {
+        hi
+    } else {
+        v
+    }
+}
+
+/// 姿态内环的独立入口（固有方法，不属于 `Controller` trait）。
+impl PidController {
+    /// **姿态内环**：期望姿态 + 总推力 → 执行器指令（**不含**位置/速度外环）。
+    ///
+    /// 从 [`control`](Controller::control) 尾部提取，使姿态内环**可独立驱动**。
+    /// 动机（阶段 2）：姿态环原先**没有外部入口** —— `q_des` 只由外环在
+    /// `control()` 内部生成（`tilt = clamp(acc/g, ±tilt_max)`），而阶段 2 的核心
+    /// 需求是“先用**真值姿态**验证控制器本身，再接入估计姿态”。
+    ///
+    /// `control()` 内部调用本方法，**行为逐位不变**（纯提取，无逻辑改动）。
+    ///
+    /// 链路：`omega` 一阶低通 → `attitude_rates`（四元数误差 P-D → 期望机体角速率）
+    /// → `x4_mix` → 限幅。注意此处**无独立速率 PID**：角速率指令直接进混控。
+    pub fn control_attitude(
+        &mut self,
+        _dt: Second,
+        q_des: Quaternion,
+        des_thrust: f32,
+        est: &VehicleState,
+    ) -> ActuatorCmd {
+        let dt = _dt.0;
         // --- 内环：四元数姿态误差 -> 期望机体角速度（标准鲁棒写法，无欧拉角奇点） ---
         // 复用共享姿态内环 `attitude::attitude_rates`（P3-A3 提取，与 TECS 完全一致）。
         // 含：q_err = q_est^-1 ⊗ q_des、误差旋转向量 ≈ 2·sign(w)·(x,y,z)、
@@ -345,28 +411,5 @@ impl Controller for PidController {
                 clampf(motors[3], 0.0, 1.0),
             ],
         }
-    }
-
-    fn reset(&mut self) {
-        // 四元数误差内环无状态积分；清除垂向位置积分项防 windup 残留
-        self.iz = 0.0;
-        // 阶段 11-A：重置 EMA 滤波状态，避免跨任务/重启残留
-        self.filt_vd = 0.0;
-        self.filt_d = 0.0;
-        self.filt_w = [0.0; 3];
-        self.rate_filt_init = false;
-        self.filt_init = false;
-        self.dbg_step = 0;
-    }
-}
-
-#[inline]
-fn clampf(v: f32, lo: f32, hi: f32) -> f32 {
-    if v < lo {
-        lo
-    } else if v > hi {
-        hi
-    } else {
-        v
     }
 }
