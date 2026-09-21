@@ -232,6 +232,8 @@ pub struct EkfEstimator {
     /// 锚定交流门控状态：`a_h` 的 EMA 均值与绝对偏差（一阶包络）。
     acc_h_mean: f32,
     acc_h_dev: f32,
+    /// 最近一拍 dt（s）：供 `update_mag` 等"无 dt 参数的观测回调"使用。
+    last_dt: f32,
     mag_ref: [f32; 2],  // 世界系水平参考地磁方向（单位向量）：默认 (1,0)=地理北；
                         // 有磁偏角时 set_mag_declination 旋转该参考 → 磁航向转地理航向
     /// 机体硬铁偏置（与磁力计同单位），由**离线标定**得到，默认零。
@@ -322,6 +324,7 @@ impl EkfEstimator {
             mag_alpha: 0.05,  // 微弱航向锚定：yaw 误差每拍吸收 2.5%（0.05*0.5）
             acc_h_mean: 0.0,
             acc_h_dev: 0.0,
+            last_dt: 0.0,
             mag_ref: [1.0, 0.0], // 默认磁北=地理北（无偏角）
             mag_hard_iron: [0.0; 3], // 默认未标定（零偏置）
             world_accel: [0.0; 3],   // 默认零平移（→ 与历史行为一致）
@@ -429,6 +432,7 @@ impl Estimator for EkfEstimator {
         airspeed: Option<AirspeedSample>,
     ) -> VehicleState {
         let dt = dt.0;
+        self.last_dt = dt;
         // 标定旋钮（易失读：由外部写入，普通读会被常量折叠掉）
         let gyro_bias_k = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_GYRO_BIAS_K)) };
         let att_acc_ac = {
@@ -1454,8 +1458,33 @@ impl EkfEstimator {
         // 正确修法是**离线标定扣除**（`mag_hard_iron` / `set_mag_hard_iron`）。
         // 详见 `docs/stage1-attitude-findings.md` F7。
         let k = alpha * 0.5 * W_GYRO;
-        let dq = Quaternion::from_axis_angle([0.0, 0.0, 1.0], Radian(yaw_err * k));
+        let corr = yaw_err * k;
+        let dq = Quaternion::from_axis_angle([0.0, 0.0, 1.0], Radian(corr));
         self.att = (dq * self.att).normalize();
+
+        // ---- 陀螺零偏（Z 分量）在线估计：**以磁力计为参考** ----
+        //
+        // ## 为何参考源必须是磁力计，而不是比力（阶段 1 的方案修正）
+        // 原方案打算"零偏改由速度/位置创新观测"。分析后**否决**：
+        //   速度观测经标准卡尔曼增益更新 `x[6..8]`，需要协方差里存在**姿态状态**
+        //   （零偏经姿态→重力投影→速度的耦合）。而我们的姿态**不在协方差里**
+        //   （是独立的固定-α 锚定）⇒ 交叉项恒≈0 ⇒ 这正是 `x[6..8]`"从未被任何
+        //   观测更新"的**根本原因**；速度对该零偏的耦合还是**二阶**的（经姿态二次
+        //   积分），即使硬接也很弱。
+        //
+        // 而**磁力计是世界系方向参考**（不像比力会被水平加速度污染）⇒ 抗加速、
+        // 抗风的零偏参考 ✓。`update_mag` 施加的 yaw 修正正是"Z 陀螺零偏造成的
+        // 航向漂移"被拉回的体现：稳态下**修正速率 = −零偏_z**（同重力锚定的推导）。
+        //
+        // 只估 Z 分量：本处修正只绕世界 Z（= 航向），故只能观测 Z 零偏。roll/pitch
+        // 的零偏需 Stage 2（风状态）或 Stage 3（误差状态 + NIS）方能可靠观测。
+        let gbk = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_GYRO_BIAS_K)) };
+        if gbk > 0.0 && self.last_dt > 1e-6 {
+            let inv_dt = 1.0 / self.last_dt;
+            let obs = -corr * inv_dt;
+            self.x[8] += gbk * (obs - self.x[8]) * self.last_dt;
+            self.x[8] = self.x[8].clamp(-GYRO_BIAS_MAX, GYRO_BIAS_MAX);
+        }
     }
 }
 
