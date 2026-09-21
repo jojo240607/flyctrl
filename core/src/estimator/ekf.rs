@@ -34,6 +34,27 @@ pub static mut G_GYRO_BIAS_K: f32 = 0.0;
 /// 陀螺零偏估计限幅（rad/s）。消费级 IMU 零偏远小于此；仅防异常值。
 const GYRO_BIAS_MAX: f32 = 0.05;
 
+/// [标定] 重力锚定的**水平非重力加速度门控**满闭阈值（m/s²）。哨兵 <0 = 编译期默认。
+///
+/// 为何需要第四个门控：锚定的前提是"比力方向 = 重力方向"。该前提只要求
+/// **水平非重力加速度 ≈ 0** —— 而这一点**前面三个门控都看不出来**：
+///   - 幅值门控 w：稳态抗风时比力幅值仍 = g（推力与阻力水平相消、合力竖直），
+///     幅值门控**大开**；
+///   - 方向门控 w_align：同理，比力方向仍竖直、与估计重力夹角≈0，**大开**；
+///   - 陀螺门控 w_gyro：平稳抗风时 |ω| 很小，**大开**。
+/// 但阵风/湍流/机动时比力确实含水平分量 ⇒ 锚定把姿态错误拉向"比力反方向"
+/// （那不是重力）⇒ 反而劣化。实测（H 场）：att_alpha 由 0 改 0.02 后，
+/// 无风档漂移 9.36 -> 3.12m（受益），但 **B3 风档 3.39 -> 19.22m**（劣化），
+/// 并附带 4 项新失败（mag_hover/sil/avoidance/monte_carlo）。
+///
+/// 判据：`a_h = |R·a|` 的水平分量（世界系非重力加速度）越小越可信。
+/// `a_h < 阈值/3` 全开，`> 阈值` 全闭，中间线性。
+#[used]
+pub static mut G_ATT_ACC_GATE: f32 = -1.0;
+
+/// 水平非重力加速度门控的编译期默认满闭阈值（m/s²）。
+const ATT_ACC_GATE_DEFAULT: f32 = 3.0;
+
 /// [标定] `q_accel` 运行时覆盖（0 = 用 `EkfEstimator` 的编译期值）。
 ///
 /// 用途：协方差更新改用 Joseph 形式后，位置/高度通道需要重标定——原误实现的协方差
@@ -385,6 +406,10 @@ impl Estimator for EkfEstimator {
         let dt = dt.0;
         // 标定旋钮（易失读：由外部写入，普通读会被常量折叠掉）
         let gyro_bias_k = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_GYRO_BIAS_K)) };
+        let att_acc_gate = {
+            let v = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ATT_ACC_GATE)) };
+            if v >= 0.0 { v } else { ATT_ACC_GATE_DEFAULT }
+        };
         // 累计自上次新鲜速度观测的时间（供 `update_vel_r` 的 Doppler 差分用）。
         if self.vel_obs_dt >= 0.0 {
             self.vel_obs_dt += dt;
@@ -520,7 +545,22 @@ impl Estimator for EkfEstimator {
                 } else {
                     0.0
                 };
-                let k = self.att_alpha * 0.5 * w * w_align * w_gyro;
+                // 第四个门控：水平非重力加速度（见 G_ATT_ACC_GATE 的说明）。
+                // 世界系比力 = R·a；重力竖直 ⇒ 其水平分量即非重力水平加速度。
+                let a_world_h = crate::vehicle::rotate_vec_by_quat(self.att, a);
+                let a_h = sqrt(a_world_h[0] * a_world_h[0] + a_world_h[1] * a_world_h[1]);
+                let gate_full = att_acc_gate;
+                let gate_zero = att_acc_gate / 3.0;
+                let w_acc = if gate_full <= 0.0 {
+                    1.0 // 门控关闭（阈值 <=0：保持历史行为）
+                } else if a_h <= gate_zero {
+                    1.0
+                } else if a_h >= gate_full {
+                    0.0
+                } else {
+                    (gate_full - a_h) / (gate_full - gate_zero)
+                };
+                let k = self.att_alpha * 0.5 * w * w_align * w_gyro * w_acc;
                 // 把估计重力向量 down_body 锚定到【真实重力方向】，即比力的反方向 (-a)。
                 // 修正轴 = down_body × (-a/an)：n 为垂直于二者的旋转轴，
                 // 右乘（机体系）dq 使 down_body 旋转向 -a，姿态向水平收敛。
@@ -552,7 +592,7 @@ impl Estimator for EkfEstimator {
                 // 陀螺漂移 0.34°/min 造成 **9.36m/60s 持续位置漂移且仍在增长**；
                 // 而只注入加计漂移时仅 1.52m（= 完全无注入）⇒ 该漂移**完全**
                 // 由陀螺零偏贡献（分离实验，见 wind_turb_scan::imu_bias_separation_no_wind）。
-                let gyro_learn = gyro_bias_k * w * w_align * w_gyro;
+                let gyro_learn = gyro_bias_k * w * w_align * w_gyro * w_acc;
                 if gyro_learn > 0.0 {
                     let inv_dt = 1.0 / dt;
                     let obs = [-ax * inv_dt, -ay * inv_dt, -az * inv_dt];
