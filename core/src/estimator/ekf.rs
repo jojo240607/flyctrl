@@ -234,6 +234,17 @@ pub struct EkfEstimator {
     acc_h_dev: f32,
     /// 最近一拍 dt（s）：供 `update_mag` 等"无 dt 参数的观测回调"使用。
     last_dt: f32,
+    /// 阻力加速度系数 `k = 0.5·ρ·Cd/m`（水平 2 轴共用）。
+    ///
+    /// 阻力加速度 `a_drag = -k·|v_rel|·v_rel`（沿相对风速反向），与
+    /// `plant.rs::aero_drag_body` **同一模型**、同一参数来源（`VehicleConfig`）。
+    /// **0 = 未设置/关闭**（阶段 2 的风状态在 k=0 时退化为不启用，既有行为逐位不变）。
+    ///
+    /// 为何需要显式设置：EKF 是**纯参数**的（`new(att_alpha, q_vel, …)`），
+    /// 拿不到 `VehicleConfig` ⇒ 由调用方（固件/SIL harness）在构造后注入。
+    drag_k: f32,
+    /// 水平风估计（世界系 NED，m/s）——阶段 2 的观测器输出，供锚定扣减用。
+    wind_est: [f32; 2],
     mag_ref: [f32; 2],  // 世界系水平参考地磁方向（单位向量）：默认 (1,0)=地理北；
                         // 有磁偏角时 set_mag_declination 旋转该参考 → 磁航向转地理航向
     /// 机体硬铁偏置（与磁力计同单位），由**离线标定**得到，默认零。
@@ -325,6 +336,8 @@ impl EkfEstimator {
             acc_h_mean: 0.0,
             acc_h_dev: 0.0,
             last_dt: 0.0,
+            drag_k: 0.0,
+            wind_est: [0.0; 2],
             mag_ref: [1.0, 0.0], // 默认磁北=地理北（无偏角）
             mag_hard_iron: [0.0; 3], // 默认未标定（零偏置）
             world_accel: [0.0; 3],   // 默认零平移（→ 与历史行为一致）
@@ -404,6 +417,19 @@ impl EkfEstimator {
     /// 导致 GPS/气压首次校正前 PID 看到 ~5m 位置误差全油门弹射（见 PLAN 阶段 11-A）。
     /// 在仿真/实飞启动前用真实初始位置初始化，使首拍 ez≈0，避免初始 windup 弹射。
     /// 位置协方差压到 ~0.01m²（视为已收敛，避免初始大协方差经 F 矩阵耦合膨胀）。
+    /// 注入阻力加速度系数 `k = 0.5·ρ·Cd/m`（水平 2 轴共用）。见 `drag_k` 字段说明。
+    ///
+    /// 调用方应从 `VehicleConfig` 按其定义算出（ρ 取 `air_density`、Cd 取
+    /// `drag_coeff[0]`（水平）、m 取 `mass`）。**传 0 = 关闭阶段 2 风模型**。
+    pub fn set_drag_k(&mut self, k: f32) {
+        self.drag_k = if k.is_finite() && k > 0.0 { k } else { 0.0 };
+    }
+
+    /// 当前水平风估计（世界系 NED，m/s）。
+    pub fn wind_estimate(&self) -> [f32; 2] {
+        self.wind_est
+    }
+
     pub fn set_initial_position(&mut self, ned: [f32; 3]) {
         self.x[0] = ned[0];
         self.x[1] = ned[1];
@@ -652,6 +678,44 @@ impl Estimator for EkfEstimator {
                     }
                 }
             }
+        }
+
+        // ---- 阶段 2：水平风观测器（drag_k > 0 时生效；默认 0 = 完全不执行）----
+        //
+        // 依据（准稳态力平衡）：机体 -Z（推力方向）水平分量与阻力相消
+        //     m·g·tanθ = k·m·|v_rel|·v_rel        （k = 0.5ρCd/m，见 drag_k）
+        // ⇒ |v_rel| = sqrt(g·tanθ / k)，方向 = 推力水平分量方向（即倾斜指向）
+        // ⇒ v_wind = v_ground − v_rel
+        //
+        // 用途（阶段 2.3）：把**模型化的阻力**从比力中扣掉，锚定看到的才是纯重力 ——
+        // 这正是"H 场湍流风下锚定劣化"的正面解（湍流瞬间的 ΔD 被解释掉）。
+        //
+        // 局限（如实标注）：本式是**准稳态代数解**，湍流瞬态下 θ 与 v_rel 不同步 ⇒
+        // 估计滞后；且悬停时若 θ≈0 则 v_rel≈0（与"风在无相对运动时不可观"一致）。
+        // 之所以先做这个而不直接扩协方差（N:10→12）：**不动 N/P/F 的维度**，
+        // 风险与验证成本低得多；后续若要更准可升级为风状态（方案阶段 2.2 已备规格）。
+        if self.drag_k > 0.0 {
+            let up_b = crate::vehicle::rotate_vec_by_quat(self.att, [0.0, 0.0, 1.0]);
+            let hx = up_b[0];
+            let hy = up_b[1];
+            let hnorm = sqrt(hx * hx + hy * hy);
+            let mut vw = [0.0f32; 2];
+            if hnorm > 1e-3 && up_b[2].abs() > 1e-3 {
+                let tan_t = hnorm / up_b[2].abs();
+                let vr = sqrt((g * tan_t / self.drag_k).max(0.0));
+                let dir = [hx / hnorm, hy / hnorm];
+                // v_rel 指向推力水平分量方向；v_wind = v_ground − v_rel
+                vw = [self.x[3] - dir[0] * vr, self.x[4] - dir[1] * vr];
+            }
+            // 一阶低通（~0.5s 量级）：代数解瞬时噪声大，且湍流下需平滑
+            const W_ALPHA: f32 = 0.02;
+            self.wind_est[0] += W_ALPHA * (vw[0] - self.wind_est[0]);
+            self.wind_est[1] += W_ALPHA * (vw[1] - self.wind_est[1]);
+            for i in 0..2 {
+                self.wind_est[i] = self.wind_est[i].clamp(-30.0, 30.0);
+            }
+        } else {
+            self.wind_est = [0.0; 2];
         }
 
         // 位置/速度预测（世界系 NED）：a_world = R*(a_body) - [0,0,ab_z] + g_vec(z 向下正)
