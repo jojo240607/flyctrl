@@ -24,7 +24,7 @@ use crate::hal::actuator::{clamp_thrust, MotorActuator};
 use crate::hal::sensor::{AirspeedSensor, GpsSensor, ImuSensor, RtkSensor, VioSensor};
 use crate::math;
 use crate::units::{Meter, MeterPerSecondSquared, Radian, RadianPerSecond, Second};
-use crate::vehicle::{ActuatorCmd, ImuSample, PosSample, Quaternion, RtkSample, VehicleState, VioSample};
+use crate::vehicle::{rotate_vec_by_quat_inverse, ActuatorCmd, ImuSample, PosSample, Quaternion, RtkSample, VehicleState, VioSample};
 
 /// HIL/共享单步结果：本拍估计状态 + 健康等级 + 已限幅执行器指令。
 pub struct StepResult {
@@ -567,8 +567,19 @@ mod tests {
         let gps = Some(crate::vehicle::PosSample::pos_only([
             Meter(0.0), Meter(0.0), Meter(-5.0),
         ]));
+        // 磁力计必须与**真值姿态**自洽：世界系恒定地磁 `[0.2,0,0.4]` 旋到机体系。
+        // 本测试断言姿态收敛到设定点（yaw=0.7），所以按该姿态生成机体磁场。
+        //
+        // 历史：这里原本注入**恒定机体系** `[0.2,0,0.4]`（等价于磁场随飞行器一起转，
+        // 物理不成立）。当时 `EkfEstimator` 缺 `Estimator::update_mag` 的 trait 委托
+        // → 磁锚定静默失效 → 恒定场无人理会，yaw 停在设定点，“恰好”能过。
+        // 修好委托后锚定生效，它忠实地把 yaw 拉向恒定场所暗示的航向(0)，断言才暴露。
+        let mag_body = rotate_vec_by_quat_inverse(
+            Quaternion::from_euler(Radian(0.0), Radian(0.0), Radian(0.7)),
+            [0.2, 0.0, 0.4],
+        );
         for it in 0..300 {
-            let r = ctx.step_hil(Some(frd_hover), gps, Some(5.0), None, None, Some([0.2, 0.0, 0.4]), &sp, true, true, true, &mut sim_imu);
+            let r = ctx.step_hil(Some(frd_hover), gps, Some(5.0), None, None, Some(mag_body), &sp, true, true, true, &mut sim_imu);
             if it % 2 == 0 {
                 let a = r.est.att;
                 eprintln!(
@@ -585,7 +596,8 @@ mod tests {
         }
         assert!(ctx.hil_att_inited, "真实 IMU 帧到达后应完成姿态初始化");
         assert!(ctx.hil_pos_inited, "真实设定点到达后应完成位置初始化");
-        // 姿态应收敛到水平（roll/pitch ≈ 0），yaw 对齐设定点。
+        // 姿态应收敛到水平（roll/pitch ≈ 0），yaw 对齐**设定点**（磁力计已按该姿态注入，
+        // 所以“对齐设定点”与“对齐磁北”不再矛盾）。
         let a = ctx.est.state().att;
         assert!(a.roll().abs() < 0.5, "roll 应≈0，实测 {}", a.roll());
         assert!(a.pitch().abs() < 0.5, "pitch 应≈0，实测 {}", a.pitch());
