@@ -40,6 +40,12 @@ pub static mut DBG_TILT: [f32; 4] = [0.0; 4];
 #[used]
 pub static mut G_KI_XY: f32 = -1.0;
 
+/// [标定] 水平积分**上限**（m/s）运行时覆盖。哨兵同为 **<0 = 用编译期默认 2.0**。
+/// 为何必须可调：该夹子直接决定残余稳态偏移 —— 当所需稳态速度指令超过它时，
+/// 偏移被夹死为 `(des_v_need - 上限)/kp_xy`，此时**再加 `ki_xy` 也无用**。
+#[used]
+pub static mut G_I_XY_MAX: f32 = -1.0;
+
 pub struct PidController {
     // 位置外环 P：位置误差 -> 期望速度（世界系）
     kp_xy: f32,
@@ -270,23 +276,33 @@ impl Controller for PidController {
         // 水平位置积分（抗恒定扰动下的稳态偏移，如侧风）—— 与垂向 iz 对称：
         // 同样用**回算**抗饱和（饱和时把积分置为"恰使 des_v 抵达边界"的值）。
         // 积分上限 ±2.0 m/s，与垂向同口径。
-        const I_XY_MAX: f32 = 2.0;
+        // 积分上限：运行时旋钮（哨兵 <0 = 用编译期默认 2.0）。为何要可调：
+        // B3 风下所需稳态速度指令 ≈ 2.26 m/s > 2.0 ⇒ **积分撞上限**，
+        // 残余稳态偏移 = (des_v_need - I_XY_MAX)/kp_xy 被这个夹子决定。
+        let i_xy_max = {
+            let ov = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_I_XY_MAX)) };
+            if ov >= 0.0 {
+                ov
+            } else {
+                2.0
+            }
+        };
         let pre_ix = self.kp_xy * ex + sp.vel[0].0; // P 项 + 速度前馈（不含积分）
         let pre_iy = self.kp_xy * ey + sp.vel[1].0;
-        let mut ix_final = clampf(self.i_xy[0] + self.ki_xy * ex * dt, -I_XY_MAX, I_XY_MAX);
-        let mut iy_final = clampf(self.i_xy[1] + self.ki_xy * ey * dt, -I_XY_MAX, I_XY_MAX);
+        let mut ix_final = clampf(self.i_xy[0] + self.ki_xy * ex * dt, -i_xy_max, i_xy_max);
+        let mut iy_final = clampf(self.i_xy[1] + self.ki_xy * ey * dt, -i_xy_max, i_xy_max);
         if !self.rate_mode_xy {
             let dx = pre_ix + ix_final;
             if dx > self.vmax_xy {
-                ix_final = clampf(self.vmax_xy - pre_ix, -I_XY_MAX, I_XY_MAX);
+                ix_final = clampf(self.vmax_xy - pre_ix, -i_xy_max, i_xy_max);
             } else if dx < -self.vmax_xy {
-                ix_final = clampf(-self.vmax_xy - pre_ix, -I_XY_MAX, I_XY_MAX);
+                ix_final = clampf(-self.vmax_xy - pre_ix, -i_xy_max, i_xy_max);
             }
             let dy = pre_iy + iy_final;
             if dy > self.vmax_xy {
-                iy_final = clampf(self.vmax_xy - pre_iy, -I_XY_MAX, I_XY_MAX);
+                iy_final = clampf(self.vmax_xy - pre_iy, -i_xy_max, i_xy_max);
             } else if dy < -self.vmax_xy {
-                iy_final = clampf(-self.vmax_xy - pre_iy, -I_XY_MAX, I_XY_MAX);
+                iy_final = clampf(-self.vmax_xy - pre_iy, -i_xy_max, i_xy_max);
             }
         }
         self.i_xy = [ix_final, iy_final];
