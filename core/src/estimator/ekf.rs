@@ -703,7 +703,12 @@ impl Estimator for EkfEstimator {
             if hnorm > 1e-3 && up_b[2].abs() > 1e-3 {
                 let tan_t = hnorm / up_b[2].abs();
                 let vr = sqrt((g * tan_t / self.drag_k).max(0.0));
-                let dir = [hx / hnorm, hy / hnorm];
+                // ⚠️ 符号（首版写错，开环对真值验证时抓到）：
+                // `up_b = rotate_vec_by_quat(att, [0,0,1])` 在 NED/FRD 约定下是机体的
+                // **+Z（朝下）**，而**推力沿 −Z** ⇒ 推力的水平方向 = 该向量水平分量的
+                // **负向**。首版漏了这个负号，估计出的风与真值**符号相反**
+                // （实测：真值 北+5.40/东+2.16，估计 北-3.31/东-2.23）。
+                let dir = [-hx / hnorm, -hy / hnorm]; // 推力水平方向（朝上风）
                 // v_rel 指向推力水平分量方向；v_wind = v_ground − v_rel
                 vw = [self.x[3] - dir[0] * vr, self.x[4] - dir[1] * vr];
             }
