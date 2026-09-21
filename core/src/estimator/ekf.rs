@@ -37,6 +37,14 @@ pub static mut G_Q_ACCEL: f32 = 0.0;
 #[used]
 pub static mut G_Q_VEL: f32 = 0.0;
 
+/// [标定] `mag_alpha`（磁力计航向锚定强度）运行时覆盖。
+///
+/// ⚠️ 哨兵取值与其它旋钮**不同**：本旋钮用 **< 0（默认 -1）= 用编译期值**。
+/// 理由：`0` 是本旋钮的**有效取值**（= 关闭磁锚定，用于隔离磁路影响的对照实验），
+/// 不能用 0 当"未设置"哨兵，否则无法表达"显式关闭"。
+#[used]
+pub static mut G_MAG_ALPHA: f32 = -1.0;
+
 /// [标定] `r_vel`（Doppler 速度观测噪声）运行时覆盖（0 = 用编译期值）。
 #[used]
 pub static mut G_R_VEL: f32 = 0.0;
@@ -1266,7 +1274,12 @@ impl EkfEstimator {
     /// 绕世界 Z 轴按 `mag_alpha` 强度修正（符号：yaw 偏大 → 磁场偏东 → yaw_err<0
     /// → 绕 -Z 修正，yaw 减小）。roll/pitch 分量不受影响（绕世界 Z 纯 yaw 修正）。
     fn update_mag(&mut self, mag: Option<[f32; 3]>) {
-        if self.mag_alpha <= 0.0 {
+        // 标定旋钮（易失读：由外部写入，普通读会被常量折叠掉）。
+        let alpha = {
+            let ov = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_MAG_ALPHA)) };
+            if ov >= 0.0 { ov } else { self.mag_alpha }
+        };
+        if alpha <= 0.0 {
             return;
         }
         let m = match mag {
@@ -1315,7 +1328,7 @@ impl EkfEstimator {
         // 对小倾角只是二阶变化。⇒ 模长门控在原理上盖不住它。
         // 正确修法是**离线标定扣除**（`mag_hard_iron` / `set_mag_hard_iron`）。
         // 详见 `docs/stage1-attitude-findings.md` F7。
-        let k = self.mag_alpha * 0.5 * W_GYRO;
+        let k = alpha * 0.5 * W_GYRO;
         let dq = Quaternion::from_axis_angle([0.0, 0.0, 1.0], Radian(yaw_err * k));
         self.att = (dq * self.att).normalize();
     }
