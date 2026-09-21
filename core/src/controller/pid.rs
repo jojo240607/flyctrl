@@ -40,6 +40,15 @@ pub static mut DBG_TILT: [f32; 4] = [0.0; 4];
 #[used]
 pub static mut G_KI_XY: f32 = -1.0;
 
+/// [标定] `tilt_max`（倾角指令上限，rad）运行时覆盖。哨兵同规：**<0 = 用编译期值**。
+///
+/// 为何可调：H 场能力曲线显示 **5.4 m/s（蒲福 3 级上限）处漂移悬崖**（0.85→5.59m）。
+/// 物理解释：该风速下抗风稳态倾角需 ≈15.3°(pitch)+2.5°(roll)，叠加阵风摆动后逼近
+/// `tilt_max=20°` ⇒ **位置环饱和、失去纠偏能力**。本旋钮用于验证该解释：
+/// 若漂移随 `tilt_max` 单调改善，则"倾角权限"就是那个工程杠杆（代价：需推力余量）。
+#[used]
+pub static mut G_TILT_MAX: f32 = -1.0;
+
 /// [标定] 水平积分**上限**（m/s）运行时覆盖。哨兵同为 **<0 = 用编译期默认 2.0**。
 /// 为何必须可调：该夹子直接决定残余稳态偏移 —— 当所需稳态速度指令超过它时，
 /// 偏移被夹死为 `(des_v_need - 上限)/kp_xy`，此时**再加 `ki_xy` 也无用**。
@@ -381,15 +390,20 @@ impl Controller for PidController {
         // 高度推力：悬停 + 垂直加速度项（acc_d>0 表示要向下加速，减推力）。
         // 期望机体倾角（小角）：北向加速度 -> 俯仰，东向加速度 -> 横滚。
         // 采用四元数误差内环（见下），这里把世界系期望加速度转换为期望姿态四元数。
-        let tilt_n = clampf(acc_n / g, -self.tilt_max, self.tilt_max);
-        let tilt_e = clampf(acc_e / g, -self.tilt_max, self.tilt_max);
+        // 倾角上限旋钮（易失读；哨兵 <0 = 用编译期值）
+        let tilt_max_eff = {
+            let ov = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_TILT_MAX)) };
+            if ov > 0.0 { ov } else { self.tilt_max }
+        };
+        let tilt_n = clampf(acc_n / g, -tilt_max_eff, tilt_max_eff);
+        let tilt_e = clampf(acc_e / g, -tilt_max_eff, tilt_max_eff);
         // ⚠️ **有条件写**（重要）：每拍无条件写一个 16B 静态会把控制任务推过 4ms 预算
         // ——实测同一固件仅加这条 store，`x_hover_noise` 就从 20.00°/28.64°（有界极限环）
         // 变成 141.90°/87.38°（40s 后发散）。固件里已有 `DBG_PID`(48B)/`DBG_MOTOR`(16B)
         // 等多个每拍诊断量，本条是压垮的那一根。
         // 而 H2 专项真正要问的是"**倾角是否顶满**"，所以只在**顶满时**记录 ⇒ 正常情况
         // 几乎零成本（一个可预测分支），且保留关键信息。
-        if tilt_n.abs() >= self.tilt_max - 1e-6 || tilt_e.abs() >= self.tilt_max - 1e-6 {
+        if tilt_n.abs() >= tilt_max_eff - 1e-6 || tilt_e.abs() >= tilt_max_eff - 1e-6 {
             unsafe { DBG_TILT = [acc_n, acc_e, tilt_n, tilt_e]; }
         }
 
