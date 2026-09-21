@@ -110,6 +110,16 @@ pub static mut G_MAG_ALPHA: f32 = -1.0;
 #[used]
 pub static mut G_MAG3D_ALPHA: f32 = 0.0;
 
+/// [标定] `att_alpha`（重力锚定强度）运行时覆盖。
+///
+/// ⚠️ 哨兵同 `G_MAG_ALPHA`：**< 0（默认 -1）= 用编译期值**（`0` 是有效值 = 关闭锚定）。
+///
+/// 为何需要可调：路线 2.2e 提供了**加速度免疫**的磁参考后，重力锚定（其参考=比力，
+/// 会被水平加速度污染）应当**下调甚至取消** —— 这将使 "0.0 vs 0.02" 那个两难
+/// （H/M 口径不一致 vs 4 项测试红）**从根上消失**，故必须能扫。
+#[used]
+pub static mut G_ATT_ALPHA: f32 = -1.0;
+
 /// [标定] `r_vel`（Doppler 速度观测噪声）运行时覆盖（0 = 用编译期值）。
 #[used]
 pub static mut G_R_VEL: f32 = 0.0;
@@ -491,6 +501,10 @@ impl Estimator for EkfEstimator {
             let v = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ATT_ACC_AC)) };
             if v >= 0.0 { v } else { ATT_ACC_AC_DEFAULT }
         };
+        let att_alpha_eff = {
+            let v = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ATT_ALPHA)) };
+            if v >= 0.0 { v } else { self.att_alpha }
+        };
         let att_acc_gate = {
             let v = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ATT_ACC_GATE)) };
             if v >= 0.0 { v } else { ATT_ACC_GATE_DEFAULT }
@@ -525,7 +539,7 @@ impl Estimator for EkfEstimator {
         self.att = self.att.integrate(wx, wy, wz, dt);
 
         // 可选微弱重力修正（锚定 roll/pitch 到重力方向）
-        if self.att_alpha > 0.0 {
+        if att_alpha_eff > 0.0 {
             // 比力直接使用，**不做额外低通**。
             //
             // 历史：此处原有一级 `accel_lp`（`lp_coeff=0.05`，fc≈2.04Hz，注释称"滤 40Hz 振动"）。
@@ -660,7 +674,7 @@ impl Estimator for EkfEstimator {
                     (att_acc_ac - self.acc_h_dev) / (att_acc_ac - att_acc_ac / 3.0)
                 };
                 let w_acc = w_inst * w_ac;
-                let k = self.att_alpha * 0.5 * w * w_align * w_gyro * w_acc;
+                let k = att_alpha_eff * 0.5 * w * w_align * w_gyro * w_acc;
                 // 把估计重力向量 down_body 锚定到【真实重力方向】，即比力的反方向 (-a)。
                 // 修正轴 = down_body × (-a/an)：n 为垂直于二者的旋转轴，
                 // 右乘（机体系）dq 使 down_body 旋转向 -a，姿态向水平收敛。
