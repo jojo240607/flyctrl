@@ -34,6 +34,13 @@ pub static mut G_GYRO_BIAS_K: f32 = 0.0;
 /// 陀螺零偏估计限幅（rad/s）。消费级 IMU 零偏远小于此；仅防异常值。
 const GYRO_BIAS_MAX: f32 = 0.05;
 
+/// 阶段 3 层 1：门控须**连续**满足此时长（s）才允许零偏学习。见 `gate_hold_s`。
+const GYRO_BIAS_HOLD_S: f32 = 2.0;
+
+/// 阶段 3 层 1：`a_h` **交流包络**（`acc_h_dev`，m/s²）的学习门限。
+/// 超过它视为"扰动剧烈" ⇒ 冻结学习（EMA 系数 0.02@4ms ⇒ 时间常数 ~0.2s）。
+const GYRO_BIAS_DEV_MAX: f32 = 0.5;
+
 /// [标定] 重力锚定的**水平非重力加速度门控**满闭阈值（m/s²）。哨兵 <0 = 编译期默认。
 ///
 /// 为何需要第四个门控：锚定的前提是"比力方向 = 重力方向"。该前提只要求
@@ -258,6 +265,10 @@ pub struct EkfEstimator {
     acc_h_dev: f32,
     /// 最近一拍 dt（s）：供 `update_mag` 等"无 dt 参数的观测回调"使用。
     last_dt: f32,
+    /// 阶段 3 层 1：**门控持续满足的累计时长**（s）。
+    /// 零偏学习只在"参考可证干净"**持续**足够久后进行 —— 瞬时满足不足以说明
+    /// 参考干净（机动/湍流的瞬时也可能偶然过门），持续性才排除瞬态污染。
+    gate_hold_s: f32,
     /// 阻力加速度系数 `k = 0.5·ρ·Cd/m`（水平 2 轴共用）。
     ///
     /// 阻力加速度 `a_drag = -k·|v_rel|·v_rel`（沿相对风速反向），与
@@ -364,6 +375,7 @@ impl EkfEstimator {
             acc_h_mean: 0.0,
             acc_h_dev: 0.0,
             last_dt: 0.0,
+            gate_hold_s: 0.0,
             drag_k: 0.0,
             wind_est: [0.0; 2],
             mag_ref3d: [0.0; 3], // 未设置 ⇒ 全姿态修正不生效（见 update_mag）
@@ -706,7 +718,29 @@ impl Estimator for EkfEstimator {
                 // 陀螺漂移 0.34°/min 造成 **9.36m/60s 持续位置漂移且仍在增长**；
                 // 而只注入加计漂移时仅 1.52m（= 完全无注入）⇒ 该漂移**完全**
                 // 由陀螺零偏贡献（分离实验，见 wind_turb_scan::imu_bias_separation_no_wind）。
-                let gyro_learn = gyro_bias_k * w * w_align * w_gyro * w_acc;
+                // ---- 阶段 3 层 1：持续性判据 + 收紧的交流门控 ----
+                //
+                // 为何需要（上一轮实测教训）：`G_GYRO_BIAS_K` 扫描**单调变差**
+                // （真值 7.76°→11.41°）—— 说明**参考污染仍被学进了零偏**。
+                // 原因：现有门控是**瞬时**的，机动/湍流中偶然过门的采样照样被学。
+                //
+                // 两条收紧：
+                // ① **持续性**：门控须**连续**满足 `GYRO_BIAS_HOLD_S` 秒才开始学习；
+                //    一旦被破坏立即清零（并停学）⇒ 排除瞬态污染。
+                // ② **交流包络**：`w_acc` 已用瞬时 `a_h`（抖动，见 att_acc_gate_scan
+                //    的 88m 灾难点）；改用 `acc_h_dev`（`a_h` 的 EMA 绝对偏差 = 一阶
+                //    包络）的**独立**门控，阈值更紧。
+                let gates_ok = w > 0.9 && w_align > 0.9 && w_gyro > 0.9 && self.acc_h_dev < GYRO_BIAS_DEV_MAX;
+                if gates_ok {
+                    self.gate_hold_s += dt;
+                } else {
+                    self.gate_hold_s = 0.0;
+                }
+                let gyro_learn = if self.gate_hold_s >= GYRO_BIAS_HOLD_S {
+                    gyro_bias_k * w * w_align * w_gyro * w_acc
+                } else {
+                    0.0
+                };
                 if gyro_learn > 0.0 {
                     let inv_dt = 1.0 / dt;
                     let obs = [-ax * inv_dt, -ay * inv_dt, -az * inv_dt];
