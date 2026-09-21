@@ -96,6 +96,20 @@ pub static mut G_Q_VEL: f32 = 0.0;
 #[used]
 pub static mut G_MAG_ALPHA: f32 = -1.0;
 
+/// [标定] **磁参考全姿态修正**强度（1/s）。**0 = 关闭**（既有行为：只修 yaw）。
+///
+/// 路线 2.2e：把磁参考从"只绕世界 Z 修 yaw"扩为**修全姿态（含 roll/pitch）**。
+/// 动机：比力锚定（`att_alpha`）会被水平加速度污染（H 场湍流风劣化 3.39→19.22m
+/// 的根源），而**磁场与世界加速度无耦合** ⇒ 是加速度免疫的姿态参考。
+///
+/// 前置条件（已验证）：必须扣除硬铁 —— 实测未补偿时磁场方向偏差最坏 **39.54°**
+/// （解析 40.06°），补偿后 **0°**（`fly-sim-core/tests/mag_attitude_ref.rs`）。
+/// 硬铁同步注入见 `FlyController::new`（F7 使用约定）。
+///
+/// 局限：需已知**磁倾角**（`mag_ref3d`）；软铁未建模；标定残差与磁噪声直接进姿态。
+#[used]
+pub static mut G_MAG3D_ALPHA: f32 = 0.0;
+
 /// [标定] `r_vel`（Doppler 速度观测噪声）运行时覆盖（0 = 用编译期值）。
 #[used]
 pub static mut G_R_VEL: f32 = 0.0;
@@ -245,6 +259,10 @@ pub struct EkfEstimator {
     drag_k: f32,
     /// 水平风估计（世界系 NED，m/s）——阶段 2 的观测器输出，供锚定扣减用。
     wind_est: [f32; 2],
+    /// 世界系参考地磁场**三维**方向（含倾角；不必单位化），供路线 2.2e 的全姿态
+    /// 修正用（强度旋钮见模块级 `G_MAG3D_ALPHA`）。
+    /// 全姿态修正用；`mag_ref`（二维水平方向）继续供只修 yaw 的旧路径使用。
+    mag_ref3d: [f32; 3],
     mag_ref: [f32; 2],  // 世界系水平参考地磁方向（单位向量）：默认 (1,0)=地理北；
                         // 有磁偏角时 set_mag_declination 旋转该参考 → 磁航向转地理航向
     /// 机体硬铁偏置（与磁力计同单位），由**离线标定**得到，默认零。
@@ -338,6 +356,7 @@ impl EkfEstimator {
             last_dt: 0.0,
             drag_k: 0.0,
             wind_est: [0.0; 2],
+            mag_ref3d: [0.0; 3], // 未设置 ⇒ 全姿态修正不生效（见 update_mag）
             mag_ref: [1.0, 0.0], // 默认磁北=地理北（无偏角）
             mag_hard_iron: [0.0; 3], // 默认未标定（零偏置）
             world_accel: [0.0; 3],   // 默认零平移（→ 与历史行为一致）
@@ -421,6 +440,13 @@ impl EkfEstimator {
     ///
     /// 调用方应从 `VehicleConfig` 按其定义算出（ρ 取 `air_density`、Cd 取
     /// `drag_coeff[0]`（水平）、m 取 `mass`）。**传 0 = 关闭阶段 2 风模型**。
+    /// 设置世界系参考地磁场**三维**方向（含倾角），供全姿态修正（路线 2.2e）用。
+    /// 传全零 = 不启用（回到只修 yaw）。典型：本仓世界场 `[0.5, 0, 0.4]`
+    /// （水平 0.5、垂向 0.4，倾角 ≈38.7°）。
+    pub fn set_mag_ref3d(&mut self, b: [f32; 3]) {
+        self.mag_ref3d = b;
+    }
+
     pub fn set_drag_k(&mut self, k: f32) {
         self.drag_k = if k.is_finite() && k > 0.0 { k } else { 0.0 };
     }
@@ -1526,6 +1552,32 @@ impl EkfEstimator {
         // 对小倾角只是二阶变化。⇒ 模长门控在原理上盖不住它。
         // 正确修法是**离线标定扣除**（`mag_hard_iron` / `set_mag_hard_iron`）。
         // 详见 `docs/stage1-attitude-findings.md` F7。
+        // ---- 路线 2.2e：全姿态修正（含 roll/pitch），默认关 ----
+        //
+        // 与重力锚定对称的叉积形式，但参考是**磁场**而非比力 ⇒ 与加速度无耦合。
+        // 修正轴 = 估计世界场方向 × 参考世界场方向（世界系），左乘施加。
+        let a3 = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_MAG3D_ALPHA)) };
+        if a3 > 0.0 && self.mag_ref3d != [0.0, 0.0, 0.0] {
+            let r = self.mag_ref3d;
+            let rn = sqrt(r[0] * r[0] + r[1] * r[1] + r[2] * r[2]);
+            let mn = sqrt(m_world[0] * m_world[0] + m_world[1] * m_world[1] + m_world[2] * m_world[2]);
+            if rn > 1e-6 && mn > 1e-6 {
+                let rh = [r[0] / rn, r[1] / rn, r[2] / rn];
+                let mh3 = [m_world[0] / mn, m_world[1] / mn, m_world[2] / mn];
+                // 叉积（旋转轴）：把 mh3 转向 rh
+                let ax = mh3[1] * rh[2] - mh3[2] * rh[1];
+                let ay = mh3[2] * rh[0] - mh3[0] * rh[2];
+                let az = mh3[0] * rh[1] - mh3[1] * rh[0];
+                let s = sqrt(ax * ax + ay * ay + az * az);
+                let c = (mh3[0] * rh[0] + mh3[1] * rh[1] + mh3[2] * rh[2]).clamp(-1.0, 1.0);
+                let ang = crate::math::atan2(s, c) * a3 * 0.5 * self.last_dt * 250.0;
+                if s > 1e-9 && ang.abs() > 0.0 {
+                    let dq3 = Quaternion::from_axis_angle([ax / s, ay / s, az / s], Radian(ang));
+                    self.att = (dq3 * self.att).normalize();
+                }
+            }
+        }
+
         let k = alpha * 0.5 * W_GYRO;
         let corr = yaw_err * k;
         let dq = Quaternion::from_axis_angle([0.0, 0.0, 1.0], Radian(corr));
