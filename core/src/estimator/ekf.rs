@@ -24,6 +24,16 @@ use crate::vehicle::{
 
 const N: usize = 10; // pos(3) + vel(3) + gyro_bias(3) + accel_bias_z(1)
 
+/// 陀螺零偏估计的**收敛速率**（1/s）。**0 = 关闭**（既有行为：`x[6..8]` 恒为 0）。
+///
+/// 见 `step` 里"陀螺零偏在线估计"处的推导。默认关的理由：属新增估计通道，
+/// 需先 A/B 量化收益与代价（会不会把姿态估计带坏），再定值——不拍脑袋。
+#[used]
+pub static mut G_GYRO_BIAS_K: f32 = 0.0;
+
+/// 陀螺零偏估计限幅（rad/s）。消费级 IMU 零偏远小于此；仅防异常值。
+const GYRO_BIAS_MAX: f32 = 0.05;
+
 /// [标定] `q_accel` 运行时覆盖（0 = 用 `EkfEstimator` 的编译期值）。
 ///
 /// 用途：协方差更新改用 Joseph 形式后，位置/高度通道需要重标定——原误实现的协方差
@@ -373,6 +383,8 @@ impl Estimator for EkfEstimator {
         airspeed: Option<AirspeedSample>,
     ) -> VehicleState {
         let dt = dt.0;
+        // 标定旋钮（易失读：由外部写入，普通读会被常量折叠掉）
+        let gyro_bias_k = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_GYRO_BIAS_K)) };
         // 累计自上次新鲜速度观测的时间（供 `update_vel_r` 的 Doppler 差分用）。
         if self.vel_obs_dt >= 0.0 {
             self.vel_obs_dt += dt;
@@ -521,6 +533,35 @@ impl Estimator for EkfEstimator {
                 if na > 1e-6 {
                     let dq = Quaternion::from_axis_angle([ax, ay, az], Radian(na));
                     self.att = (self.att * dq).normalize();
+                }
+
+                // ---- 陀螺零偏在线估计（把 `x[6..8]` 从不被观测更新接上）----
+                //
+                // 依据：锚定每拍施加的修正角 `(ax,ay,az)` 就是"零偏造成的姿态漂移"
+                // 被拉回的体现。**稳态下修正速率 = −陀螺零偏**（零偏使姿态漂走、
+                // 锚定把它拉回，二者速率相等反向）⇒ 以 `-(ax,ay,az)/dt` 为观测量
+                // 一阶收敛到它，即得零偏估计（互补滤波的标准做法）。
+                //
+                // 关键：**只复用上方已算好的门控**（w 幅值 / w_align 方向 /
+                // w_gyro 角速率）—— 机动、失重、大角速率时门控归零 ⇒ 不学习，
+                // 避免"把机动学成零偏"。
+                //
+                // 历史：`x[6..8]` 一直是状态向量的一部分、传播时也被扣除
+                // （`gyro - x[6..8]`），但**从未被任何观测更新** ⇒ 恒为 0，
+                // 姿态漂移只能靠锚定"当场拉"，没有前馈补偿。实测后果（H 场无风档）：
+                // 陀螺漂移 0.34°/min 造成 **9.36m/60s 持续位置漂移且仍在增长**；
+                // 而只注入加计漂移时仅 1.52m（= 完全无注入）⇒ 该漂移**完全**
+                // 由陀螺零偏贡献（分离实验，见 wind_turb_scan::imu_bias_separation_no_wind）。
+                let gyro_learn = gyro_bias_k * w * w_align * w_gyro;
+                if gyro_learn > 0.0 {
+                    let inv_dt = 1.0 / dt;
+                    let obs = [-ax * inv_dt, -ay * inv_dt, -az * inv_dt];
+                    self.x[6] += gyro_learn * (obs[0] - self.x[6]) * dt;
+                    self.x[7] += gyro_learn * (obs[1] - self.x[7]) * dt;
+                    self.x[8] += gyro_learn * (obs[2] - self.x[8]) * dt;
+                    for i in 6..9 {
+                        self.x[i] = self.x[i].clamp(-GYRO_BIAS_MAX, GYRO_BIAS_MAX);
+                    }
                 }
             }
         }
