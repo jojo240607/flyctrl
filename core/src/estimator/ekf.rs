@@ -53,7 +53,27 @@ const GYRO_BIAS_MAX: f32 = 0.05;
 pub static mut G_ATT_ACC_GATE: f32 = -1.0;
 
 /// 水平非重力加速度门控的编译期默认满闭阈值（m/s²）。
-const ATT_ACC_GATE_DEFAULT: f32 = 3.0;
+/// 注意：**默认 0 = 关闭**（保持历史"三门槛"行为）。实测瞬时门控过于抖动，
+/// 见 `G_ATT_ACC_AC`（交流能量门控，本项的正解）。
+const ATT_ACC_GATE_DEFAULT: f32 = 0.0;
+
+/// [标定] 重力锚定的**交流能量门控**满闭阈值（m/s²，a_h 的交流幅度）。哨兵 <0 = 编译期默认。
+///
+/// # 为何必须用"交流能量"而不是瞬时值或均值
+/// 扰动（阵风 @0.12Hz + Dryden 湍流）是**零均值交流**：
+///   - **瞬时 `a_h`** 抓得住，但悬停噪声也让它抖 ⇒ 门控反复开闭（实测 2.0 阈值处
+///     无风档恶化到 88.73m）；
+///   - **均值 `a_h`** 在零均值扰动下 ≈0 ⇒ 门控根本不关（抓不住）；
+/// ⇒ 只有**交流幅度**（偏离均值的量）既能稳定又能反映"扰动有多剧烈"。
+///
+/// 实现：`a_h` 的 EMA 均值 + EMA 绝对偏差（一阶包络），门控看偏差。
+/// 平稳无风悬停 → 偏差小 → 全锚定（拿陀螺零偏抑制的收益）；
+/// 阵风/湍流/机动 → 偏差大 → 全撤（避免把姿态错误拉向"比力反方向"）。
+#[used]
+pub static mut G_ATT_ACC_AC: f32 = -1.0;
+
+/// 交流门控的编译期默认满闭阈值（m/s²）。**默认 0 = 关闭**；取值由扫描数据定。
+const ATT_ACC_AC_DEFAULT: f32 = 0.0;
 
 /// [标定] `q_accel` 运行时覆盖（0 = 用 `EkfEstimator` 的编译期值）。
 ///
@@ -209,6 +229,9 @@ pub struct EkfEstimator {
     r_rtk: f32,         // RTK-GPS 位置观测噪声（m）^2（厘米级，远强于普通 GPS）
     att_alpha: f32,     // 姿态重力修正强度（0 = 纯积分）
     mag_alpha: f32,     // 磁力计航向锚定强度（0 = 不锚定 yaw；纯陀螺积分 yaw 会漂移）
+    /// 锚定交流门控状态：`a_h` 的 EMA 均值与绝对偏差（一阶包络）。
+    acc_h_mean: f32,
+    acc_h_dev: f32,
     mag_ref: [f32; 2],  // 世界系水平参考地磁方向（单位向量）：默认 (1,0)=地理北；
                         // 有磁偏角时 set_mag_declination 旋转该参考 → 磁航向转地理航向
     /// 机体硬铁偏置（与磁力计同单位），由**离线标定**得到，默认零。
@@ -297,6 +320,8 @@ impl EkfEstimator {
             r_rtk: 0.0025,    // ~0.05 m RMS：RTK 厘米级绝对位置，权重最强
             att_alpha,
             mag_alpha: 0.05,  // 微弱航向锚定：yaw 误差每拍吸收 2.5%（0.05*0.5）
+            acc_h_mean: 0.0,
+            acc_h_dev: 0.0,
             mag_ref: [1.0, 0.0], // 默认磁北=地理北（无偏角）
             mag_hard_iron: [0.0; 3], // 默认未标定（零偏置）
             world_accel: [0.0; 3],   // 默认零平移（→ 与历史行为一致）
@@ -406,6 +431,10 @@ impl Estimator for EkfEstimator {
         let dt = dt.0;
         // 标定旋钮（易失读：由外部写入，普通读会被常量折叠掉）
         let gyro_bias_k = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_GYRO_BIAS_K)) };
+        let att_acc_ac = {
+            let v = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ATT_ACC_AC)) };
+            if v >= 0.0 { v } else { ATT_ACC_AC_DEFAULT }
+        };
         let att_acc_gate = {
             let v = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ATT_ACC_GATE)) };
             if v >= 0.0 { v } else { ATT_ACC_GATE_DEFAULT }
@@ -551,8 +580,8 @@ impl Estimator for EkfEstimator {
                 let a_h = sqrt(a_world_h[0] * a_world_h[0] + a_world_h[1] * a_world_h[1]);
                 let gate_full = att_acc_gate;
                 let gate_zero = att_acc_gate / 3.0;
-                let w_acc = if gate_full <= 0.0 {
-                    1.0 // 门控关闭（阈值 <=0：保持历史行为）
+                let w_inst = if gate_full <= 0.0 {
+                    1.0 // 瞬时门控关闭
                 } else if a_h <= gate_zero {
                     1.0
                 } else if a_h >= gate_full {
@@ -560,6 +589,21 @@ impl Estimator for EkfEstimator {
                 } else {
                     (gate_full - a_h) / (gate_full - gate_zero)
                 };
+                // 交流能量门控：a_h 的 EMA 均值/绝对偏差（一阶包络），看**偏差**。
+                // EMA 系数按 ~1s 量级（与阵风主频 0.12Hz≈8.3s 周期相比足够快，
+                // 能跟上包络；又比单拍噪声慢，不抖）。
+                self.acc_h_mean += 0.02 * (a_h - self.acc_h_mean);
+                self.acc_h_dev += 0.02 * ((a_h - self.acc_h_mean).abs() - self.acc_h_dev);
+                let w_ac = if att_acc_ac <= 0.0 {
+                    1.0 // 交流门控关闭
+                } else if self.acc_h_dev <= att_acc_ac / 3.0 {
+                    1.0
+                } else if self.acc_h_dev >= att_acc_ac {
+                    0.0
+                } else {
+                    (att_acc_ac - self.acc_h_dev) / (att_acc_ac - att_acc_ac / 3.0)
+                };
+                let w_acc = w_inst * w_ac;
                 let k = self.att_alpha * 0.5 * w * w_align * w_gyro * w_acc;
                 // 把估计重力向量 down_body 锚定到【真实重力方向】，即比力的反方向 (-a)。
                 // 修正轴 = down_body × (-a/an)：n 为垂直于二者的旋转轴，
