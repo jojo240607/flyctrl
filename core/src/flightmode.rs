@@ -34,6 +34,56 @@ pub enum FlightMode {
     Land,
 }
 
+/// **RC 模式开关 → 飞行模式**：H 场（SIL `FlyController`）与固件（非 HIL 路径）
+/// 共用的**唯一真源**。
+///
+/// # 为什么必须共用（这是"H 场结论无法作为 M 场验收"的一类根因）
+/// 此前两边**各写各的**且语义不一致：
+/// - 固件 SBUS 驱动（`flyctrl/app/src/sensors/rc/sbus.rs`）把 ch[5] 解析成**3 位**
+///   （`<600→0`、`<1400→1`、其余`→2`）；
+/// - SIL harness（`fly-sim-core/src/controller.rs::step_rc`）却按**6 位**槽位
+///   `[Manual, Stabilize, Altitude, Position, Rtl, Land]` 解释**同一个** `rc.mode`。
+///
+/// ⇒ 同一个 `rc.mode = 1` 在两边**含义不同**（SIL=Stabilize，固件本意=ALT_HOLD）。
+///
+/// # 映射（3 位开关；ArduCopter 经典三档）
+/// | `rc.mode` | 飞行模式 | 语义 |
+/// |---|---|---|
+/// | 0 | [`FlightMode::Stabilize`] | 自稳（无定高） |
+/// | 1 | [`FlightMode::Altitude`] | **ALT_HOLD** 定高 |
+/// | 2 | [`FlightMode::Position`] | **LOITER** 定点 |
+/// | 3/4/5 | Rtl / Land / Mission | 6 位开关时的扩展档 |
+///
+/// ⚠️ 未知档位（`>5`）**钳到 `Position` 而非回退 `Manual`** —— 安全取向：
+/// 未知开关值不得退化成"无任何保持"的手动，那会在空中给飞行员一个惊吓。
+pub fn mode_from_rc_switch(m: u8) -> FlightMode {
+    match m {
+        0 => FlightMode::Stabilize,
+        1 => FlightMode::Altitude,
+        2 => FlightMode::Position,
+        3 => FlightMode::Rtl,
+        4 => FlightMode::Land,
+        5 => FlightMode::Mission,
+        _ => FlightMode::Position,
+    }
+}
+
+impl FlightMode {
+    /// 本模式对应的 ArduCopter `custom_mode` 码（固件 `control.rs` 的模式判据口径）。
+    ///
+    /// 与 [`mode_from_rc_switch`] 互为逆映射（`Manual` 无对应码，落 `STABILIZE`）。
+    pub fn to_copter_mode(self) -> u16 {
+        match self {
+            FlightMode::Manual | FlightMode::Stabilize => 0, // COPTER_MODE_STABILIZE
+            FlightMode::Altitude => 2,                       // COPTER_MODE_ALT_HOLD
+            FlightMode::Position => 5,                       // COPTER_MODE_LOITER
+            FlightMode::Rtl => 6,                            // COPTER_MODE_RTL
+            FlightMode::Land => 9,                           // COPTER_MODE_LAND
+            FlightMode::Mission => 3,                        // COPTER_MODE_AUTO
+        }
+    }
+}
+
 impl FlightMode {
     /// 自主性授权等级（0=最低，6=最高）。用于"降权"比较。
     pub fn authorization_level(&self) -> u8 {

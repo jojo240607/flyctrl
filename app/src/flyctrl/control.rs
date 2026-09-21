@@ -227,7 +227,19 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
                     COPTER_MODE_ALT_HOLD, COPTER_MODE_GUIDED, COPTER_MODE_LAND,
                     COPTER_MODE_LOITER, COPTER_MODE_RTL, COPTER_MODE_STABILIZE,
                 };
-                let cmd_mode = crate::flyctrl::uplink::G_CMD_MODE.load(Ordering::Relaxed);
+                // 模式来源（**唯一真源** `flightmode::mode_from_rc_switch`）：
+                // **RC 模式开关优先** —— 真机上飞行员必须能自己切模式，这也是
+                // 地面站断链时唯一的手段；仅当 RC 链路不新鲜（失联）时才回退到
+                // 地面站 `G_CMD_MODE`（MAVLink DO_SET_MODE）。
+                //
+                // 历史：本行原先**只**读 G_CMD_MODE ⇒ 固件里 `RcInput.mode`
+                // （SBUS ch[5] 已解析）被彻底丢弃，而一期又关闭了 usb-link
+                // ⇒ 模式恒为 0，M 场无法用遥控器切到 LOITER（定点）做抗风验收。
+                let cmd_mode = if rc.fresh {
+                    flyctrl_core::flightmode::mode_from_rc_switch(rc.mode).to_copter_mode()
+                } else {
+                    crate::flyctrl::uplink::G_CMD_MODE.load(Ordering::Relaxed)
+                };
                 // 模式 → 位置外环开关（每拍设置）：速率模式（STABILIZE/ALT_HOLD）旁路
                 // 位置外环（期望速度=摇杆直通），位置模式（LOITER/GUIDED/RTL/LAND）
                 // 启用位置跟踪（位置 P + 速度前馈）。
