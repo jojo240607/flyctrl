@@ -68,6 +68,15 @@ impl<B: Controller> IndiController<B> {
         &self.base
     }
 
+    /// 可变取内层基础控制律（运行时标定/模式设置用）。
+    ///
+    /// 用途：`FlyController::set_rate_mode_xy` 需要经 INDI 把模式开关透传到内层
+    /// `PidController`——固件侧的调用链是 `hil.ctrl.set_rate_mode_xy(..)`
+    /// （见 `flyctrl/app/src/flyctrl/control.rs:234`）。
+    pub fn inner_mut(&mut self) -> &mut B {
+        &mut self.base
+    }
+
     /// `ctrl_eff` 为三轴控制效能（p,q,r），`gain_scale` 为 INDI 总强度。
     pub fn new(base: B, ctrl_eff: [f32; 3], gain_scale: f32) -> Self {
         Self {
