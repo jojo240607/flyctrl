@@ -46,6 +46,11 @@ pub static mut G_KI_XY: f32 = -1.0;
 #[used]
 pub static mut G_I_XY_MAX: f32 = -1.0;
 
+/// [标定] 水平一阶低通时间常数（s）运行时覆盖。哨兵同规：**<0 = 用编译期值**。
+/// 0 是有效取值（= 关闭低通，即既有行为），故哨兵取 <0。
+#[used]
+pub static mut G_VEL_LPF_H_TAU: f32 = -1.0;
+
 pub struct PidController {
     // 位置外环 P：位置误差 -> 期望速度（世界系）
     kp_xy: f32,
@@ -91,6 +96,18 @@ pub struct PidController {
     rate_filt_init: bool,
     filt_vd: f32,   // 滤波后的垂直速度（NED，向下正）
     filt_d: f32,    // 滤波后的垂直位置（NED，向下正）
+    /// 水平一阶低通时间常数（s）。**0 = 关闭（既有行为）**。
+    ///
+    /// 为何需要：水平位置/速度此前**没有任何低通**就直驱倾角指令，而垂向一直有
+    /// （`vel_lpf_tau`，注释写明"噪声经 EKF 估计后直接驱动油门会导致悬停发散"）。
+    /// 后果实测（H 场，位置环，60s）：**零均值扰动下位置无界游走** ——
+    /// 无恒风时峰值≡末态（9.36m 且仍在增长）；有恒风时因速度估计有确定偏置
+    /// 反而有界（0.85m）。即文档 §4.2 早已写下的"估计器输出的速度噪声直接进了
+    /// 位置外环…水平通道没有等效处理"。
+    vel_lpf_h_tau: f32,
+    /// 水平低通状态 `[pos_n, pos_e, vel_n, vel_e]`；`filt_h_init` 首帧直接赋值。
+    filt_h: [f32; 4],
+    filt_h_init: bool,
     filt_init: bool, // 首帧直接赋值避免启动瞬态
     // 调试快照：最近一次内环计算的姿态误差向量与期望机体角速度
     dbg_err: [f32; 3],
@@ -183,6 +200,9 @@ impl PidController {
             rate_filt_init: false,
             filt_vd: 0.0,
             filt_d: 0.0,
+            vel_lpf_h_tau: 0.0, // 默认关：既有行为逐位不变；取值由 A/B 扫描定
+            filt_h: [0.0; 4],
+            filt_h_init: false,
             filt_init: false,
             dbg_err: [0.0; 3],
             dbg_pqr: [0.0; 3],
@@ -225,6 +245,10 @@ impl Controller for PidController {
             if ov >= 0.0 {
                 self.ki_xy = ov;
             }
+            let ot = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_VEL_LPF_H_TAU)) };
+            if ot >= 0.0 {
+                self.vel_lpf_h_tau = ot;
+            }
         }
         let g = self.gravity;
         let dt = _dt.0;
@@ -247,12 +271,28 @@ impl Controller for PidController {
         } else {
             (est.pos[2].0, est.vel[2].0)
         };
+        // 水平低通：**与垂向完全同形**（位置+速度都滤、首帧直接赋值）。
+        let (est_n, est_e, est_vn, est_ve) = if self.vel_lpf_h_tau > 0.0 {
+            let alpha = (dt / (self.vel_lpf_h_tau + dt)).clamp(0.0, 1.0);
+            if !self.filt_h_init {
+                self.filt_h = [est.pos[0].0, est.pos[1].0, est.vel[0].0, est.vel[1].0];
+                self.filt_h_init = true;
+            } else {
+                self.filt_h[0] += alpha * (est.pos[0].0 - self.filt_h[0]);
+                self.filt_h[1] += alpha * (est.pos[1].0 - self.filt_h[1]);
+                self.filt_h[2] += alpha * (est.vel[0].0 - self.filt_h[2]);
+                self.filt_h[3] += alpha * (est.vel[1].0 - self.filt_h[3]);
+            }
+            (self.filt_h[0], self.filt_h[1], self.filt_h[2], self.filt_h[3])
+        } else {
+            (est.pos[0].0, est.pos[1].0, est.vel[0].0, est.vel[1].0)
+        };
 
         // --- 外环：位置误差 -> 期望速度（限幅，避免饱和） ---
         // 加入设定点速度前馈：轨迹跟踪时直接把 sp.vel 叠加到期望速度，
         // 减少相位滞后（square/circle 场景 RMS 显著下降）。
-        let ex = sp.pos[0].0 - est.pos[0].0;
-        let ey = sp.pos[1].0 - est.pos[1].0;
+        let ex = sp.pos[0].0 - est_n;
+        let ey = sp.pos[1].0 - est_e;
         let ez = sp.pos[2].0 - est_d;
         // 垂向位置积分（抗稳态下沉）：iz 累积位置误差，作为期望速度的积分分量。
         // 标准 PI 配条件积分（clamping 抗 windup，PLAN 阶段 11-A）：
@@ -323,8 +363,8 @@ impl Controller for PidController {
         // P3-A1 轨迹跟踪：在速度误差 P 项之上叠加设定点加速度前馈 `sp.acc`，
         // 使转弯/机动时控制器直接按期望加速度预倾（而非等位置/速度误差积累），
         // 减小轨迹跟踪相位滞后。
-        let acc_n = self.kv_xy * (des_vx - est.vel[0].0) + sp.acc[0].0; // 北向
-        let acc_e = self.kv_xy * (des_vy - est.vel[1].0) + sp.acc[1].0; // 东向
+        let acc_n = self.kv_xy * (des_vx - est_vn) + sp.acc[0].0; // 北向
+        let acc_e = self.kv_xy * (des_vy - est_ve) + sp.acc[1].0; // 东向
         let acc_d = self.kv_z * (des_vz - est_vd) + sp.acc[2].0; // 下垂方向（NED），用滤波后垂直速度
 
         // 阶段 11-A 诊断：把控制律内部量存进调试字段，供 host 侧打印（绕开 no_std 无 eprintln）。
