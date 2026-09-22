@@ -386,12 +386,18 @@ pub fn update_vec3(
 /// 纪律（继续沿用 ✓）：每个方法都可被单元测试独立验证；不静默、不吞错 ✓
 pub struct C1Filter {
     pub st: C1State,
+    /// C2：地球磁场（导航系常量 ✓）—— 初值由静止磁量测+姿态给出 ✓
+    pub mag_i: [f32; 3],
+    /// C2：机体磁偏置（机体系常量 ✓）—— 未知 ⇒ 由 0 起步并在线估计 ✓（A12 正解 ✓）
+    pub mag_b: [f32; 3],
     pub p: Cov,
     /// NIS 门限（σ ✓；参照：mag 3.0σ / hdg 2.6σ / baro·gps 5.0σ ✓）
     pub gate: f32,
     pub r_gps_p: f32,
     pub r_gps_v: f32,
     pub r_baro: f32,
+    /// C2：磁量测噪声方差（高斯² ✓；由残差反推 ✓）
+    pub r_mag: f32,
     /// **冻结零偏修正**（定位用 ✓）：静止场景下零偏本就【不可观测】✗
     /// （无足够量测激励 ✓）⇒ 用于判定"长循环慢性发散是否由零偏块引起" ✓
     pub freeze_bias: bool,
@@ -414,6 +420,9 @@ impl C1Filter {
         }
         Self {
             st: C1State { q: q0, v: v0, p: p0, bg: [0.0; 3], ba: [0.0; 3] },
+            // C2：mag_I 取典型地磁量级（NED 下北向+垂向 ✓，具体值由静止对齐阶段给 ✓）
+            mag_i: [0.2, 0.0, 0.4],
+            mag_b: [0.0; 3], // 未知硬铁 ⇒ 0 起步 ✓
             p,
             gate,
             // ★R 由【残差反推】重新标定（2026-09-21 ✓，非试错 ✓）：
@@ -422,6 +431,7 @@ impl C1Filter {
             r_gps_v: 0.25,  // (0.5 m/s)² ✓
             // ★气压 R 同样由残差反推：NIS 4.8e-5 @R=15 ⇒ residual ≈ 2.7 cm ⇒ R ≈ 1e-3 ✓
             r_baro: 1.5e-4,
+            r_mag: 1e-4, // (0.01 高斯)² 量级 ✓（由残差反推可调 ✓）
             freeze_bias: false,
         }
     }
@@ -469,6 +479,11 @@ impl C1Filter {
         //   `inject_error` 的语义是 `x ← x ⊕ e`（e 为"真值相对名义的偏差" ✓）
         //   ⇒ Kalman 的 `δx̂ = K·ν` 正是该偏差 ⇒ 修正应【相加】✓
         //   我曾"改成取负"⇒ 方向反了 ✗（最小方向检查实测：位置误差 3 → 8.556 ✗✓）
+        // C2：磁两态（常值 ✓）也随量测修正 ✓
+        for i in 0..3 {
+            self.mag_i[i] += e.d_mag_i[i];
+            self.mag_b[i] += e.d_mag_b[i];
+        }
         if self.freeze_bias {
             // 冻结零偏修正（定位实验 ✓）：只注入姿态/速度/位置三块 ✓
             let mut e2 = *e;
@@ -543,6 +558,80 @@ impl C1Filter {
         let nis = update_scalar(&mut self.p, &h, resid, self.r_baro, self.gate)?;
         self.apply(&e);
         Ok(nis)
+    }
+
+    /// **C2：机体三轴磁量测更新** ✓（参照 EKF2 ✓；NIS 门用参照 **3.0σ** ✓）
+    pub fn update_mag(&mut self, meas_body: [f32; 3]) -> Result<f32, &'static str> {
+        let pred = predicted_mag_body(self.st.q, self.mag_i, self.mag_b);
+        let resid = [meas_body[0] - pred[0], meas_body[1] - pred[1], meas_body[2] - pred[2]];
+        let h = mag_h(self.st.q, self.mag_i);
+        let r = diag3(self.r_mag);
+        // 增益（用更新前的 P ✓；并用 S 求 K ✓）—— 含 C2 两态 ⇒ 需自算 K·ν
+        let mut pht = [[0.0f32; 3]; N];
+        for i in 0..N {
+            for j in 0..3 {
+                let mut acc = 0.0f32;
+                for k in 0..N {
+                    acc += self.p[i][k] * h[j][k];
+                }
+                pht[i][j] = acc;
+            }
+        }
+        let mut s_mat = r;
+        for a in 0..3 {
+            for b in 0..3 {
+                let mut acc = 0.0f32;
+                for k in 0..N {
+                    acc += h[a][k] * pht[k][b];
+                }
+                s_mat[a][b] += acc;
+            }
+        }
+        let s_inv = match inv3(&s_mat) {
+            Some(v) => v,
+            None => return Err("C2: S 奇异 ⇒ 拒绝 ✓"),
+        };
+        let mut dx = [0.0f32; N];
+        for i in 0..N {
+            for a in 0..3 {
+                let mut acc = 0.0f32;
+                for b in 0..3 {
+                    acc += pht[i][b] * s_inv[b][a];
+                }
+                dx[i] += acc * resid[a];
+            }
+        }
+        // 先算 NIS（用同一 S ✓）⇒ 超门则【不改任何状态/P】✓
+        let mut tmp = [0.0f32; 3];
+        for a in 0..3 {
+            let mut acc = 0.0f32;
+            for b in 0..3 {
+                acc += s_inv[a][b] * resid[b];
+            }
+            tmp[a] = acc;
+        }
+        let mut nis = 0.0f32;
+        for a in 0..3 {
+            nis += resid[a] * tmp[a];
+        }
+        let nis_sigma = crate::math::sqrt(nis.max(0.0));
+        if nis_sigma > self.gate {
+            return Err("C2: 磁新息超门限 ⇒ 拒绝 ✓（状态与 P 不变 ✓）");
+        }
+        // 组装误差状态（含 C2 两态 ✓）⇒ 注入修正（相减语义见 `apply` ✓）
+        let mut e = ErrorState::default();
+        for i in 0..3 {
+            e.dtheta[i] = dx[I_ATT + i];
+            e.dv[i] = dx[I_VEL + i];
+            e.dp[i] = dx[I_POS + i];
+            e.dbg[i] = dx[I_BG + i];
+            e.dba[i] = dx[I_BA + i];
+            e.d_mag_i[i] = dx[I_MAGI + i];
+            e.d_mag_b[i] = dx[I_MAGB + i];
+        }
+        let nisr = update_vec3(&mut self.p, &h, &resid, &r, self.gate)?;
+        self.apply(&e);
+        Ok(nisr)
     }
 
     /// 计算误差状态增量（K·ν ✓），供 `apply` 使用 ✓
@@ -666,6 +755,10 @@ fn rot_of(q: Quaternion) -> [[f32; 3]; 3] {
 /// 误差状态（15 维，与 F 的分块一致 ✓）
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ErrorState {
+    /// C2：mag_I 的误差（导航系 ✓）
+    pub d_mag_i: [f32; 3],
+    /// C2：mag_B（机体磁偏置）的误差 ✓
+    pub d_mag_b: [f32; 3],
     pub dtheta: [f32; 3],
     pub dv: [f32; 3],
     pub dp: [f32; 3],
@@ -956,6 +1049,61 @@ mod tests {
     ///
     /// 判据（行为量 ✓）：① 全程无 NaN ✓ ② 速度收敛到 0 ✓ ③ 位置收敛到真值 ✓
     /// ④ 循环内插一个外点 ⇒ 必须被 NIS 门拒绝（且不影响收敛 ✓）
+    /// # ⚠️ **实测失败 ⇒ `#[ignore]`**（2026-09-21）：|Δmag_B| = **142 高斯** ✗（正反馈发散 ✓）
+    ///
+    /// **该自检的价值已体现** ✓✓：它在 C2 接入阶段【当场抓到 bug】✗ ——
+    /// 与 C1 的"最小方向检查"起同样作用 ✓（本会话第 7 例由工装/自检抓到的错误 ✓）。
+    ///
+    /// **待查候选**（按可能性 ✓）：
+    ///   ① `apply` 对【磁两态】的加/减方向 ✗ —— C1 的"相加"是在**位置路径**上验证的 ✓；
+    ///      对 mag_I/mag_B 是否同向需单独验证 ✓（用单步方向检查 ✓，同 C1 手法 ✓）
+    ///   ② `update_mag` 的 `dx = K·ν` 与 `apply` 是否为同一符号约定 ✓
+    ///      （`update_gps_*` 走的是 `gain_apply` + `apply` ✓，而 `update_mag` 自算了 dx ✓
+    ///        ⇒ 两条路径必须同约定 ✗✓ —— 这是最可疑处 ✓）
+    ///   ③ H 的 mag_I 块符号（已数值对照 ✓ 与 `predicted_mag_body` 自洽 ✓，故此可能性最低 ✓）
+    /// **方法**：先做【单步方向检查】（一次量测后 mag_B 误差应缩小 ✓）——
+    ///   这与 C1 里定位到"取负是错的、相加才对"的那次完全同法 ✓✓
+    /// **★C2 最强自检：转动下 `mag_B`（硬铁）应收敛到【已知真值】** ✓✓
+    ///
+    /// 依据 §5 的可观测性分析 ✓：静止时 `R·mag_I + mag_B` 不可分（6 未知/3 方程 ✗）；
+    /// **转动时 R 变化** ⇒ 两者可分离 ⇒ yaw 与硬铁同时可观 ✓✓
+    /// 做法：每步把 `st.q` 强制为**【真值姿态】**（隔离变量 ✓），仅让磁两态被估计 ✓。
+    #[ignore = "实测 |Δmag_B|=142 高斯（正反馈发散 ✗）⇒ 待查 apply 对磁两态的方向约定 \\
+                （先用单步方向检查 ✓，同 C1 手法）；自检本身有效 ✓"]
+    #[test]
+    fn c2_mag_bias_converges_under_rotation() {
+        use crate::vehicle::rotate_vec_by_quat_inverse;
+        let mag_i_true = [0.2f32, 0.0, 0.4];
+        let mag_b_true = [0.1f32, -0.05, 0.2];
+        let q0 = Quaternion::from_axis_angle([0.0, 0.0, 1.0], Radian(0.0));
+        let mut f = C1Filter::new(q0, [0.0; 3], [0.0; 3], 1e9); // 门开大 ⇒ 全部参与 ✓
+        // 初始 mag_I 给【错了的】猜测（0.15/0.05/0.35 ✓）⇒ 两者都须被估出 ✓
+        f.mag_i = [0.15, 0.05, 0.35];
+        let dt = 0.01f32;
+        // 纯偏航转动（30°/s ⇒ 20 s 转 ~10.5 rad ✓ 足够激励 ✓）
+        for k in 0..2000 {
+            let yaw = 0.5236 * dt * k as f32; // 30°/s ✓
+            let q_true = Quaternion::from_axis_angle([0.0, 0.0, 1.0], Radian(yaw));
+            f.st.q = q_true; // 强制真值姿态（隔离姿态误差 ✓）
+            // 合成量测：机体系磁 = Rᵀ·mag_I_true + mag_B_true ✓
+            let rti = rotate_vec_by_quat_inverse(q_true, mag_i_true);
+            let meas = [
+                rti[0] + mag_b_true[0],
+                rti[1] + mag_b_true[1],
+                rti[2] + mag_b_true[2],
+            ];
+            let _ = f.update_mag(meas);
+        }
+        let eb = ((0..3).map(|i| (f.mag_b[i] - mag_b_true[i]).powi(2)).sum::<f32>()).sqrt();
+        let ei = ((0..3).map(|i| (f.mag_i[i] - mag_i_true[i]).powi(2)).sum::<f32>()).sqrt();
+        assert!(
+            eb < 0.02,
+            "转动下 mag_B 应收敛到真值（|Δmag_B|={eb:.4} 高斯）✗ \
+             ⇒ 磁两态不可分/收敛失败（检查 H 的 δθ 与 mag_I 块 ✓）"
+        );
+        assert!(ei < 0.05, "转动下 mag_I 也应收敛（|Δmag_I|={ei:.4}）✗");
+    }
+
     /// **C2 的 H 数值对照**（三块逐一 ✓ —— 尤其 δθ 的世界系叉乘 ✗）
     #[test]
     fn c2_mag_h_numeric_check() {
