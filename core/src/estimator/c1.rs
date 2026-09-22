@@ -408,6 +408,9 @@ pub struct C1Filter {
     pub r_baro: f32,
     /// C2：磁量测噪声方差（高斯² ✓；由残差反推 ✓）
     pub r_mag: f32,
+    /// ⚠️ 航向处理开关（**默认关** ✓ —— 参照在"磁健康"时【不清零航向】✗，
+    /// 本项是我为验证"姿态吸走残差"而设的【实验性代理】✗ ⇒ 不污染默认行为 ✓）
+    pub heading_guard: bool,
     /// 诊断（2026-09-21 ✓）：磁更新实际【应用】与【跳过】的计数 ✓
     pub mag_applied: u32,
     pub mag_skipped: u32,
@@ -454,6 +457,7 @@ impl C1Filter {
             //   1e-8 过小 ⇒ 增益过大 ⇒ (I − K·h) 变负 ⇒ P 失正定 ⇒ 爆炸到 1e12 ✗✓
             //   ⇒ 取 1e-2（σ ≈ 0.1 高斯 ✓，为地磁量级的一小部分 ✓ 合理）
             r_mag: 1e-2,
+            heading_guard: false,
             mag_applied: 0,
             mag_skipped: 0,
             freeze_bias: false,
@@ -525,7 +529,7 @@ impl C1Filter {
         //       ⇒ 航向【不能】再吸走磁残差 ⇒ 残差只能归给 mag_B ✓✓（对正确诊 ✓）
         //     · **限幅**：P_{θz,θz} 不过上限 ✓
         //   依据：诊断实验证实"姿态吸走残差"（残差 1e-3 → 3.19 ✓✓）
-        {
+        if self.heading_guard {
             let iz = I_ATT + 2; // δθ_z（偏航 ✓）
             let cap = 1e-2f32; // 航向 1σ ≈ 0.1 rad ≈ 5.7°（与磁的量测尺度一致 ✓）
             let mag_idx = [I_MAGI, I_MAGI + 1, I_MAGI + 2, I_MAGB, I_MAGB + 1, I_MAGB + 2];
