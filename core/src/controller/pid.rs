@@ -123,6 +123,13 @@ pub struct PidController {
     ki_xy: f32,
     /// 水平位置积分累积（NED 北/东）。抗饱和与垂向同用**回算**（back-calculation）。
     i_xy: [f32; 2],
+    /// **水平速度环积分**累积（m/s，NED 北/东）与增益。
+    ///
+    /// 根因见 `G_KI_V_XY` 的说明：速度环原为 P-only，而平飞巡航须有非零倾角（平衡阻力）
+    /// ⇒ `acc ≠ 0` ⇒ P-only 下 `des_v ≠ v` ⇒ 固有速度偏置 ⇒ 积分成位置斜坡。
+    /// 与垂向 `ki_z`/`iz` **对称**：同样用**回算**抗饱和。
+    ki_v_xy: f32,
+    i_v_xy: [f32; 2],
     // 阶段 11-A：EKF 估计的垂直速度/位置一阶低通（EMA）状态，滤除 IMU 高频噪声。
     // 噪声经 EKF 估计后直接驱动油门会导致悬停发散；LPF 时间常数由 vel_lpf_tau 控制（0=不过滤）。
     vel_lpf_tau: f32,
@@ -251,6 +258,8 @@ impl PidController {
             iz: 0.0,
             ki_xy: 0.0, // 默认关：既有行为逐位不变；由 wind_turb_scan 扫出后再定
             i_xy: [0.0; 2],
+            ki_v_xy: 0.0, // 默认关：既有行为逐位不变（由扫描定值）
+            i_v_xy: [0.0; 2],
             vel_lpf_tau: 0.15,
             rate_lpf_tau: 0.02, // 50Hz：抑噪为主，相位滞后小
             filt_w: [0.0; 3],
@@ -427,8 +436,21 @@ impl Controller for PidController {
         // P3-A1 轨迹跟踪：在速度误差 P 项之上叠加设定点加速度前馈 `sp.acc`，
         // 使转弯/机动时控制器直接按期望加速度预倾（而非等位置/速度误差积累），
         // 减小轨迹跟踪相位滞后。
-        let acc_n = self.kv_xy * (des_vx - est_vn) + sp.acc[0].0; // 北向
-        let acc_e = self.kv_xy * (des_vy - est_ve) + sp.acc[1].0; // 东向
+        // ---- 水平**速度环积分**（消除恒定阻力下的速度偏置）----
+        // 读数：标定旋钮（易失读；0 是有效值 ⇒ 哨兵取 <0）
+        let ki_v_eff = {
+            let ov = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_KI_V_XY)) };
+            if ov >= 0.0 { ov } else { self.ki_v_xy }
+        };
+        const I_V_MAX: f32 = 2.0; // 与位置积分同口径（m/s^2 累积上限由回算保证）
+        let ev_n = des_vx - est_vn;
+        let ev_e = des_vy - est_ve;
+        // 回算抗饱和：饱和时把积分置为"恰使 acc 抵达边界"的值（与本仓 iz/i_xy 同法）
+        self.i_v_xy[0] = clampf(self.i_v_xy[0] + ki_v_eff * ev_n * dt, -I_V_MAX, I_V_MAX);
+        self.i_v_xy[1] = clampf(self.i_v_xy[1] + ki_v_eff * ev_e * dt, -I_V_MAX, I_V_MAX);
+
+        let acc_n = self.kv_xy * (des_vx - est_vn) + sp.acc[0].0 + self.i_v_xy[0]; // 北向
+        let acc_e = self.kv_xy * (des_vy - est_ve) + sp.acc[1].0 + self.i_v_xy[1]; // 东向
         let acc_d = self.kv_z * (des_vz - est_vd) + sp.acc[2].0; // 下垂方向（NED），用滤波后垂直速度
 
         // 阶段 11-A 诊断：把控制律内部量存进调试字段，供 host 侧打印（绕开 no_std 无 eprintln）。
