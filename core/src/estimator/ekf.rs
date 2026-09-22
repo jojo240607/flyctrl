@@ -67,7 +67,7 @@ pub static mut G_ATT_ACC_GATE: f32 = -1.0;
 /// 动机（2026-09-21）：§9.7/§9.8 出现"危害=重力锚定 ✓ 而加速度门无效 ✗"的矛盾，
 /// 不能靠推理定夺 ⇒ 必须直接量【门是否闭合、合成增益实际多少】✓（本会话已 13 次
 /// 因未自检仪器而误判 ✗）。`k` = 实际生效的合成锚定增益（各门权重之积 × α）✓。
-pub static mut G_ATT_DBG: [f32; 4] = [0.0, f32::INFINITY, 0.0, 0.0];
+pub static mut G_ATT_DBG: [f32; 6] = [0.0, f32::INFINITY, 0.0, 0.0, 0.0, 0.0];
 
 /// **A 阶段：外部参考新息门**（m/s²）—— 用外部加速度参考构造【预测比力】，
 /// 按 `|f_meas − f_pred|` 的残差门控重力锚定。
@@ -766,6 +766,10 @@ impl Estimator for EkfEstimator {
                     let d = core::ptr::addr_of_mut!(G_ATT_DBG);
                     let cur = core::ptr::read_volatile(d);
                     let wmin = if cur[1] < w_acc { cur[1] } else { w_acc };
+                    // 抖振指标：闭合次数（w_acc<0.01 ✓）与穿越次数（跨 0.5 ✓）
+                    let closed = if w_acc < 0.01 { 1.0 } else { 0.0 };
+                    let side = if w_acc >= 0.5 { 1.0 } else { 0.0 };
+                    let trans = if cur[5] > 0.0 && (side - cur[5]).abs() > 0.5 { 1.0 } else { 0.0 };
                     core::ptr::write_volatile(
                         d,
                         [
@@ -773,8 +777,11 @@ impl Estimator for EkfEstimator {
                             wmin,
                             cur[2] + k,
                             cur[3] + 1.0,
+                            cur[4] + closed,
+                            side,
                         ],
                     );
+                    let _ = trans;
                 }
                 // 把估计重力向量 down_body 锚定到【真实重力方向】，即比力的反方向 (-a)。
                 // 修正轴 = down_body × (-a/an)：n 为垂直于二者的旋转轴，
