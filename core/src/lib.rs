@@ -23,6 +23,8 @@ pub mod hil;
 pub mod perf;
 pub mod invariants;
 pub mod mission;
+/// 制导层（阶段 5）：连续轨迹 → `Setpoint`（含速度/加速度前馈）。
+pub mod guidance;
 pub mod swarm;
 pub mod hal;
 pub mod comm;
