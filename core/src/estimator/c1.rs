@@ -71,13 +71,17 @@ pub struct ImuDelta {
     pub delta_vel: [f32; 3],
 }
 
-/// 误差状态的块索引（15 维 ✓）
-pub const N: usize = 15;
+/// 误差状态的块索引（**C2 后 21 维** ✓：原 15 + `mag_I`3 + `mag_B`3 ✓）
+pub const N: usize = 21;
 pub const I_ATT: usize = 0;
 pub const I_VEL: usize = 3;
 pub const I_POS: usize = 6;
 pub const I_BG: usize = 9;
 pub const I_BA: usize = 12;
+/// C2：地球磁场（导航系常量 ✓，参照 `State::mag_I` ✓）
+pub const I_MAGI: usize = 15;
+/// C2：机体磁偏置（机体系常量 ✓，参照 `State::mag_B` ✓）—— **A12 的正解** ✓
+pub const I_MAGB: usize = 18;
 
 /// 构造误差状态转移矩阵 F（15×15，行主序）
 ///
@@ -229,6 +233,45 @@ pub fn update_scalar(
     Ok(nis_sigma)
 }
 
+/// **C2 量测预测**：机体三轴磁 `h(x) = R(q)·mag_I + mag_B` ✓（参照 EKF2 ✓）
+pub fn predicted_mag_body(q: Quaternion, mag_i: [f32; 3], mag_b: [f32; 3]) -> [f32; 3] {
+    let mi = rotate_vec_by_quat(q, mag_i);
+    [mi[0] + mag_b[0], mi[1] + mag_b[1], mi[2] + mag_b[2]]
+}
+
+/// **C2 的 H（3×21 ✓）** —— 三块（★须数值对照 ✓）：
+///   · 对 `δθ`：`−[R·mag_I ×]`（**世界系叉乘** ✓ —— 与 §12.8 同类陷阱 ✗）
+///   · 对 `mag_I`：`R` ✓
+///   · 对 `mag_B`：`I` ✓
+pub fn mag_h(q: Quaternion, mag_i: [f32; 3]) -> [[f32; N]; 3] {
+    let mut h = [[0.0f32; N]; 3];
+    let aw = rotate_vec_by_quat(q, mag_i); // 世界系磁矢量 ✓
+    // δθ 块：−[aw ×]（第 j 列 = −(aw × e_j) ✓）
+    let basis = [[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    for (j, e) in basis.iter().enumerate() {
+        let c = [
+            aw[1] * e[2] - aw[2] * e[1],
+            aw[2] * e[0] - aw[0] * e[2],
+            aw[0] * e[1] - aw[1] * e[0],
+        ];
+        for i in 0..3 {
+            h[i][I_ATT + j] = -c[i];
+        }
+    }
+    // mag_I 块 = R ✓（用基向量取列 ✓）
+    for (j, e) in basis.iter().enumerate() {
+        let c = rotate_vec_by_quat(q, *e);
+        for i in 0..3 {
+            h[i][I_MAGI + j] = c[i];
+        }
+    }
+    // mag_B 块 = I ✓
+    for i in 0..3 {
+        h[i][I_MAGB + i] = 1.0;
+    }
+    h
+}
+
 /// 3×3 求逆（伴随/行列式 ✓，no_std 固定数组 ✓）
 fn inv3(m: &[[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
     let det = m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
@@ -365,6 +408,9 @@ impl C1Filter {
             p[I_POS + i][I_POS + i] = 25.0;
             p[I_BG + i][I_BG + i] = 1e-4;
             p[I_BA + i][I_BA + i] = 0.01;
+            // C2：mag_I（地磁 ~0.5 高斯量级 ⇒ 初值方差取 0.01 ✓）；mag_B（硬铁同量级 ✓）
+            p[I_MAGI + i][I_MAGI + i] = 0.01;
+            p[I_MAGB + i][I_MAGB + i] = 0.01;
         }
         Self {
             st: C1State { q: q0, v: v0, p: p0, bg: [0.0; 3], ba: [0.0; 3] },
@@ -404,6 +450,9 @@ impl C1Filter {
             q[I_POS + i][I_POS + i] = 1e-4 * dt;
             q[I_BG + i][I_BG + i] = 1e-6 * dt;
             q[I_BA + i][I_BA + i] = 1e-4 * dt;
+            // C2：磁两态（常值 ✓ ⇒ Q 极小，但仍非零以保持可观测方向不塌陷 ✓）
+            q[I_MAGI + i][I_MAGI + i] = 1e-8 * dt;
+            q[I_MAGB + i][I_MAGB + i] = 1e-8 * dt;
         }
         self.p = predict_covariance(&self.p, &fm, &q);
         self.st.predict(ImuDelta { delta_ang, delta_vel }, g, dt);
@@ -907,6 +956,53 @@ mod tests {
     ///
     /// 判据（行为量 ✓）：① 全程无 NaN ✓ ② 速度收敛到 0 ✓ ③ 位置收敛到真值 ✓
     /// ④ 循环内插一个外点 ⇒ 必须被 NIS 门拒绝（且不影响收敛 ✓）
+    /// **C2 的 H 数值对照**（三块逐一 ✓ —— 尤其 δθ 的世界系叉乘 ✗）
+    #[test]
+    fn c2_mag_h_numeric_check() {
+        use crate::vehicle::rotate_vec_by_quat;
+        let q = Quaternion::from_axis_angle([0.3, -0.4, 0.6], Radian(0.8)).normalize();
+        let mag_i = [0.21f32, -0.05, 0.43];
+        let mag_b = [0.12f32, -0.07, 0.2];
+        let eng = mag_h(q, mag_i);
+        let eps = 1e-3f32;
+        let base = predicted_mag_body(q, mag_i, mag_b);
+        let mut maxdev = 0.0f32;
+        // ① δθ 块：q ← δq(θ) * q（本项目 local ✓，§12.4 ✓）
+        for j in 0..3 {
+            let mut d = [0.0f32; 3];
+            d[j] = eps;
+            let n = eps;
+            let dq = Quaternion::from_axis_angle([d[0] / n, d[1] / n, d[2] / n], Radian(n));
+            let out = predicted_mag_body((dq * q).normalize(), mag_i, mag_b);
+            for i in 0..3 {
+                maxdev = maxdev.max((((out[i] - base[i]) / eps) - eng[i][I_ATT + j]).abs());
+            }
+        }
+        // ② mag_I 块（加性 ✓）
+        for j in 0..3 {
+            let mut mi = mag_i;
+            mi[j] += eps;
+            let out = predicted_mag_body(q, mi, mag_b);
+            for i in 0..3 {
+                maxdev = maxdev.max((((out[i] - base[i]) / eps) - eng[i][I_MAGI + j]).abs());
+            }
+        }
+        // ③ mag_B 块（加性 ✓）
+        for j in 0..3 {
+            let mut mb = mag_b;
+            mb[j] += eps;
+            let out = predicted_mag_body(q, mag_i, mb);
+            for i in 0..3 {
+                maxdev = maxdev.max((((out[i] - base[i]) / eps) - eng[i][I_MAGB + j]).abs());
+            }
+        }
+        let _ = rotate_vec_by_quat;
+        assert!(
+            maxdev < 1e-3,
+            "C2 的 H 与数值不符（偏差 {maxdev:.2e}）✗ ⇒ δθ 块是否用世界系叉乘？"
+        );
+    }
+
     /// **静止对齐自检**（对接前必做 ✓）：由已知姿态合成比力 ⇒ 对齐应恢复 roll/pitch ✓
     #[test]
     fn c1_static_alignment_recovers_known_attitude() {
