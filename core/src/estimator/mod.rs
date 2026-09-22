@@ -7,7 +7,7 @@ pub mod trait_def;
 pub mod complementary;
 pub mod ekf;
 pub mod learning;
-pub mod c1; // C1 骨架（未接入产品路径 ✓；见 docs/c1-design.md）
+pub mod eskf; // ★默认估计方案：误差状态 EKF（C1+C2；见 docs/c1-design.md / c2-design.md）
 
 pub use trait_def::Estimator;
 pub use complementary::ComplementaryEstimator;
