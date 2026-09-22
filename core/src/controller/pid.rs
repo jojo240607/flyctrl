@@ -488,9 +488,12 @@ impl Controller for PidController {
                 } else {
                     Quaternion::from_axis_angle([ax / s, ay / s, 0.0], Radian(crate::math::atan2(s, c)))
                 };
-                // 偏航在世界系施加（左乘）
+                // ⚠️ **乘法序（自检单测实测）**：本仓约定下 `A*B` 意为"**先 A 后 B**"
+                // （与标准四元数相反）—— 自检显示 `q_yaw*q_align` 会把 (0,0,1) 映到
+                // [0.360,-0.032,0.932] ≠ zb=[0.301,-0.201,0.932] ✗（偏航被对准覆盖）。
+                // ⇒ 正确序是"**先按偏航摆正航向，再对准推力方向**"：`q_align * q_yaw`。
                 let q_yaw = Quaternion::from_axis_angle([0.0, 0.0, 1.0], sp.yaw);
-                q_yaw * q_align
+                q_align * q_yaw
             } else {
                 Quaternion::from_euler(Radian(0.0), Radian(0.0), sp.yaw)
             }
@@ -535,6 +538,13 @@ impl Controller for PidController {
         // 只说明**我的实现需要先做约定核对**（`Quaternion` 的乘法序、`from_axis_angle`
         // 的旋转方向、以及 `att` 是"世界→机体"还是"机体→世界"）—— 这正是本会话反复
         // 教训的"仪表/约定先自检"。
+        // ⚠️ **2026-09-21 二次回退**：约定自检确实抓到了**乘法序**问题（`A*B` 在本仓
+        // 是"先 A 后 B"，与标准相反）并已修，但**修后结果逐位不变** ✗ ⇒ 该实现仍有
+        // 其它错误，且**当前指标无法定位**（见下）。
+        // 另：本测例的"姿态误差 355°"极可能是**指标自身的缠绕假象** —— roll/pitch 由
+        // atan2 求得，在 ±180 附近会跳变，两曲线符号相反即算出 ~360° ✗（非真实误差）。
+        // ⇒ **再回退**；待 ①推力矢量实现逐项与自检对齐 ②姿态指标改为**四元数夹角**
+        // （无缠绕，如 2·acos|⟨q1,q2⟩|）之后，再启用。
         let _ = q_des_thrust;
         let q_des = q_des_legacy;
 
