@@ -78,6 +78,10 @@ pub static mut G_ESKF_Q_ATT_BASE: f32 = 1e-4;
 /// ★**方差地板倍率**（照参照 `cov.cpp` 的条件式过程噪声 ✓）。默认 1.0 = 开 ✓；0 = 关（对照臂 ✓）。
 /// 作用：防协方差塌陷 ⇒ 从而防 `mag_I`/`mag_B` 沿【病态方向】无限漂移 ✓✓（§3.5 的根因 ✓）。
 pub static mut G_ESKF_VAR_FLOOR: f32 = 1.0;
+/// ★**重锚定强度**（照参照 `mag_control.cpp` 的 `resetMagStates` 语义 ✓；§3.6 的下一半 ✓）。
+/// 0 = 关（对照臂 ✓）；>0 = 把 `mag_I` 软拉回先验的等效 σ（1/σ² = 权重 ✓）。
+/// 作用：打破 (mag_I, mag_B) 的【相关对倒】漂移 ✓✓（对角方差地板做不到 ✗）。
+pub static mut G_ESKF_MAG_REANCHOR: f32 = 0.0;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ImuDelta {
@@ -834,6 +838,55 @@ impl Eskf {
     /// 参照对三个分量【逐项】求新息与 `S = Hx·P·Hxᵀ + R` ✓ ⇒
     /// **后两项使用已被前项更新过的 `x` 与 `P`** ✓✓
     /// （而原 3×3 联合更新三项共用同一组 `(x,P)` ✗ —— 在 H 依赖状态时不等价 ✓）
+    /// ★**重锚定 `mag_I` 到先验**（软约束 ✓，逐分量 ✓）。
+    ///
+    /// 机理（§3.5/§3.6 ✓）：`mag_I` 与 `mag_B` 沿"对倒"方向**不可观测** ⇒ 会慢漂 ✓；
+    /// 对角方差地板**止不住**（该方向是相关方向 ✗）⇒ 用**先验伪量测**打破该结构 ✓。
+    /// 逐分量 + 既有 NIS 门 ✓（拒绝时 P 不变 ⇒ 与既有约定一致 ✓）。
+    pub fn reanchor_mag_i(&mut self, prior: [f32; 3], sigma: f32) -> u32 {
+        let mut applied = 0u32;
+        for i in 0..3 {
+            let idx = I_MAGI + i;
+            let mut h = [0.0f32; N];
+            h[idx] = 1.0;
+            let mut ph = [0.0f32; N];
+            for k in 0..N {
+                let mut acc = 0.0f32;
+                for m in 0..N {
+                    acc += self.p[k][m] * h[m];
+                }
+                ph[k] = acc;
+            }
+            let mut s_ = sigma * sigma;
+            for k in 0..N {
+                s_ += h[k] * ph[k];
+            }
+            if s_ <= 0.0 {
+                continue;
+            }
+            let resid = prior[i] - self.mag_i[i];
+            if (resid / crate::math::sqrt(s_)).abs() > self.gate {
+                continue; // 门控 ✓（与既有约定一致 ✓）
+            }
+            let mut e = ErrorState::default();
+            e.d_mag_i[i] = ph[idx] / s_ * resid;
+            let mut newp = [[0.0f32; N]; N];
+            for aa in 0..N {
+                for bb in 0..N {
+                    let mut acc = self.p[aa][bb];
+                    for m in 0..N {
+                        acc -= ph[aa] / s_ * h[m] * self.p[m][bb];
+                    }
+                    newp[aa][bb] = acc;
+                }
+            }
+            self.p = newp;
+            self.apply(&e);
+            applied += 1;
+        }
+        applied
+    }
+
     pub fn update_mag(&mut self, meas_body: [f32; 3]) -> Result<f32, &'static str> {
         if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_ON)) } < 0.5 {
             return Err("磁量测：对照臂【旋钮关闭】✓（实验用，非静默 ✗）");

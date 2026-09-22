@@ -39,6 +39,8 @@ pub struct EskfEstimator {
     pub n_mag: u32,
     /// 磁被门拒绝次数 ✓
     pub n_mag_rejected: u32,
+    /// ★重锚定应用的【分量】次数 ✓（证明机制在运行 ✓）
+    pub n_mag_reanchored: u32,
     /// GPS 位置/速度更新**成功**次数 ✓
     pub n_gps_pos: u32,
     pub n_gps_vel: u32,
@@ -67,6 +69,7 @@ impl EskfEstimator {
             n_baro: 0,
             n_mag: 0,
             n_mag_rejected: 0,
+            n_mag_reanchored: 0,
             n_gps_pos: 0,
             n_gps_vel: 0,
             n_baro_rejected: 0,
@@ -162,6 +165,14 @@ impl Estimator for EskfEstimator {
         if !self.mag_first_done {
             self.f.reset_mag_states(m, self.mag_i_prior);
             self.mag_first_done = true;
+        }
+        // ★重锚定（§3.6 ✓）：持续旋转时把 `mag_I` 软拉回先验（旋钮默认 0 = 关 ✓）
+        let ra = unsafe {
+            core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_REANCHOR))
+        };
+        if ra > 0.0 {
+            let n = self.f.reanchor_mag_i(self.mag_i_prior, ra);
+            self.n_mag_reanchored = self.n_mag_reanchored.wrapping_add(n);
         }
         match self.f.update_mag(m) {
             Ok(_) => self.n_mag = self.n_mag.wrapping_add(1),
