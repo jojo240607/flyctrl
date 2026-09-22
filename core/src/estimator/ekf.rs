@@ -86,6 +86,21 @@ pub static mut G_ATT_DBG: [f32; 6] = [0.0, f32::INFINITY, 0.0, 0.0, 0.0, 0.0];
 /// 不可信 ⇒ 本门应保持关闭（哨兵 `<0` = 关闭 = 默认，行为逐位不变 ✓）。
 pub static mut G_ATT_INNOV_GATE: f32 = -1.0;
 
+/// **B 阶段：原始比力 plausibility 门** —— 用【补偿前】的 `|f|` 门控平移补偿。
+///
+/// 动机（2026-09-21，本会话定位的**鸡生蛋问题** ✓）：
+/// 既有的"比力幅值门"（`an/g`）本可识别自由落体 ✓（`|f|≈0` ⇒ 比力方向无意义 ✓），
+/// 但它的 `an` 是**补偿之后**算的 ✗ —— 而补偿会扣掉伪 `a_world` ⇒ `|f|` 又 ≈ g
+/// ⇒ **门被补偿自己骗开** ✗✗（实测 A9 自由落体：0.023° → **28.509°**，×1240 ✗）。
+/// ⇒ 正解：用【补偿前】的原始比力判 plausibility ✓（**非循环** ✓ —— 与补偿动作无关 ✓）。
+///
+/// 依据（机动定义，非推断 ✓）：A3/A7 的加速度是**水平**的 ⇒ 原始 `|f|≈g` ✓ ⇒ 放行；
+/// A9 是 `accel_world = g`（**纯竖直**）⇒ 原始 `|f|≈0` ✗ ⇒ 必须抑制 ✓。
+///
+/// 语义：`≤0` = 关闭（默认，行为逐位不变 ✓）；`>0` = 门限（原始 `|f|/g` 偏离 1 超过
+/// 此值则线性抑制到 0 ✓）。
+pub static mut G_AW_RAWGATE: f32 = -1.0;
+
 /// 水平非重力加速度门控的编译期默认满闭阈值（m/s²）。
 /// 注意：**默认 0 = 关闭**（保持历史"三门槛"行为）。实测瞬时门控过于抖动，
 /// 见 `G_ATT_ACC_AC`（交流能量门控，本项的正解）。
@@ -646,6 +661,19 @@ impl Estimator for EkfEstimator {
                     let m = sqrt(aw[0] * aw[0] + aw[1] * aw[1] + aw[2] * aw[2]) / g;
                     ((m - 0.05) / 0.15).clamp(0.0, 1.0)
                 };
+                // ★ B 阶段：用【补偿前】的原始比力做 plausibility 门（非循环 ✓）
+                let raw_gate = unsafe {
+                    let th = core::ptr::read_volatile(core::ptr::addr_of!(G_AW_RAWGATE));
+                    if th <= 0.0 {
+                        1.0
+                    } else {
+                        let an_raw =
+                            sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]) / g;
+                        let dev = (an_raw - 1.0).abs();
+                        ((th - dev) / th).clamp(0.0, 1.0)
+                    }
+                };
+                let gate = gate * raw_gate;
                 let aw_b = crate::vehicle::rotate_vec_by_quat_inverse(self.att, aw);
                 [
                     a[0] - gate * aw_b[0],
