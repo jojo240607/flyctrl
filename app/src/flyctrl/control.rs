@@ -6,7 +6,8 @@
 use core::ffi::c_void;
 
 use flyctrl_core::controller::{PidController, Setpoint};
-use flyctrl_core::estimator::EkfEstimator;
+// ★**默认估计器改为 ESKF**（迁移计划步 3 ✓；全表验收 0/10 劣于 Legacy ✓，见 docs/c1-migration-plan.md ✓）
+use flyctrl_core::estimator::select::AnyEstimator;
 use flyctrl_core::fdir::Health;
 use flyctrl_core::hil::{HilContext, SimImu};
 use flyctrl_core::units::{Meter, MeterPerSecond, MeterPerSecondSquared, Second};
@@ -73,7 +74,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
     // 姿态/位置初始化门控、SimImu 回退、EKF + 气压观测、FDIR、控制环健康闸、
     // 执行器限幅全部由 `step_hil` 完成，与 SIL（fly-sim-core）完全一致。
     let mut hil = HilContext::new(
-        EkfEstimator::default_quad(),
+        AnyEstimator::default_product(), // ★默认 = ESKF ✓（Legacy 仍可经 AnyEstimator::legacy() 回退 ✓）
         PidController::default_quad(),
         Second(4.0 / 1000.0),
     );
