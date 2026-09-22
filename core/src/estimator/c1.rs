@@ -577,78 +577,79 @@ impl C1Filter {
         Ok(nis)
     }
 
-    /// **C2：机体三轴磁量测更新** ✓（参照 EKF2 ✓；NIS 门用参照 **3.0σ** ✓）
+    /// **C2：机体三轴磁量测更新 —— 逐分量【顺序标量融合】** ✓✓
+    ///
+    /// ★按参照实现改（`derivation.py` 435–437 行 ✓）：
+    /// 参照对三个分量【逐项】求新息与 `S = Hx·P·Hxᵀ + R` ✓ ⇒
+    /// **后两项使用已被前项更新过的 `x` 与 `P`** ✓✓
+    /// （而原 3×3 联合更新三项共用同一组 `(x,P)` ✗ —— 在 H 依赖状态时不等价 ✓）
     pub fn update_mag(&mut self, meas_body: [f32; 3]) -> Result<f32, &'static str> {
-        let pred = predicted_mag_body(self.st.q, self.mag_i, self.mag_b);
-        let resid = [meas_body[0] - pred[0], meas_body[1] - pred[1], meas_body[2] - pred[2]];
-        let h = mag_h(self.st.q, self.mag_i);
-        let r = diag3(self.r_mag);
-        // 增益（用更新前的 P ✓；并用 S 求 K ✓）—— 含 C2 两态 ⇒ 需自算 K·ν
-        let mut pht = [[0.0f32; 3]; N];
-        for i in 0..N {
-            for j in 0..3 {
-                let mut acc = 0.0f32;
-                for k in 0..N {
-                    acc += self.p[i][k] * h[j][k];
-                }
-                pht[i][j] = acc;
-            }
-        }
-        let mut s_mat = r;
-        for a in 0..3 {
-            for b in 0..3 {
-                let mut acc = 0.0f32;
-                for k in 0..N {
-                    acc += h[a][k] * pht[k][b];
-                }
-                s_mat[a][b] += acc;
-            }
-        }
-        let s_inv = match inv3(&s_mat) {
-            Some(v) => v,
-            None => return Err("C2: S 奇异 ⇒ 拒绝 ✓"),
-        };
-        let mut dx = [0.0f32; N];
-        for i in 0..N {
-            for a in 0..3 {
-                let mut acc = 0.0f32;
-                for b in 0..3 {
-                    acc += pht[i][b] * s_inv[b][a];
-                }
-                dx[i] += acc * resid[a];
-            }
-        }
-        // 先算 NIS（用同一 S ✓）⇒ 超门则【不改任何状态/P】✓
-        let mut tmp = [0.0f32; 3];
-        for a in 0..3 {
-            let mut acc = 0.0f32;
-            for b in 0..3 {
-                acc += s_inv[a][b] * resid[b];
-            }
-            tmp[a] = acc;
-        }
-        let mut nis = 0.0f32;
-        for a in 0..3 {
-            nis += resid[a] * tmp[a];
-        }
-        let nis_sigma = crate::math::sqrt(nis.max(0.0));
-        if nis_sigma > self.gate {
-            return Err("C2: 磁新息超门限 ⇒ 拒绝 ✓（状态与 P 不变 ✓）");
-        }
-        // 组装误差状态（含 C2 两态 ✓）⇒ 注入修正（相减语义见 `apply` ✓）
-        let mut e = ErrorState::default();
+        let mut worst = 0.0f32;
         for i in 0..3 {
-            e.dtheta[i] = dx[I_ATT + i];
-            e.dv[i] = dx[I_VEL + i];
-            e.dp[i] = dx[I_POS + i];
-            e.dbg[i] = dx[I_BG + i];
-            e.dba[i] = dx[I_BA + i];
-            e.d_mag_i[i] = dx[I_MAGI + i];
-            e.d_mag_b[i] = dx[I_MAGB + i];
+            // ★每分量重新算预测与 H（用【已更新】的状态 ✓ —— 顺序融合的关键 ✓）
+            let pred = predicted_mag_body(self.st.q, self.mag_i, self.mag_b);
+            let resid = meas_body[i] - pred[i];
+            let hfull = mag_h(self.st.q, self.mag_i);
+            let h = hfull[i]; // 1×N 行（参照的 Hx ✓）
+            // S = h·P·hᵀ + R
+            let mut ph = [0.0f32; N];
+            for (k, v) in ph.iter_mut().enumerate() {
+                let mut acc = 0.0f32;
+                for m in 0..N {
+                    acc += self.p[k][m] * h[m];
+                }
+                *v = acc;
+            }
+            let mut s_ = self.r_mag;
+            for k in 0..N {
+                s_ += h[k] * ph[k];
+            }
+            if s_ <= 0.0 {
+                continue;
+            }
+            let nis = resid.abs() / crate::math::sqrt(s_);
+            if nis > self.gate {
+                continue; // 该分量被拒 ⇒ 跳过（不影响其他分量 ✓）
+            }
+            worst = worst.max(nis);
+            // 误差状态增量 dx = K·ν = P·hᵀ·ν / S
+            let mut dx = [0.0f32; N];
+            for k in 0..N {
+                dx[k] = ph[k] / s_ * resid;
+            }
+            let mut e = ErrorState::default();
+            for kk in 0..3 {
+                e.dtheta[kk] = dx[I_ATT + kk];
+                e.dv[kk] = dx[I_VEL + kk];
+                e.dp[kk] = dx[I_POS + kk];
+                e.dbg[kk] = dx[I_BG + kk];
+                e.dba[kk] = dx[I_BA + kk];
+                e.d_mag_i[kk] = dx[I_MAGI + kk];
+                e.d_mag_b[kk] = dx[I_MAGB + kk];
+            }
+            // P ← (I − K·h)·P（用当前 P ✓）
+            let kk_gain: [f32; N] = {
+                let mut g = [0.0f32; N];
+                for k in 0..N {
+                    g[k] = ph[k] / s_;
+                }
+                g
+            };
+            let mut newp = [[0.0f32; N]; N];
+            for a in 0..N {
+                for b in 0..N {
+                    let mut acc = self.p[a][b];
+                    for m in 0..N {
+                        acc -= kk_gain[a] * h[m] * self.p[m][b];
+                    }
+                    newp[a][b] = acc;
+                }
+            }
+            self.p = newp;
+            // 状态注入（在该分量之后立即生效 ⇒ 下一分量看到新状态 ✓✓）
+            self.apply(&e);
         }
-        let nisr = update_vec3(&mut self.p, &h, &resid, &r, self.gate)?;
-        self.apply(&e);
-        Ok(nisr)
+        Ok(worst)
     }
 
     /// 计算误差状态增量（K·ν ✓），供 `apply` 使用 ✓
@@ -1192,6 +1193,27 @@ mod tests {
     /// | ② 姿态块 P0 ⇒ 1e-6（声明姿态已知 ✓）| 0.0646 ⇒ **0.0730**（无改善 ✗）⇒ **排除** |
     /// ⇒ 停滞 ~0.07 高斯【不是】上述三者 ✓ ⇒ 更深结构问题 ✗
     ///
+    /// # ★★★真正的根因（2026-09-21）：**磁更新根本没生效** —— mag_I/mag_B 初末值【逐位不变】
+    /// ```
+    /// 初末值未变化 ✗：mag_I 最大变化 0.00e0 / mag_B 0.00e0
+    /// ```
+    /// **⇒ 这一下解释了此前所有"参数无影响"的现象** ✓✓
+    /// （P0 ✗ / 三轴 ✗ / Q ✗ / 融合结构 ✗ 全都无影响 ⇒ 因为状态从未被更新 ✓✓）
+    /// **并说明我此前"残差收敛 ⇒ 零空间"的结论无效** ✗：
+    ///   `r_res` 断言排在 `eb` 断言之后 ⇒ **从未运行** ✗✓（又一次断言顺序造成的假结论 ✓）
+    ///
+    /// ## 候选（下一步的决定性检查：统计"接受 vs 拒绝"次数 ✓）
+    /// ①★ **门控死锁**（最可能 ✓）：磁 R 极小 ⇒ `S` 小 ⇒ `NIS = |resid|/√S` 巨大
+    ///    ⇒ **每次都被 5σ 门拒绝** ✗ ⇒ 状态冻结 ✓
+    ///    ⇒ 冻结又使残差持续巨大 ⇒ **永久拒绝（恶性循环）** ✓✓（经典 ✓）
+    /// ② 我在顺序融合改写中引入的 bug（逐分量 NIS 用了过大的 H·P·Hᵀ ✓）
+    ///
+    /// ## 修法（两条都要 ✓）
+    /// ① **初始化**：`mag_I` 应由【首个磁量测 + 对齐姿态】给出 ✓（而非随手猜 ✗）
+    /// ② **R/门**：初值偏差大 ⇒ 首步 NIS 必然巨大 ⇒ 正确做法是
+    ///    **先初始化再开门**（或大 R 起步、随收敛收紧 ✓ —— 参照亦如此 ✓）
+    ///
+    /// **（以下为已失效的旧结论，保留以存过程 ✓）**
     /// # ★★残差检查已裁决：**残差收敛而两态仍错 ⇒ 存在不可观测零空间** ✗✓（2026-09-21）
     /// `r_res < 1e-3` **通过** ✓（后半程预测已贴合量测 ✓）而 `|Δmag_B| = 0.073` ✗
     /// ⇒ 即：滤波器找到了一组 **能解释所有量测、但偏离真值的 (mag_I, mag_B)** ✗✓
@@ -1296,6 +1318,18 @@ mod tests {
             }
             f.p[I_ATT + i][I_ATT + i] = 1e-6;
         }
+        // ★最直接检查（2026-09-21）：初末值是否变化 ✓（若一字不变 ⇒ 更新根本没生效 ✗）
+        let (mi_init, mb_init) = (f.mag_i, f.mag_b);
+        {
+            let dm_i = (0..3).map(|i| (f.mag_i[i] - mi_init[i]).abs()).fold(0.0f32, f32::max);
+            let dm_b = (0..3).map(|i| (f.mag_b[i] - mb_init[i]).abs()).fold(0.0f32, f32::max);
+            assert!(
+                dm_i > 1e-6 && dm_b > 1e-6,
+                "初末值【未变化】✗：mag_I 最大变化 {dm_i:.2e} / mag_B {dm_b:.2e} \
+                 ⇒ 磁更新【根本没生效】（全被拒/空跑 ✓）—— 这才是停滞的根源 ✓✓"
+            );
+        }
+
         let (tr_att0, tr_magb0) = (tr_block(&f, I_ATT), tr_block(&f, I_MAGB));
         // ★修【测例可观测性】(2026-09-21)：纯偏航下"与转轴平行"的分量不可分 ✗
         //   ⇒ 改为【三轴常值体速率】✓（所有分量都可被激励 ✓）
