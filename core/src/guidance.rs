@@ -20,6 +20,11 @@
 //! `mission.rs` 是**航点式**（离散目标 + 到达半径），本模块是**连续轨迹式**
 //! （每拍都有位/速/加前馈）。两者互补：航点适合任务层，连续轨迹适合跟踪判据。
 
+//! ⚠️ **no_std 教训**：本 crate 是 `no_std`（数学走 `crate::math` 后端），
+//! **不能直接用 `f32::sin_cos` / `f32::atan2` 等 std 方法** —— 它们在 no_std 下不存在。
+//! 本模块初版即因此**只在 host 测试（有 std）通过、而 no_std 构建失败** ✗。
+//! ⇒ 验证此类模块**必须同时跑 `cargo build`（目标配置）**，不能只跑 host 单测。
+
 use crate::controller::Setpoint;
 use crate::units::{Meter, MeterPerSecond, MeterPerSecondSquared, Radian, Second};
 
@@ -177,7 +182,7 @@ impl TrajectorySource for Circle {
         // 飞完后**保持终点**（不外推 —— 否则终点处会冒出虚假前馈）。
         let tt = t.0.min(self.duration().0);
         let ph = self.phase0 + self.omega * tt;
-        let (s, c) = ph.sin_cos();
+        let (s, c) = crate::math::sin_cos(ph);
         let r = self.radius.0;
         let w = self.omega;
         // 位置：圆心 + r·(cosφ, sinφ)（北/东）；高度取圆心的高
@@ -200,7 +205,7 @@ impl TrajectorySource for Circle {
         ];
         // 机头切向：atan2(ve, vn)
         let yaw = if self.nose_tangent {
-            Radian(f32::atan2(vel[1].0, vel[0].0))
+            Radian(crate::math::atan2(vel[1].0, vel[0].0))
         } else {
             Radian(0.0)
         };
@@ -252,8 +257,8 @@ impl TrajectorySource for Figure8 {
     fn at(&self, t: Second) -> TrajectorySample {
         let tt = t.0.min(self.duration().0);
         let ph = self.omega * tt;
-        let (s1, c1) = ph.sin_cos();
-        let (s2, c2) = (2.0 * ph).sin_cos();
+        let (s1, c1) = crate::math::sin_cos(ph);
+        let (s2, c2) = crate::math::sin_cos(2.0 * ph);
         let (an, ae, w) = (self.amp_n.0, self.amp_e.0, self.omega);
         let pos = [
             Meter(self.center[0].0 + an * s1),
@@ -270,7 +275,7 @@ impl TrajectorySource for Figure8 {
             MeterPerSecondSquared(-4.0 * ae * w * w * s2),
             MeterPerSecondSquared(0.0),
         ];
-        let yaw = Radian(f32::atan2(vel[1].0, vel[0].0));
+        let yaw = Radian(crate::math::atan2(vel[1].0, vel[0].0));
         TrajectorySample {
             pos,
             vel,
