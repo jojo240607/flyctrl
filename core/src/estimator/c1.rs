@@ -408,6 +408,9 @@ pub struct C1Filter {
     pub r_baro: f32,
     /// C2：磁量测噪声方差（高斯² ✓；由残差反推 ✓）
     pub r_mag: f32,
+    /// 诊断（2026-09-21 ✓）：磁更新实际【应用】与【跳过】的计数 ✓
+    pub mag_applied: u32,
+    pub mag_skipped: u32,
     /// **冻结零偏修正**（定位用 ✓）：静止场景下零偏本就【不可观测】✗
     /// （无足够量测激励 ✓）⇒ 用于判定"长循环慢性发散是否由零偏块引起" ✓
     pub freeze_bias: bool,
@@ -446,6 +449,8 @@ impl C1Filter {
             // ★实验（2026-09-21）：本测例量测是【合成精确值】⇒ R 应很小 ✓
             //   （原 1e-4 会让滤波在残差 ~√R 处停手 ⇒ 持久偏差 ✓ —— 候选①）
             r_mag: 1e-8,
+            mag_applied: 0,
+            mag_skipped: 0,
             freeze_bias: false,
         }
     }
@@ -605,12 +610,15 @@ impl C1Filter {
                 s_ += h[k] * ph[k];
             }
             if s_ <= 0.0 {
+                self.mag_skipped += 1;
                 continue;
             }
             let nis = resid.abs() / crate::math::sqrt(s_);
             if nis > self.gate {
+                self.mag_skipped += 1;
                 continue; // 该分量被拒 ⇒ 跳过（不影响其他分量 ✓）
             }
+            self.mag_applied += 1;
             worst = worst.max(nis);
             // 误差状态增量 dx = K·ν = P·hᵀ·ν / S
             let mut dx = [0.0f32; N];
@@ -1193,7 +1201,20 @@ mod tests {
     /// | ② 姿态块 P0 ⇒ 1e-6（声明姿态已知 ✓）| 0.0646 ⇒ **0.0730**（无改善 ✗）⇒ **排除** |
     /// ⇒ 停滞 ~0.07 高斯【不是】上述三者 ✓ ⇒ 更深结构问题 ✗
     ///
-    /// # ★★★真正的根因（2026-09-21）：**磁更新根本没生效** —— mag_I/mag_B 初末值【逐位不变】
+    /// # ★★★真因查明：**测例里 `update_mag` 调用被漏掉了**（2026-09-21 ✓✓）
+    /// 经过：改写三轴转动测例时（替换范围过大 ✗）把 `let _ = f.update_mag(meas);` 删掉了 ✗
+    /// ⇒ 状态初末【逐位不变】⇒ 所有参数"无影响" ✓（现象完全自洽 ✓）
+    /// ⇒ 而"初末检查"断言又被我放在**循环之前** ✗ ⇒ 报出合法的 0/0 ✓（双重误导 ✗）
+    /// **补回调用后**：信息值非零 ✓（更新确实在跑 ✓）**且立刻暴露真问题：姿态 → NaN** ✗✓
+    ///
+    /// # ⚠️ 方法论修正（重要 ✓）
+    /// 此前"排除 R ✗ / P0 ✗ / Q ✗ / 三轴 ✗ / 融合结构 ✗"**全部是在"更新未运行"下测的** ✗✓
+    /// ⇒ 那些排除**全部无效** ✓ ⇒ 必须在更新真正运行时**重新评估** ✓✓
+    /// ⇒ 教训（本会话同源第 N 次）：**先证明"被测机制确实在运行"** ✗✓
+    ///   —— 本次靠【调用计数】才发现 ✓✓（新仪器：把"是否运行"变成可观测量 ✓）
+    ///
+    /// **（以下为已被推翻的旧诊断，保留以存过程 ✓）**
+    /// # ★★旧：**磁更新根本没生效** —— mag_I/mag_B 初末值【逐位不变】
     /// ```
     /// 初末值未变化 ✗：mag_I 最大变化 0.00e0 / mag_B 0.00e0
     /// ```
@@ -1323,11 +1344,6 @@ mod tests {
         {
             let dm_i = (0..3).map(|i| (f.mag_i[i] - mi_init[i]).abs()).fold(0.0f32, f32::max);
             let dm_b = (0..3).map(|i| (f.mag_b[i] - mb_init[i]).abs()).fold(0.0f32, f32::max);
-            assert!(
-                dm_i > 1e-6 && dm_b > 1e-6,
-                "初末值【未变化】✗：mag_I 最大变化 {dm_i:.2e} / mag_B {dm_b:.2e} \
-                 ⇒ 磁更新【根本没生效】（全被拒/空跑 ✓）—— 这才是停滞的根源 ✓✓"
-            );
         }
 
         let (tr_att0, tr_magb0) = (tr_block(&f, I_ATT), tr_block(&f, I_MAGB));
@@ -1361,6 +1377,10 @@ mod tests {
                 rti[1] + mag_b_true[1],
                 rti[2] + mag_b_true[2],
             ];
+            // ★★★补回被遗漏的更新调用（2026-09-21 查出 ✓）：
+            //   改写三轴转动测例时，替换范围把这一行删掉了 ✗ ⇒ 更新从未被调用
+            //   ⇒ 状态初末不变、所有参数"无影响"（这才是真因 ✓✓）
+            let _ = f.update_mag(meas);
             // ★堆叠 H（每 200 步取一次 ✓）⇒ 供严格的零空间判定 ✓
             if k % 200 == 0 && hn < 20 {
                 hs[hn] = mag_h(f.st.q, f.mag_i);
@@ -1459,6 +1479,19 @@ mod tests {
                  ⇒ 需加强激励（更多轴/更大转角）或按参照处理不可观测方向 ✓"
             );
         }
+            let dm_i = (0..3).map(|k| (f.mag_i[k] - mi_init[k]).abs()).fold(0.0f32, f32::max);
+            let dm_b = (0..3).map(|k| (f.mag_b[k] - mb_init[k]).abs()).fold(0.0f32, f32::max);
+            assert!(
+                f.mag_applied > 0,
+                "磁更新【一次都没应用】✗（应用 {} / 跳过 {}）⇒ 定位到 update_mag 内部 ✓",
+                f.mag_applied, f.mag_skipped
+            );
+            assert!(
+                dm_i > 1e-6 && dm_b > 1e-6,
+                "初末值【未变化】✗：mag_I 最大变化 {dm_i:.2e} / mag_B {dm_b:.2e} \
+                 ⇒ 磁更新【根本没生效】（全被拒/空跑 ✓）—— 这才是停滞的根源 ✓✓"
+            );
+
         let (tr_att1, tr_magb1) = (tr_block(&f, I_ATT), tr_block(&f, I_MAGB));
         let eb = ((0..3).map(|i| (f.mag_b[i] - mag_b_true[i]).powi(2)).sum::<f32>()).sqrt();
         // 判据：若 mag_B 真在被估计 ⇒ 其 P 的迹应显著下降 ✓；
