@@ -69,6 +69,23 @@ pub static mut G_ATT_ACC_GATE: f32 = -1.0;
 /// 因未自检仪器而误判 ✗）。`k` = 实际生效的合成锚定增益（各门权重之积 × α）✓。
 pub static mut G_ATT_DBG: [f32; 4] = [0.0, f32::INFINITY, 0.0, 0.0];
 
+/// **A 阶段：外部参考新息门**（m/s²）—— 用外部加速度参考构造【预测比力】，
+/// 按 `|f_meas − f_pred|` 的残差门控重力锚定。
+///
+/// 与既有 `G_ATT_ACC_GATE` 的本质区别（2026-09-21 实测定位）：
+///  - 旧门问【加速度大不大？】✗ —— 是代理量：大步阶跃本来就有加速度 ⇒ 门要么关掉
+///    正确修正 ✗，要么几乎不管事 ✗（§9.9 实测：门确实闭合，但合成增益只降 **3%** ✗）。
+///  - 新门问【测量与状态是否【不自洽】？】✓ —— 与加速度大小**解耦** ✓：
+///    姿态正确 ⇒ 残差≈0（全开 ✓）；姿态被污染 ⇒ 残差显著（关闭 ✓）。
+///
+/// 预测比力（本项目的约定：静止时 `f = −Rᵀ·[0,0,g]`，与 `down_body` 一致 ✓）：
+/// ```text
+///   f_pred = Rᵀ · (a_world_ref − [0,0,g])
+/// ```
+/// **前提**：`world_accel` 必须可信（即 `G_AW_GPS>0` 且源质量可接受 ✓）；否则预测本身
+/// 不可信 ⇒ 本门应保持关闭（哨兵 `<0` = 关闭 = 默认，行为逐位不变 ✓）。
+pub static mut G_ATT_INNOV_GATE: f32 = -1.0;
+
 /// 水平非重力加速度门控的编译期默认满闭阈值（m/s²）。
 /// 注意：**默认 0 = 关闭**（保持历史"三门槛"行为）。实测瞬时门控过于抖动，
 /// 见 `G_ATT_ACC_AC`（交流能量门控，本项的正解）。
@@ -718,7 +735,31 @@ impl Estimator for EkfEstimator {
                 } else {
                     (att_acc_ac - self.acc_h_dev) / (att_acc_ac - att_acc_ac / 3.0)
                 };
-                let w_acc = w_inst * w_ac;
+                // ---- A 阶段：外部参考【新息门】（见 G_ATT_INNOV_GATE）----
+                // 旧门（上）问"加速度大不大"（代理量 ✗）；本门问"测量与状态是否自洽"（✓）。
+                let innov_gate = unsafe {
+                    core::ptr::read_volatile(core::ptr::addr_of!(G_ATT_INNOV_GATE))
+                };
+                let w_innov = if innov_gate <= 0.0 {
+                    1.0 // 未启用 ⇒ 行为不变 ✓
+                } else {
+                    let aw = self.world_accel;
+                    let fp = crate::vehicle::rotate_vec_by_quat_inverse(
+                        self.att,
+                        [aw[0], aw[1], aw[2] - g],
+                    );
+                    let (dx, dy, dz) = (a[0] - fp[0], a[1] - fp[1], a[2] - fp[2]);
+                    let r = sqrt(dx * dx + dy * dy + dz * dz);
+                    let g0 = innov_gate / 3.0;
+                    if r <= g0 {
+                        1.0
+                    } else if r >= innov_gate {
+                        0.0
+                    } else {
+                        (innov_gate - r) / (innov_gate - g0)
+                    }
+                };
+                let w_acc = w_inst * w_ac * w_innov;
                 let k = att_alpha_eff * 0.5 * w * w_align * w_gyro * w_acc;
                 unsafe {
                     // 自检埋点：峰值 a_h / 最小 w_acc / k 的累计（供测试读取 ✓）
