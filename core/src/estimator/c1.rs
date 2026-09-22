@@ -349,6 +349,9 @@ pub struct C1Filter {
     pub r_gps_p: f32,
     pub r_gps_v: f32,
     pub r_baro: f32,
+    /// **冻结零偏修正**（定位用 ✓）：静止场景下零偏本就【不可观测】✗
+    /// （无足够量测激励 ✓）⇒ 用于判定"长循环慢性发散是否由零偏块引起" ✓
+    pub freeze_bias: bool,
 }
 
 impl C1Filter {
@@ -370,6 +373,7 @@ impl C1Filter {
             r_gps_p: 2.0,   // 2 m²（σ ≈ 1.4 m ✓）
             r_gps_v: 0.25,  // (0.5 m/s)² ✓
             r_baro: 0.25,   // (0.5 m)² ✓
+            freeze_bias: false,
         }
     }
 
@@ -411,7 +415,15 @@ impl C1Filter {
         //   `inject_error` 的语义是 `x ← x ⊕ e`（e 为"真值相对名义的偏差" ✓）
         //   ⇒ Kalman 的 `δx̂ = K·ν` 正是该偏差 ⇒ 修正应【相加】✓
         //   我曾"改成取负"⇒ 方向反了 ✗（最小方向检查实测：位置误差 3 → 8.556 ✗✓）
-        inject_error(&mut self.st, e);
+        if self.freeze_bias {
+            // 冻结零偏修正（定位实验 ✓）：只注入姿态/速度/位置三块 ✓
+            let mut e2 = *e;
+            e2.dbg = [0.0; 3];
+            e2.dba = [0.0; 3];
+            inject_error(&mut self.st, &e2);
+        } else {
+            inject_error(&mut self.st, e);
+        }
     }
 
     /// GPS 位置（H = [0 0 I] ✓）
@@ -844,6 +856,44 @@ mod tests {
     ///
     /// 判据（行为量 ✓）：① 全程无 NaN ✓ ② 速度收敛到 0 ✓ ③ 位置收敛到真值 ✓
     /// ④ 循环内插一个外点 ⇒ 必须被 NIS 门拒绝（且不影响收敛 ✓）
+    /// **定位实验：冻结零偏后长循环是否收敛** ✓（候选① ✓）
+    ///
+    /// **实测结论（2026-09-21）**：|v|² = 5.06e4 ✗ ⇒ **仍发散**
+    /// ⇒ **候选①（零偏块）被排除** ✓✓（干净排除：冻结修正后行为几乎不变 ✓）
+    /// ⇒ 候选顺延至 ②（P/Q 与真实误差量级不匹配 ⇒ 协方差不一致 ✗）
+    ///    与 ③（姿态经位置量测的交叉协方差反噬速度 ✗）
+    /// **下一步首选仪器：NIS 一致性检查** ✓✓
+    ///   理论：滤波器一致时，NIS 的**均值应 ≈ 量测维数 m**（卡方期望 ✓）
+    ///   ⇒ 若实测均值 ≫ m ⇒ 滤波器【过度自信】（P 偏小 / Q、R 不匹配 ✗）
+    ///     —— 这正是经典的发散成因 ✓，且**用一个统计量即可判定** ✓✓
+    #[ignore = "定位实验：零偏块已排除（|v|²=5.06e4 仍发散 ✗）；下一步做 NIS 一致性检查 ✓"]
+    #[test]
+    fn c1_long_loop_with_frozen_bias() {
+        let g = [0.0f32, 0.0, 9.81];
+        let dt = 0.01f32;
+        let q0 = Quaternion::from_axis_angle([0.0, 0.0, 1.0], Radian(0.0)).normalize();
+        let truth_p = [0.0f32, 0.0, -5.0];
+        let mut f = C1Filter::new(q0, [-1.0, 0.5, 0.2], [3.0, -2.0, -4.0], 5.0);
+        f.freeze_bias = true; // ★冻结零偏修正 ✓
+        let a_support = [0.0f32, 0.0, -9.81];
+        for k in 0..3000 {
+            f.predict([0.0; 3], [a_support[0] * dt, a_support[1] * dt, a_support[2] * dt], dt, g);
+            if k % 10 == 0 {
+                let _ = f.update_gps_vel([0.0, 0.0, 0.0]);
+                let _ = f.update_gps_pos(truth_p);
+                let _ = f.update_baro(5.0);
+            }
+            assert!(f.st.v.iter().all(|x| x.is_finite()), "第 {k} 步非有限 ✗");
+        }
+        let vnorm2: f32 = f.st.v.iter().map(|x| x * x).sum();
+        let perr2: f32 = (0..3).map(|i| (f.st.p[i] - truth_p[i]).powi(2)).sum();
+        assert!(
+            vnorm2 < 0.01,
+            "冻结零偏后速度应收敛（实测 |v|²={vnorm2:.3e}）✗ ⇒ 定位：慢性发散【不是】零偏块"
+        );
+        assert!(perr2 < 1.0, "冻结零偏后位置应收敛（实测 |Δp|²={perr2:.3e}）✗");
+    }
+
     #[ignore = "长循环仍发散 ✗（符号与短程已确认 ✓；待查 P0/Q、姿态交叉协方差、零偏块 ✓）"]
     #[test]
     fn c1_filter_loop_stationary_converges() {
