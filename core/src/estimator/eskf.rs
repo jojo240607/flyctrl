@@ -79,9 +79,11 @@ pub static mut G_ESKF_Q_ATT_BASE: f32 = 1e-4;
 /// 作用：防协方差塌陷 ⇒ 从而防 `mag_I`/`mag_B` 沿【病态方向】无限漂移 ✓✓（§3.5 的根因 ✓）。
 pub static mut G_ESKF_VAR_FLOOR: f32 = 1.0;
 /// ★**重锚定强度**（照参照 `mag_control.cpp` 的 `resetMagStates` 语义 ✓；§3.6 的下一半 ✓）。
+/// ★**默认 0.01**（已由全表验收 ✓）：参照 `ekf2_mag_e_noise = 1e-3` ⇒ 飞行 t≈100s 的
+/// 世界磁场不确定度 ≈ 1e-3·√t ≈ 0.01 ✓（物理交叉验证：|B|≈0.45 的 2% ≈ 0.009 ✓）。
 /// 0 = 关（对照臂 ✓）；>0 = 把 `mag_I` 软拉回先验的等效 σ（1/σ² = 权重 ✓）。
 /// 作用：打破 (mag_I, mag_B) 的【相关对倒】漂移 ✓✓（对角方差地板做不到 ✗）。
-pub static mut G_ESKF_MAG_REANCHOR: f32 = 0.0;
+pub static mut G_ESKF_MAG_REANCHOR: f32 = 0.01;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ImuDelta {
