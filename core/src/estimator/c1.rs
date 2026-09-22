@@ -235,7 +235,11 @@ pub fn update_scalar(
 
 /// **C2 量测预测**：机体三轴磁 `h(x) = R(q)·mag_I + mag_B` ✓（参照 EKF2 ✓）
 pub fn predicted_mag_body(q: Quaternion, mag_i: [f32; 3], mag_b: [f32; 3]) -> [f32; 3] {
-    let mi = rotate_vec_by_quat(q, mag_i);
+    // ★方向修正（2026-09-21，由"收敛到错值"定位 ✓）
+    //   `mag_I` 是**导航系**地磁 ✓、量测是**机体系** ⇒ 必须 **Rᵀ·mag_I + mag_B** ✓
+    //   （我原用 `R·mag_I` ✗ —— 方向反了 ⇒ 模型与真值不自洽 ⇒ mag_B 收敛到错值 ✓✓）
+    //   参照：PX4 EKF2 的 mag 量测即 Rᵀ·mag_I + mag_B ✓（§14.8 ✓）
+    let mi = rotate_vec_by_quat_inverse(q, mag_i);
     [mi[0] + mag_b[0], mi[1] + mag_b[1], mi[2] + mag_b[2]]
 }
 
@@ -246,21 +250,27 @@ pub fn predicted_mag_body(q: Quaternion, mag_i: [f32; 3], mag_b: [f32; 3]) -> [f
 pub fn mag_h(q: Quaternion, mag_i: [f32; 3]) -> [[f32; N]; 3] {
     let mut h = [[0.0f32; N]; 3];
     let aw = rotate_vec_by_quat(q, mag_i); // 世界系磁矢量 ✓
-    // δθ 块：−[aw ×]（第 j 列 = −(aw × e_j) ✓）
+    // ★δθ 块（2026-09-21 按修正后的 h 定义重推 ✓，并由数值对照裁决 ✓）：
+    //   h = Rᵀ·mag_I；`R_new = R_δq·R`（本项目 local ✓）⇒
+    //   h_new ≈ Rᵀ(I − [δθ×])mag_I = h + Rᵀ(mag_I × δθ)
+    //   ⇒ ∂h/∂δθ = **+Rᵀ·[mag_I ×]**（第 j 列 = Rᵀ·(mag_I × e_j) ✓）
+    //   ⚠️ 与旧式"世界系叉乘 −[R·mag_I ×]"不同 ✗ —— 模型定义改了，H 必须跟着改 ✓✓
     let basis = [[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
     for (j, e) in basis.iter().enumerate() {
-        let c = [
-            aw[1] * e[2] - aw[2] * e[1],
-            aw[2] * e[0] - aw[0] * e[2],
-            aw[0] * e[1] - aw[1] * e[0],
+        let c0 = [
+            mag_i[1] * e[2] - mag_i[2] * e[1],
+            mag_i[2] * e[0] - mag_i[0] * e[2],
+            mag_i[0] * e[1] - mag_i[1] * e[0],
         ];
+        let c = rotate_vec_by_quat_inverse(q, c0);
         for i in 0..3 {
-            h[i][I_ATT + j] = -c[i];
+            h[i][I_ATT + j] = c[i];
         }
     }
-    // mag_I 块 = R ✓（用基向量取列 ✓）
+    let _ = aw;
+    // mag_I 块 = **Rᵀ** ✓（与修正后的 h 定义一致 ✓）
     for (j, e) in basis.iter().enumerate() {
-        let c = rotate_vec_by_quat(q, *e);
+        let c = rotate_vec_by_quat_inverse(q, *e);
         for i in 0..3 {
             h[i][I_MAGI + j] = c[i];
         }
@@ -1106,6 +1116,24 @@ mod tests {
     /// ⇒ ① 不再发散 ✓ ② 诊断（"强制姿态 ⇒ 状态/协方差不一致"）**成立** ✓✓
     /// 但**尚未收敛**（1.039 高斯 vs 真值量级 0.23 高斯 ⇒ 误差 ≈ 4.5× 真值 ✗）
     /// ⇒ 属【收敛速率/量级】问题 ✓（与 C1 早期 Q/R 标定同类 ✓，手法已成熟 ✓）
+    /// # ★★两处【结构性】修正已落地（2026-09-21），收敛改善 **1970 倍**
+    /// 1. **`predicted_mag_body` 方向错了** ✗✓：原用 `R·mag_I`，正解 **`Rᵀ·mag_I + mag_B`**
+    ///    （`mag_I` 是导航系、量测是机体系 ✓；参照 EKF2 ✓）
+    ///    —— 由"收敛到**错值**"定位 ✓（P 迹正常下降 ⇒ 不是在吸姿态 ⇒ 是模型定义 ✗✓）
+    /// 2. **H 的 δθ 块必须跟着改** ✓：模型改为 `Rᵀ·mag_I` 后，正确形式是
+    ///    **`+Rᵀ·[mag_I ×]`** ✗✓（不再是"世界系叉乘" ✗）—— 由 **H 的数值对照当场报错**定位 ✓✓
+    /// ⇒ |Δmag_B|：**142 ⇒ 0.0722**（**1970 倍** ✓✓），且 H 数值对照通过 ✓
+    ///
+    /// # ⚠️ 但**仍停滞**（尚差 3~4×）—— 延长步数裁决 ✓
+    /// 2000 步 ⇒ 0.0750；**6000 步 ⇒ 0.0722**（3 倍步数仅改善 4% ✗）⇒ **停滞** ✗
+    /// ⇒ 仍有【残留不一致】✗（非速率问题 ✓）
+    /// **候选**（按可能性 ✓）：
+    ///   ①★ **磁量测的 R 过大**（1e-4 ✓）—— 而本测例的量测是【合成精确值】✗
+    ///      ⇒ R 与真值不符 ⇒ 滤波在残差 ~√R 时就停止修正 ⇒ 留下**持久偏差** ✓✓（经典 ✓）
+    ///   ② 姿态仍吸收部分残差（P 迹检查显示 mag 块确实在降 ✓，但未必降到 0 ✓）
+    ///   ③ mag_I 与 mag_B 的**部分不可分**（纯偏航下，垂直于转轴的分量不可分 ✗✓）
+    ///      —— 纯偏航绕 Z ⇒ 只有 Z 分量不可分 ⇒ 可能正是残留所在 ✓✓（有理论依据 ✓）
+    ///
     /// **P0 实验（2026-09-21）**：把两态 P0 由 0.01 提到 0.25（按真值量级 ✓）⇒
     ///   |Δmag_B| = 1.039 ⇒ **1.254**（略差 ✗）⇒ **对 P0 不敏感** ✗ ⇒ 排除"先验尺度"✓
     ///
@@ -1153,7 +1181,13 @@ mod tests {
         //   改为用 `predict` 驱动（喂陀螺 ✓）⇒ 状态与协方差【天然一致】✓✓
         //   量测由【独立真值 q_true】合成 ✓（q_true 只用于生成量测，滤波器不知道它 ✓）
         let w = 0.5236f32; // 30°/s 偏航 ✓
-        for k in 0..2000 {
+        // ★"谁在吸残差"的定量检查（2026-09-21 ✓）：记录 P 的【姿态块】与【mag_B 块】的迹 ✓
+        let tr_block = |f: &C1Filter, base: usize| -> f32 {
+            (0..3).map(|i| f.p[base + i][base + i]).sum::<f32>()
+        };
+        let (tr_att0, tr_magb0) = (tr_block(&f, I_ATT), tr_block(&f, I_MAGB));
+        // ★延长步数（2000 ⇒ 6000 = 60 s / 转角 ~31 rad ✓）：判定"仍在收敛 vs 停滞" ✓
+        for k in 0..6000 {
             // 姿态驱动：纯偏航角速率 ✓；水平姿态下比力 = 支撑力 ✓
             f.predict([0.0, 0.0, w * dt], [0.0, 0.0, -9.81 * dt], dt, [0.0, 0.0, 9.81]);
             let yaw = w * dt * (k + 1) as f32;
@@ -1166,7 +1200,15 @@ mod tests {
             ];
             let _ = f.update_mag(meas);
         }
+        let (tr_att1, tr_magb1) = (tr_block(&f, I_ATT), tr_block(&f, I_MAGB));
         let eb = ((0..3).map(|i| (f.mag_b[i] - mag_b_true[i]).powi(2)).sum::<f32>()).sqrt();
+        // 判据：若 mag_B 真在被估计 ⇒ 其 P 的迹应显著下降 ✓；
+        //   若它几乎不动而【姿态块】在降 ⇒ 残差被姿态吸走 ✓（歧义证实 ✓）
+        assert!(
+            tr_magb1 < tr_magb0 * 0.5,
+            "mag_B 的 P 迹应显著下降（{tr_magb0:.4} → {tr_magb1:.4}）✗ \
+             ⇒ 残差可能被【姿态块】吸走（其迹 {tr_att0:.4} → {tr_att1:.4}）✓ 歧义证实 ✓"
+        );
         let ei = ((0..3).map(|i| (f.mag_i[i] - mag_i_true[i]).powi(2)).sum::<f32>()).sqrt();
         assert!(
             eb < 0.02,
