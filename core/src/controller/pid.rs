@@ -445,7 +445,26 @@ impl Controller for PidController {
         // 期望 roll 取 +tilt_e（实测 2026-08-21）：NED 中绕 +X(前向) 正转(右滚)把机体 -Z
         // 旋到 +Y(东) -> 东向推力，故东向加速度需 +roll；旧代码用 -tilt_e 恰好反向，
         // 导致东向速度指令产生西向推力、东向持续漂移发散（Hover 逐秒诊断 y: 0→-65m）。
-        let q_des = Quaternion::from_euler(Radian(tilt_e), Radian(-tilt_n), yaw);
+        // ⚠️ **坐标系修正（2026-09-21，阶段 5 的切向偏航实验暴露）**：
+        // `tilt_n`/`tilt_e` 由**世界系**水平加速度 `acc_n`/`acc_e` 经 `/g` 得到，
+        // 而 `from_euler(roll, pitch, yaw)` 里的 roll/pitch 是**机体系**欧拉角 ——
+        // 二者只有在 **`yaw = 0`**（机体系与世界系对齐）时才相同。
+        //
+        // 旧代码直接把 `tilt_e`/`-tilt_n` 当 roll/pitch ⇒ **偏航非零时期望倾角方向错**
+        // ⇒ 位置误差纠不回来 ⇒ 发散。实测（阶段 5 分解实验，圆轨迹 r=2m ω=1rad/s）：
+        //   yaw=0（偏航固定）：跟踪 err_max **1.305m** ✓
+        //   切向偏航（1 rad/s）：跟踪 err_max **22.221m** ✗（17× 劣化）
+        //
+        // 推导：期望推力水平分量在世界系为 `(tilt_n, tilt_e)`；转到机体系即左乘
+        // `Rz(-yaw)`（忽略一阶以下的高阶耦合）：
+        //   机体系前向 =  tilt_n·cosψ + tilt_e·sinψ
+        //   机体系右向 = -tilt_n·sinψ + tilt_e·cosψ
+        // 而本实现的欧拉映射是 `roll = 机体系右向`、`pitch = -机体系前向`
+        // （见下方 445~447 行的符号推导）。`yaw=0` 时退化为旧行为 ⇒ 既有判据不变 ✓。
+        let (sy, cy) = crate::math::sin_cos(yaw.0);
+        let tilt_fwd = tilt_n * cy + tilt_e * sy;
+        let tilt_right = -tilt_n * sy + tilt_e * cy;
+        let q_des = Quaternion::from_euler(Radian(tilt_right), Radian(-tilt_fwd), yaw);
 
         self.control_attitude(_dt, q_des, des_thrust, est)
     }
