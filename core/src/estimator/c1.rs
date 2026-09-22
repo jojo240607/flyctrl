@@ -474,9 +474,12 @@ impl C1Filter {
             q[I_POS + i][I_POS + i] = 1e-4 * dt;
             q[I_BG + i][I_BG + i] = 1e-6 * dt;
             q[I_BA + i][I_BA + i] = 1e-4 * dt;
-            // C2：磁两态（常值 ✓ ⇒ Q 极小，但仍非零以保持可观测方向不塌陷 ✓）
-            q[I_MAGI + i][I_MAGI + i] = 1e-8 * dt;
-            q[I_MAGB + i][I_MAGB + i] = 1e-8 * dt;
+            // ★C2 磁两态 Q（2026-09-21 实验）：原 1e-8 极小 ⇒ P 迅速塌陷 ⇒ 增益→0
+            //   ⇒ 估计"冻结"在部分收敛值 ✓（正好解释"残差已小、状态却错"✓）
+            //   ⇒ 提高到 1e-4 量级，让估计能持续修正 ✓（磁两态实为常值，但
+            //     在线估计需要足够过程噪声以维持可修正性 ✓ —— 参照亦如此 ✓）
+            q[I_MAGI + i][I_MAGI + i] = 1e-4 * dt;
+            q[I_MAGB + i][I_MAGB + i] = 1e-4 * dt;
         }
         self.p = predict_covariance(&self.p, &fm, &q);
         self.st.predict(ImuDelta { delta_ang, delta_vel }, g, dt);
@@ -1063,6 +1066,48 @@ mod tests {
     ///
     /// 判据（行为量 ✓）：① 全程无 NaN ✓ ② 速度收敛到 0 ✓ ③ 位置收敛到真值 ✓
     /// ④ 循环内插一个外点 ⇒ 必须被 NIS 门拒绝（且不影响收敛 ✓）
+    /// **C2 单步【状态】方向检查**（2026-09-21，下一步 ✓）
+    ///
+    /// 与上一条的区别 ✓：上一条看【预测是否贴近量测】（已通过 ✓）；
+    /// 本条看【状态是否朝真值移动】✓ —— 才能二分"单步 vs 多步" ✗
+    #[test]
+    fn c2_single_update_moves_states_toward_truth() {
+        use crate::vehicle::rotate_vec_by_quat_inverse;
+        let mag_i_true = [0.2f32, 0.0, 0.4];
+        let mag_b_true = [0.1f32, -0.05, 0.2];
+        let q = Quaternion::from_axis_angle([0.2, -0.3, 0.5], Radian(0.7)).normalize();
+        let mut f = C1Filter::new(q, [0.0; 3], [0.0; 3], 1e9);
+        f.mag_i = [0.15, 0.05, 0.35]; // 错的初值 ✓
+        f.mag_b = [0.0; 3]; // 未知硬铁 ✓
+        let err_b = |f: &C1Filter| -> f32 {
+            ((0..3).map(|i| (f.mag_b[i] - mag_b_true[i]).powi(2)).sum::<f32>()).sqrt()
+        };
+        let err_i = |f: &C1Filter| -> f32 {
+            ((0..3).map(|i| (f.mag_i[i] - mag_i_true[i]).powi(2)).sum::<f32>()).sqrt()
+        };
+        let rti = rotate_vec_by_quat_inverse(q, mag_i_true);
+        let meas = [
+            rti[0] + mag_b_true[0],
+            rti[1] + mag_b_true[1],
+            rti[2] + mag_b_true[2],
+        ];
+        let (b0, i0) = (err_b(&f), err_i(&f));
+        let _ = f.update_mag(meas);
+        let (b1, i1) = (err_b(&f), err_i(&f));
+        // 单步后：两态的误差**至少有一个应显著缩小** ✓（否则符号/映射错 ✗）
+        assert!(
+            b1 < b0 * 0.9 || i1 < i0 * 0.9,
+            "单步后两态误差均未缩小 ✗：mag_B {b0:.4}→{b1:.4}、mag_I {i0:.4}→{i1:.4} \
+             ⇒ 单步即错 ⇒ 定位到【增益/注入的符号或映射】✓"
+        );
+        // 且不应出现"越修越远"✗（放大 2 倍以上）
+        assert!(
+            b1 < b0 * 2.0 && i1 < i0 * 2.0,
+            "单步后误差放大 >2× ✗：mag_B {b0:.4}→{b1:.4}、mag_I {i0:.4}→{i1:.4} \
+             ⇒ 注入方向反了 ✓"
+        );
+    }
+
     /// **C2 单步方向检查**（与 C1 定位"取负是错的"那次同法 ✓✓）
     ///
     /// 判据（**与符号约定无关** ✓）：一次 `update_mag` 后，
