@@ -14,7 +14,7 @@ use crate::vehicle::{rotate_vec_by_quat, rotate_vec_by_quat_inverse, Quaternion}
 
 /// C1 的标称状态（15 维误差状态对应的名义量 ✓）
 #[derive(Debug, Clone, Copy)]
-pub struct C1State {
+pub struct EskfState {
     /// 姿态：机体系 → 导航系（NED ✓）
     pub q: Quaternion,
     /// 速度（NED，m/s）
@@ -27,7 +27,7 @@ pub struct C1State {
     pub ba: [f32; 3],
 }
 
-impl C1State {
+impl EskfState {
     /// 名义递推（§4 ✓ + §12.6 的乘法顺序修正 ✓）
     ///
     /// ```text
@@ -430,8 +430,8 @@ pub fn update_vec3(
 /// **C1 滤波器**（算法级集成 ✓）：预测 → 量测 → 注入 ✓
 ///
 /// 纪律（继续沿用 ✓）：每个方法都可被单元测试独立验证；不静默、不吞错 ✓
-pub struct C1Filter {
-    pub st: C1State,
+pub struct Eskf {
+    pub st: EskfState,
     /// C2：地球磁场（导航系常量 ✓）—— 初值由静止磁量测+姿态给出 ✓
     pub mag_i: [f32; 3],
     /// C2：机体磁偏置（机体系常量 ✓）—— 未知 ⇒ 由 0 起步并在线估计 ✓（A12 正解 ✓）
@@ -458,7 +458,7 @@ pub struct C1Filter {
     pub freeze_bias: bool,
 }
 
-impl C1Filter {
+impl Eskf {
     /// 初始化（姿态初值 / P0 / 零偏初值 ✓ —— §9 接入清单① ✓）
     pub fn new(q0: Quaternion, v0: [f32; 3], p0: [f32; 3], gate: f32) -> Self {
         let mut p = [[0.0f32; N]; N];
@@ -480,7 +480,7 @@ impl C1Filter {
             p[I_MAGB + i][I_MAGB + i] = 1e-2;
         }
         Self {
-            st: C1State { q: q0, v: v0, p: p0, bg: [0.0; 3], ba: [0.0; 3] },
+            st: EskfState { q: q0, v: v0, p: p0, bg: [0.0; 3], ba: [0.0; 3] },
             // C2：mag_I 取典型地磁量级（NED 下北向+垂向 ✓，具体值由静止对齐阶段给 ✓）
             mag_i: [0.2, 0.0, 0.4],
             mag_b: [0.0; 3], // 未知硬铁 ⇒ 0 起步 ✓
@@ -1000,7 +1000,7 @@ pub struct ErrorState {
 ///   · §12.4：本项目语义下"左乘 = 机体(local)扰动"（数值判定 ✓）
 ///   · 参照 `derivation.py` 153 行：`Rot3(Quaternion(xyz=theta/2, w=1)) * quat_nominal` ✓
 /// v/p/零偏为**加性** ✓
-pub fn inject_error(st: &mut C1State, e: &ErrorState) {
+pub fn inject_error(st: &mut EskfState, e: &ErrorState) {
     let dq = {
         let th = e.dtheta;
         let th2 = th[0] * th[0] + th[1] * th[1] + th[2] * th[2];
@@ -1022,7 +1022,7 @@ pub fn inject_error(st: &mut C1State, e: &ErrorState) {
 }
 
 /// **从物理状态差异提取误差状态**（与 `inject_error` 互为逆 ✓，用于自检 ✓）
-pub fn extract_error(q_old: Quaternion, st: &C1State) -> ErrorState {
+pub fn extract_error(q_old: Quaternion, st: &EskfState) -> ErrorState {
     // 姿态：δq = q_new * q_old⁻¹（本项目语义下的左乘误差 ✓，与参照 189 行同构 ✓）
     let inv = Quaternion { w: q_old.w, x: -q_old.x, y: -q_old.y, z: -q_old.z };
     let dq = (st.q * inv).normalize();
@@ -1053,7 +1053,7 @@ mod tests {
         let q = Quaternion::from_axis_angle([0.2, 0.3, 0.5], Radian(0.4)).normalize();
         // ① 静止/匀速：比力 = 支撑重力 ⇒ Δv ≈ 0 ✓
         let a_support = rotate_vec_by_quat_inverse(q, [-g[0], -g[1], -g[2]]);
-        let mut s = C1State { q, v: [0.0; 3], p: [0.0; 3], bg: [0.0; 3], ba: [0.0; 3] };
+        let mut s = EskfState { q, v: [0.0; 3], p: [0.0; 3], bg: [0.0; 3], ba: [0.0; 3] };
         s.predict(
             ImuDelta { delta_ang: [0.0; 3], delta_vel: [a_support[0] * dt, a_support[1] * dt, a_support[2] * dt] },
             g,
@@ -1062,7 +1062,7 @@ mod tests {
         let dv2 = s.v[0] * s.v[0] + s.v[1] * s.v[1] + s.v[2] * s.v[2];
         assert!(dv2 < 1e-10, "静止/匀速应无净加速度（实测 |Δv|² = {dv2:.2e}）✗");
         // ② 自由落体：a_m = 0 ⇒ Δv = g·dt ✓
-        let mut s2 = C1State { q, v: [0.0; 3], p: [0.0; 3], bg: [0.0; 3], ba: [0.0; 3] };
+        let mut s2 = EskfState { q, v: [0.0; 3], p: [0.0; 3], bg: [0.0; 3], ba: [0.0; 3] };
         s2.predict(ImuDelta { delta_ang: [0.0; 3], delta_vel: [0.0; 3] }, g, dt);
         let dev2 = (s2.v[0] - g[0] * dt).powi(2)
             + (s2.v[1] - g[1] * dt).powi(2)
@@ -1149,7 +1149,7 @@ mod tests {
         assert!(dmax == 0.0, "被拒绝时 P 必须【逐位不变】✗（实测 {dmax:.2e}）");
         // ⑥ 误差注入/提取的【往返自检】（姿态左乘约定 ✓，§12.4 + 参照 153/189 行双证 ✓）
         let q_old = Quaternion::from_axis_angle([0.2, 0.3, 0.5], Radian(0.4)).normalize();
-        let mut st2 = C1State { q: q_old, v: [0.0; 3], p: [0.0; 3], bg: [0.0; 3], ba: [0.0; 3] };
+        let mut st2 = EskfState { q: q_old, v: [0.0; 3], p: [0.0; 3], bg: [0.0; 3], ba: [0.0; 3] };
         let dth = [0.01f32, -0.02, 0.015];
         inject_error(&mut st2, &ErrorState { dtheta: dth, ..Default::default() });
         let back = extract_error(q_old, &st2).dtheta;
@@ -1159,7 +1159,7 @@ mod tests {
         }
         assert!(rdev < 1e-5, "误差注入/提取应互为逆（偏差 {rdev:.2e}）✗ —— 左乘约定错？");
         // 反证：若用【右乘】，往返应显著不符 ✓（确认该自检有鉴别力 ✓）
-        let mut st3 = C1State { q: q_old, v: [0.0; 3], p: [0.0; 3], bg: [0.0; 3], ba: [0.0; 3] };
+        let mut st3 = EskfState { q: q_old, v: [0.0; 3], p: [0.0; 3], bg: [0.0; 3], ba: [0.0; 3] };
         {
             // 手工右乘（错误做法 ✗）
             let n = crate::math::sqrt(dth[0] * dth[0] + dth[1] * dth[1] + dth[2] * dth[2]);
@@ -1213,7 +1213,7 @@ mod tests {
         let dt = 0.01f32;
         let q0 = Quaternion::from_axis_angle([0.0, 0.0, 1.0], Radian(0.0)).normalize();
         // 位置刻意偏 3 m（真值 0）；姿态/速度初值正确 ⇒ 只看位置修正方向 ✓
-        let mut f = C1Filter::new(q0, [0.0; 3], [3.0, 0.0, -5.0], 5.0);
+        let mut f = Eskf::new(q0, [0.0; 3], [3.0, 0.0, -5.0], 5.0);
         let a_support = [0.0f32, 0.0, -9.81];
         // 多步预测（保持静止 ✓）+ 每步一次 GPS 位置量测（真值 [0,0,-5] ✓）
         let mut p0_err = 3.0f32;
@@ -1286,7 +1286,7 @@ mod tests {
         let q = Quaternion::from_axis_angle([0.2, -0.3, 0.5], Radian(0.7)).normalize();
         let rti = rotate_vec_by_quat_inverse(q, mag_i_prior);
         let meas = [rti[0] + mag_b_true[0], rti[1] + mag_b_true[1], rti[2] + mag_b_true[2]];
-        let mut f = C1Filter::new(q, [0.0; 3], [0.0; 3], 3.0);
+        let mut f = Eskf::new(q, [0.0; 3], [0.0; 3], 3.0);
         assert!(!f.yaw_aligned, "闩锁初值应为 false ✓");
         f.reset_mag_states(meas, mag_i_prior);
         assert!(f.yaw_aligned, "重置后闩锁应为 true ✓");
@@ -1332,13 +1332,13 @@ mod tests {
         let mag_i_true = [0.2f32, 0.0, 0.4];
         let mag_b_true = [0.1f32, -0.05, 0.2];
         let q = Quaternion::from_axis_angle([0.2, -0.3, 0.5], Radian(0.7)).normalize();
-        let mut f = C1Filter::new(q, [0.0; 3], [0.0; 3], 1e9);
+        let mut f = Eskf::new(q, [0.0; 3], [0.0; 3], 1e9);
         f.mag_i = [0.15, 0.05, 0.35]; // 错的初值 ✓
         f.mag_b = [0.0; 3]; // 未知硬铁 ✓
-        let err_b = |f: &C1Filter| -> f32 {
+        let err_b = |f: &Eskf| -> f32 {
             ((0..3).map(|i| (f.mag_b[i] - mag_b_true[i]).powi(2)).sum::<f32>()).sqrt()
         };
-        let err_i = |f: &C1Filter| -> f32 {
+        let err_i = |f: &Eskf| -> f32 {
             ((0..3).map(|i| (f.mag_i[i] - mag_i_true[i]).powi(2)).sum::<f32>()).sqrt()
         };
         let rti = rotate_vec_by_quat_inverse(q, mag_i_true);
@@ -1375,7 +1375,7 @@ mod tests {
         let mag_b_true = [0.1f32, -0.05, 0.2];
         // 取一个【非平凡】姿态 ✓（避免退化）
         let q = Quaternion::from_axis_angle([0.2, -0.3, 0.5], Radian(0.7)).normalize();
-        let mut f = C1Filter::new(q, [0.0; 3], [0.0; 3], 1e9);
+        let mut f = Eskf::new(q, [0.0; 3], [0.0; 3], 1e9);
         f.mag_i = [0.15, 0.05, 0.35]; // 错的初值 ✓
         f.mag_b = [0.0; 3]; // 未知硬铁 ✓
         let rti = rotate_vec_by_quat_inverse(q, mag_i_true);
@@ -1384,7 +1384,7 @@ mod tests {
             rti[1] + mag_b_true[1],
             rti[2] + mag_b_true[2],
         ];
-        let dist = |f: &C1Filter| -> f32 {
+        let dist = |f: &Eskf| -> f32 {
             let p = predicted_mag_body(f.st.q, f.mag_i, f.mag_b);
             ((p[0] - meas[0]).powi(2) + (p[1] - meas[1]).powi(2) + (p[2] - meas[2]).powi(2)).sqrt()
         };
@@ -1597,7 +1597,7 @@ mod tests {
         let mag_b_true = [0.1f32, -0.05, 0.2];
         let q0 = Quaternion::from_axis_angle([0.0, 0.0, 1.0], Radian(0.0));
         // 门 = 3.0σ（参照 mag 门 ✓）；r_mag=1e-2、Q=1e-3·dt 已为干净基线值 ✓
-        let mut f = C1Filter::new(q0, [0.0; 3], [0.0; 3], 3.0);
+        let mut f = Eskf::new(q0, [0.0; 3], [0.0; 3], 3.0);
         // ★按参照做法初始化 mag_I（2026-09-21 ✓）：由【首个量测 + 姿态】给出 ✓
         //   推导：预测 = Rᵀ·mag_I + mag_B ⇒ 令其等于首个量测、mag_B₀ = 0
         //        ⇒ mag_I₀ = R·meas₀（body→world ✓，本项目 rotate_vec_by_quat 方向 ✓）
@@ -1621,7 +1621,7 @@ mod tests {
         //   改为用 `predict` 驱动（喂陀螺 ✓）⇒ 状态与协方差【天然一致】✓✓
         //   量测由【独立真值 q_true】合成 ✓（q_true 只用于生成量测，滤波器不知道它 ✓）
         // ★"谁在吸残差"的定量检查（2026-09-21 ✓）
-        let tr_block = |f: &C1Filter, base: usize| -> f32 {
+        let tr_block = |f: &Eskf, base: usize| -> f32 {
             (0..3).map(|i| f.p[base + i][base + i]).sum::<f32>()
         };
         // （2026-09-21 清理：早先"姿态 P0 ⇒ 1e-6"的实验【未回退】✗ ⇒ 已移除 ✓
@@ -1932,7 +1932,7 @@ mod tests {
         let dt = 0.01f32;
         let q0 = Quaternion::from_axis_angle([0.0, 0.0, 1.0], Radian(0.0)).normalize();
         let truth_p = [0.0f32, 0.0, -5.0];
-        let mut f = C1Filter::new(q0, [-1.0, 0.5, 0.2], [3.0, -2.0, -4.0], 1e6); // 门开大 ⇒ 全量测参与统计 ✓
+        let mut f = Eskf::new(q0, [-1.0, 0.5, 0.2], [3.0, -2.0, -4.0], 1e6); // 门开大 ⇒ 全量测参与统计 ✓
         let a_support = [0.0f32, 0.0, -9.81];
         let (mut n_v, mut s_v) = (0u32, 0.0f32);
         let (mut n_p, mut s_p) = (0u32, 0.0f32);
@@ -1987,7 +1987,7 @@ mod tests {
         let dt = 0.01f32;
         let q0 = Quaternion::from_axis_angle([0.0, 0.0, 1.0], Radian(0.0)).normalize();
         let truth_p = [0.0f32, 0.0, -5.0];
-        let mut f = C1Filter::new(q0, [-1.0, 0.5, 0.2], [3.0, -2.0, -4.0], 5.0);
+        let mut f = Eskf::new(q0, [-1.0, 0.5, 0.2], [3.0, -2.0, -4.0], 5.0);
         f.freeze_bias = true; // ★冻结零偏修正 ✓
         let a_support = [0.0f32, 0.0, -9.81];
         for k in 0..3000 {
@@ -2038,7 +2038,7 @@ mod tests {
         // 初始姿态刻意偏离（30°）；速度/位置初值也刻意偏（-1 m/s、+3 m）
         let q0 = Quaternion::from_axis_angle([0.0, 0.0, 1.0], Radian(0.0)).normalize();
         let truth_p = [0.0f32, 0.0, -5.0];
-        let mut f = C1Filter::new(q0, [-1.0, 0.5, 0.2], [3.0, -2.0, -4.0], 5.0);
+        let mut f = Eskf::new(q0, [-1.0, 0.5, 0.2], [3.0, -2.0, -4.0], 5.0);
         // 静止：比力 = 支撑重力 ✓（真值姿态为单位姿态 ⇒ a_m = −g 机体系 ✓）
         let a_support = [0.0f32, 0.0, -9.81];
         let mut max_nis = 0.0f32;

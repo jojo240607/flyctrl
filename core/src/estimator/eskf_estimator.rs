@@ -7,16 +7,16 @@
 //! - **绝不静默 no-op** ✗ —— 无等价实现的通路【显式拒绝】并计数 ✓
 //! - **每条通路都有计数** ✓（"先证明机制确实在运行" ✓）
 
-use crate::estimator::eskf::C1Filter;
+use crate::estimator::eskf::Eskf;
 use crate::estimator::trait_def::Estimator;
 use crate::units::Second;
 use crate::vehicle::{
     AirspeedSample, ImuSample, PosSample, Quaternion, RtkSample, VehicleState, VioSample,
 };
 
-/// C1 适配器：把 [`C1Filter`] 包成统一 [`Estimator`] ✓。
+/// C1 适配器：把 [`Eskf`] 包成统一 [`Estimator`] ✓。
 pub struct EskfEstimator {
-    f: C1Filter,
+    f: Eskf,
     /// 世界重力（NED，向下为正 ✓）
     g_ned: [f32; 3],
     /// 磁 `mag_I` 先验（世界系 ✓）—— `reset_mag_states` 的必需输入 ✓（§11.2 ✓）
@@ -56,7 +56,7 @@ impl EskfEstimator {
     /// 新建：`q0/v0/p0` 初值 + 观测门 `gate`（σ ✓）+ 磁 `mag_I` 先验 ✓。
     pub fn new(q0: Quaternion, v0: [f32; 3], p0: [f32; 3], gate: f32, mag_i_prior: [f32; 3]) -> Self {
         Self {
-            f: C1Filter::new(q0, v0, p0, gate),
+            f: Eskf::new(q0, v0, p0, gate),
             g_ned: [0.0, 0.0, 9.81],
             mag_i_prior,
             mag_first_done: false,
@@ -90,7 +90,7 @@ impl EskfEstimator {
     }
 
     /// 内部滤波器（诊断/测试用 ✓）
-    pub fn filter(&self) -> &C1Filter {
+    pub fn filter(&self) -> &Eskf {
         &self.f
     }
 }
@@ -172,7 +172,7 @@ impl Estimator for EskfEstimator {
     fn reset(&mut self) {
         let q = self.f.st.q;
         let (v, p) = (self.f.st.v, self.f.st.p);
-        self.f = C1Filter::new(q, v, p, 5.0);
+        self.f = Eskf::new(q, v, p, 5.0);
         self.mag_first_done = false;
     }
 
