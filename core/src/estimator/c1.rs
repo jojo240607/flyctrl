@@ -491,6 +491,22 @@ impl C1Filter {
             q[I_MAGB + i][I_MAGB + i] = 1e-3 * dt;
         }
         self.p = predict_covariance(&self.p, &fm, &q);
+        // ★★C2：磁两态的【条件过程噪声】（照参照 cov.cpp 180–200 ✓✓）
+        //   参照：`if (P(i,i) < sq(ekf2_mag_noise)) { P(i,i) += sq(dt·σ); }`
+        //   ⇒ 方差【下限维持在 R 量级】⇒ 增益不塌陷 ⇒ 估计可持续修正 ✓✓
+        //   参数（参照 common.h ✓）：σ_e = 1e-3、σ_b = 1e-4（Gauss/sec）
+        {
+            let si = 1e-3f32 * dt; let mq_i = si * si;
+            let sb = 1e-4f32 * dt; let mq_b = sb * sb;
+            for i in 0..3 {
+                if self.p[I_MAGI + i][I_MAGI + i] < self.r_mag {
+                    self.p[I_MAGI + i][I_MAGI + i] += mq_i;
+                }
+                if self.p[I_MAGB + i][I_MAGB + i] < self.r_mag {
+                    self.p[I_MAGB + i][I_MAGB + i] += mq_b;
+                }
+            }
+        }
         self.st.predict(ImuDelta { delta_ang, delta_vel }, g, dt);
     }
 
