@@ -93,6 +93,7 @@ pub fn transition_matrix(
     w: [f32; 3],
     dt: f32,
     r: &[[f32; 3]; 3],
+    f_body: [f32; 3],
 ) -> Result<[[f32; N]; N], &'static str> {
     let mut f = [[0.0f32; N]; N];
     for i in 0..N {
@@ -119,10 +120,23 @@ pub fn transition_matrix(
     for i in 0..3 {
         f[I_POS + i][I_VEL + i] += dt;
     }
-    let _ = q;
-    // ★未验证块：速度×姿态（∂δv/∂δθ）
-    //   返回 Err ✗（不 panic、不静默 ✓）—— 待 derivation.py 定形后补齐 ✓
-    Err("C1: δv/δθ 块尚未定形（待 derivation.py ✓）；拒绝返回错误的 F ✗")
+    // 速度×姿态：∂δv/∂δθ = 【+[a_world ×]·dt】（§12.8 ✓ 参照 derivation.py 169–182 行定形 ✓）
+    //   ★叉乘必须在【世界系】做（用 a_world = R·f ✓）——
+    //   写成 R·[f×] 是【结构性错误】✗（少一个 Rᵀ 的相似变换，怎么调符号都不对 ✓）
+    let a_world = rotate_vec_by_quat(q, f_body);
+    let (ax, ay, az) = (a_world[0], a_world[1], a_world[2]);
+    for j in 0..3 {
+        // [a×] 的第 j 列 = a × e_j
+        let col = match j {
+            0 => [0.0, az, -ay],
+            1 => [-az, 0.0, ax],
+            _ => [ay, -ax, 0.0],
+        };
+        for i in 0..3 {
+            f[I_VEL + i][I_ATT + j] += col[i] * dt;
+        }
+    }
+    Ok(f)
 }
 
 // 编译期守卫：本骨架【不得】被产品路径引用（直到 F 全块验证通过 ✓）
@@ -153,11 +167,23 @@ mod tests {
             + (s2.v[1] - g[1] * dt).powi(2)
             + (s2.v[2] - g[2] * dt).powi(2);
         assert!(dev2 < 1e-12, "自由落体应以 g 加速（偏差² = {dev2:.2e}）✗");
-        // ③ 未验证块必须返回 Err（防静默 ✓，且不 panic ✓）
+        // ③ δv/δθ 块：应为 +[a_world×]·dt（世界系叉乘 ✓），且整体返回 Ok ✓
         let r = [[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-        assert!(
-            transition_matrix(q, [0.1, 0.0, 0.0], dt, &r).is_err(),
-            "未定形的 δv/δθ 块必须返回 Err ✗（不得静默返回错误 F）"
-        );
+        let f_body = [0.3f32, -0.2, -9.7];
+        let fm = transition_matrix(q, [0.0, 0.0, 0.0], dt, &r, f_body).expect("F 应可构造 ✓");
+        let aw = rotate_vec_by_quat(q, f_body);
+        // 逐元素核对 [a_world×]·dt 的第 j 列 = dt·(a_world × e_j)
+        let cross = |a: [f32; 3], e: [f32; 3]| -> [f32; 3] {
+            [a[1] * e[2] - a[2] * e[1], a[2] * e[0] - a[0] * e[2], a[0] * e[1] - a[1] * e[0]]
+        };
+        let basis = [[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let mut maxdev = 0.0f32;
+        for j in 0..3 {
+            let want = cross(aw, basis[j]);
+            for i in 0..3 {
+                maxdev = maxdev.max((fm[I_VEL + i][I_ATT + j] - want[i] * dt).abs());
+            }
+        }
+        assert!(maxdev < 1e-6, "δv/δθ 块应为 +[a_world×]·dt（偏差 {maxdev:.2e}）✗");
     }
 }
