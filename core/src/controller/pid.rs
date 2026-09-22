@@ -132,6 +132,19 @@ pub struct PidController {
     dbg_omega: [f32; 3],
     // 阶段 11-A 诊断：控制律内部步计数（仅用于一次性 stderr 诊断，固定步后停止）
     dbg_step: u32,
+    /// 上一拍的偏航设定点（rad）：用于微分出**偏航速率**，作为速率环的**参考前馈**。
+    ///
+    /// 动机（2026-09-21 实测）：纯 P-D 速率环（`rates = Kp·err − Kd·ω`）**无前馈** ⇒
+    /// 期望姿态随时间旋转时（尤其**偏航以 1 rad/s 持续旋转**）姿态环只能"追"误差 ✗
+    /// ⇒ 持续大幅电机差动 ⇒ **单电机贴边 99.5% 的时间**（实测）⇒ 推力/倾角权限被夺
+    /// ⇒ 切向偏航下高度掉 **10.002m**、水平掉 10~13m ✗。
+    ///
+    /// 修法按成熟飞控（PX4 文档原文）："the model's **reference body rate is fed forward**
+    /// to the rate setpoint, **removing the pure-P law's steady-state tracking lag**".
+    prev_yaw: Option<f32>,
+    /// 本拍设定偏航（rad）。由 `control()` 在调用 `control_attitude` 前写入 ——
+    /// 因为 `control_attitude` 只收到 `q_des`，拿不到 `Setpoint`。
+    sp_yaw: f32,
     // 阶段 11-A 诊断：最近一次控制律内部量（供 host 侧打印，绕开 no_std 无 eprintln）
     dbg_raw_d: f32,
     dbg_raw_vd: f32,
@@ -232,6 +245,8 @@ impl PidController {
             dbg_pqr: [0.0; 3],
             dbg_omega: [0.0; 3],
             dbg_step: 0,
+            prev_yaw: None,
+            sp_yaw: 0.0,
             dbg_raw_d: 0.0,
             dbg_raw_vd: 0.0,
             dbg_filt_d: 0.0,
@@ -547,6 +562,7 @@ impl Controller for PidController {
         let _ = q_des_legacy;
         let q_des = q_des_thrust; // 符号修正后启用
 
+        self.sp_yaw = sp.yaw.0; // 供内环做偏航速率前馈（见 prev_yaw 的说明）
         self.control_attitude(_dt, q_des, des_thrust, est)
     }
 
@@ -615,13 +631,45 @@ impl PidController {
         } else {
             [est.omega[0].0, est.omega[1].0, est.omega[2].0]
         };
-        let att_out = super::attitude::attitude_rates(
+        let mut att_out = super::attitude::attitude_rates(
             est.att,
             q_des,
             self.att_kp,
             self.att_kd,
             omega_f,
         );
+        // ---- **参考机体角速度前馈**（PX4 `MC_REF_FF` 同构）----------------------
+        //
+        // 期望姿态随时间旋转时（偏航速率 `ψ̇`），机体**本就该**以 `R^T·(0,0,ψ̇)` 的角速度
+        // 旋转 ⇒ 这部分应由**前馈**给出，而不是留给 P 项"追" ✗。
+        // 不加前馈时（实测）：切向偏航（1 rad/s）下姿态环持续要求大幅差动 ⇒ 单电机贴边
+        // **99.5%** 的时间 ⇒ 高度掉 10.002m、水平掉 10~13m ✗。
+        let yaw_sp = self.sp_yaw;
+        let yaw_rate = match self.prev_yaw {
+            Some(py) if dt > 1e-6 => {
+                let mut d = yaw_sp - py;
+                // 归一到 [-π, π]，避免跨 ±π 的假大速率
+                while d > core::f32::consts::PI { d -= 2.0 * core::f32::consts::PI; }
+                while d < -core::f32::consts::PI { d += 2.0 * core::f32::consts::PI; }
+                d / dt
+            }
+            _ => 0.0,
+        };
+        self.prev_yaw = Some(yaw_sp);
+        // ⚠️ **默认关闭（2026-09-21）**：本次实现使结果**更差** ✗
+        //   切向偏航稳态 17.850m -> **23.449m**、饱和 99.5% -> **100.0%** ✗
+        // ⇒ **符号/轴又错了**（本区域第 4 个约定问题 ✗）。
+        // 按纪律：不留更差的实现，故做成开关并默认关。
+        // **下一步**：为"参考角速度前馈"写**零件级自检**（与姿态构造那次同法 ✓——
+        // 那次迭代 3 轮才成功 ✓）：给定已知偏航速率，断言前馈向量在**机体轴**上的
+        // 方向与量级（本仓机体系非标准 FRD，不能照搬教科书的 R^T·(0,0,ψ̇)）。
+        const ENABLE_YAW_RATE_FF: bool = false;
+        if ENABLE_YAW_RATE_FF && yaw_rate.abs() > 1e-6 {
+            let w_ff = crate::vehicle::rotate_vec_by_quat_inverse(est.att, [0.0, 0.0, yaw_rate]);
+            att_out.rates[0] += w_ff[0];
+            att_out.rates[1] += w_ff[1];
+            att_out.rates[2] += w_ff[2];
+        }
         self.dbg_err = att_out.err;
         self.dbg_pqr = att_out.rates;
         self.dbg_omega = [est.omega[0].0, est.omega[1].0, est.omega[2].0];
