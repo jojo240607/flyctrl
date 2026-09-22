@@ -139,6 +139,39 @@ pub fn transition_matrix(
     Ok(f)
 }
 
+/// 协方差矩阵（15×15 ✓）
+pub type Cov = [[f32; N]; N];
+
+/// 协方差预测：`P' = F·P·Fᵀ + Q` ✓
+///
+/// **可以实现的理由**：F 已 5/5 块数值/参照双证通过 ✓（§12.5–§12.8）。
+/// 实现纪律：先用**不变量**自检（对称性 / F=I 时退化为 P+Q ✓），再谈精度 ✓。
+pub fn predict_covariance(p: &Cov, f: &[[f32; N]; N], q: &Cov) -> Cov {
+    // FP = F·P
+    let mut fp = [[0.0f32; N]; N];
+    for (i, fp_i) in fp.iter_mut().enumerate() {
+        for (j, v) in fp_i.iter_mut().enumerate() {
+            let mut s = 0.0f32;
+            for k in 0..N {
+                s += f[i][k] * p[k][j];
+            }
+            *v = s;
+        }
+    }
+    // P' = FP·Fᵀ + Q
+    let mut out = [[0.0f32; N]; N];
+    for (i, out_i) in out.iter_mut().enumerate() {
+        for (j, v) in out_i.iter_mut().enumerate() {
+            let mut s = 0.0f32;
+            for k in 0..N {
+                s += fp[i][k] * f[j][k];
+            }
+            *v = s + q[i][j];
+        }
+    }
+    out
+}
+
 // 编译期守卫：本骨架【不得】被产品路径引用（直到 F 全块验证通过 ✓）
 #[cfg(test)]
 mod tests {
@@ -185,5 +218,38 @@ mod tests {
             }
         }
         assert!(maxdev < 1e-6, "δv/δθ 块应为 +[a_world×]·dt（偏差 {maxdev:.2e}）✗");
+        // ④ 协方差预测的不变量自检（先守不变量，再谈精度 ✓）
+        let mut p0 = [[0.0f32; N]; N];
+        for (i, row) in p0.iter_mut().enumerate() {
+            row[i] = 1.0 + i as f32 * 0.1; // 对角正 ✓
+        }
+        // 4a) F = I ⇒ P' = P + Q ✓
+        let mut eye = [[0.0f32; N]; N];
+        for (i, row) in eye.iter_mut().enumerate() {
+            row[i] = 1.0;
+        }
+        let mut q0 = [[0.0f32; N]; N];
+        for (i, row) in q0.iter_mut().enumerate() {
+            row[i] = 0.25;
+        }
+        let out = predict_covariance(&p0, &eye, &q0);
+        let mut dev = 0.0f32;
+        for i in 0..N {
+            for j in 0..N {
+                let want = p0[i][j] + q0[i][j];
+                dev = dev.max((out[i][j] - want).abs());
+            }
+        }
+        assert!(dev < 1e-6, "F=I 时 P' 应为 P+Q（偏差 {dev:.2e}）✗");
+        // 4b) F 非平凡时保持【对称性】✓（P、Q 对称 ⇒ P' 对称 ✓）
+        let f2 = transition_matrix(q, [0.1, -0.05, 0.2], dt, &r, f_body).unwrap();
+        let out2 = predict_covariance(&p0, &f2, &q0);
+        let mut sym = 0.0f32;
+        for i in 0..N {
+            for j in 0..N {
+                sym = sym.max((out2[i][j] - out2[j][i]).abs());
+            }
+        }
+        assert!(sym < 1e-5, "P' 应保持对称（最大不对称 {sym:.2e}）✗");
     }
 }
