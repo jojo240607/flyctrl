@@ -62,6 +62,13 @@ const GYRO_BIAS_DEV_MAX: f32 = 0.5;
 #[used]
 pub static mut G_ATT_ACC_GATE: f32 = -1.0;
 
+/// **锚定可观测埋点**（自检用，读后由测试复位）：`[a_h_max, w_acc_min, k_sum, k_n]`。
+///
+/// 动机（2026-09-21）：§9.7/§9.8 出现"危害=重力锚定 ✓ 而加速度门无效 ✗"的矛盾，
+/// 不能靠推理定夺 ⇒ 必须直接量【门是否闭合、合成增益实际多少】✓（本会话已 13 次
+/// 因未自检仪器而误判 ✗）。`k` = 实际生效的合成锚定增益（各门权重之积 × α）✓。
+pub static mut G_ATT_DBG: [f32; 4] = [0.0, f32::INFINITY, 0.0, 0.0];
+
 /// 水平非重力加速度门控的编译期默认满闭阈值（m/s²）。
 /// 注意：**默认 0 = 关闭**（保持历史"三门槛"行为）。实测瞬时门控过于抖动，
 /// 见 `G_ATT_ACC_AC`（交流能量门控，本项的正解）。
@@ -713,6 +720,21 @@ impl Estimator for EkfEstimator {
                 };
                 let w_acc = w_inst * w_ac;
                 let k = att_alpha_eff * 0.5 * w * w_align * w_gyro * w_acc;
+                unsafe {
+                    // 自检埋点：峰值 a_h / 最小 w_acc / k 的累计（供测试读取 ✓）
+                    let d = core::ptr::addr_of_mut!(G_ATT_DBG);
+                    let cur = core::ptr::read_volatile(d);
+                    let wmin = if cur[1] < w_acc { cur[1] } else { w_acc };
+                    core::ptr::write_volatile(
+                        d,
+                        [
+                            if a_h > cur[0] { a_h } else { cur[0] },
+                            wmin,
+                            cur[2] + k,
+                            cur[3] + 1.0,
+                        ],
+                    );
+                }
                 // 把估计重力向量 down_body 锚定到【真实重力方向】，即比力的反方向 (-a)。
                 // 修正轴 = down_body × (-a/an)：n 为垂直于二者的旋转轴，
                 // 右乘（机体系）dq 使 down_body 旋转向 -a，姿态向水平收敛。
