@@ -61,6 +61,9 @@ const GYRO_BIAS_DEV_MAX: f32 = 0.5;
 /// `a_h < 阈值/3` 全开，`> 阈值` 全闭，中间线性。
 #[used]
 pub static mut G_ATT_ACC_GATE: f32 = -1.0;
+/// ★**锚定幅值门的触发计数**（"先证明机制确实在运行" ✓，A11 用 ✓）。
+/// 含义：被乘性权重 `w` **完全关闭**（`w==0`，即 |f|/g 落在 [0.5,2.5] 之外 ✗）的拍数。
+pub static mut G_ATT_GATE_CLOSED: u32 = 0;
 
 /// **锚定可观测埋点**（自检用，读后由测试复位）：`[a_h_max, w_acc_min, k_sum, k_n]`。
 ///
@@ -736,6 +739,10 @@ impl Estimator for EkfEstimator {
                     (2.5 - ratio) / 1.5
                 };
                 let w = w.clamp(0.0, 1.0);
+                // ★计数：门被完全关闭的拍（A11 断言用 ✓）
+                if w <= 0.0 {
+                    unsafe { G_ATT_GATE_CLOSED = G_ATT_GATE_CLOSED.wrapping_add(1) };
+                }
                 let down_body = crate::vehicle::rotate_vec_by_quat_inverse(self.att, [0.0, 0.0, g]);
                 // 方向一致性门控：比力反方向（-a，估计的重力参考）与当前估计重力方向
                 // down_body 的夹角。静止/匀速悬停时比力≈纯重力（夹角≈0，仅陀螺漂移
