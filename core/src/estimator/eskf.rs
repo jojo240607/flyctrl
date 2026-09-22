@@ -65,6 +65,12 @@ impl EskfState {
 }
 
 /// IMU 增量（与 PX4 的 delta_ang / delta_vel 同构 ✓）
+/// ★**实验旋钮**（对照臂用 ✓，默认 1.0 = 开）：重力辅助开关。
+/// 置 0 ⇒ `update_gravity` 立即返回**带理由的** `Err` ✗（绝不静默跳过 ✗）。
+pub static mut G_ESKF_GRAV_ON: f32 = 1.0;
+/// ★**实验旋钮**：磁量测开关（含 `reset_mag_states` ✓）。默认 1.0 = 开。
+pub static mut G_ESKF_MAG_ON: f32 = 1.0;
+
 #[derive(Debug, Clone, Copy)]
 pub struct ImuDelta {
     pub delta_ang: [f32; 3],
@@ -682,6 +688,9 @@ impl Eskf {
     /// · ★**加速度门控**：`|a_world − (−g_ned)|` 超过阈值 ⇒ 拒绝 ✓（照 line 61 的语义 ✓）
     /// · 逐分量顺序融合 ✓（与磁同法 ✓）· 新息门控用 `self.gate` ✓
     pub fn update_gravity(&mut self, accel_body: [f32; 3], g_ned: [f32; 3]) -> Result<u32, &'static str> {
+        if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_GRAV_ON)) } < 0.5 {
+            return Err("重力辅助：对照臂【旋钮关闭】✓（实验用，非静默 ✗）");
+        }
         let an = crate::math::sqrt(
             accel_body[0] * accel_body[0] + accel_body[1] * accel_body[1] + accel_body[2] * accel_body[2],
         );
@@ -762,6 +771,9 @@ impl Eskf {
     ///  · 重置协方差到 R 量级 + **去相关** ✓（`resetMagEarthCov`/`resetMagBiasCov` ✓）
     ///  · **闩锁 `yaw_aligned = true`** ✓（此后才允许反解 ✓ —— 参照 424 行的门控 ✓）
     pub fn reset_mag_states(&mut self, meas: [f32; 3], mag_i_prior: [f32; 3]) {
+        if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_ON)) } < 0.5 {
+            return;
+        }
         self.mag_i = mag_i_prior;
         let rt = rotate_vec_by_quat_inverse(self.st.q, mag_i_prior);
         self.mag_b = [meas[0] - rt[0], meas[1] - rt[1], meas[2] - rt[2]];
@@ -791,6 +803,9 @@ impl Eskf {
     /// **后两项使用已被前项更新过的 `x` 与 `P`** ✓✓
     /// （而原 3×3 联合更新三项共用同一组 `(x,P)` ✗ —— 在 H 依赖状态时不等价 ✓）
     pub fn update_mag(&mut self, meas_body: [f32; 3]) -> Result<f32, &'static str> {
+        if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_ON)) } < 0.5 {
+            return Err("磁量测：对照臂【旋钮关闭】✓（实验用，非静默 ✗）");
+        }
         let mut worst = 0.0f32;
         for i in 0..3 {
             // ★每分量重新算预测与 H（用【已更新】的状态 ✓ —— 顺序融合的关键 ✓）
