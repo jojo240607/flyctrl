@@ -467,7 +467,13 @@ impl Controller for PidController {
         //       推力沿机体 **-Z** ⇒ 机体 -Z 在世界系 = f_w/|f_w|
         //       ⇒ 机体 +Z（NED 下朝下）世界系 = -f_w/|f_w| = zb
         //       把水平姿的 +Z（即 NED 的 (0,0,1)）旋到 zb，再施加偏航即可。
-        let f_w = [acc_n, acc_e, acc_d + g];
+        // ⚠️ **符号（第三次失败的根因）**：`f_w` 是"所需**比力**"（世界系 NED）。
+        // 悬停时推力须**向上** = NED 的 (0,0,-1) ⇒ 比力也向上 ⇒ z 分量应为 **-g** ✗
+        // （曾误用 `+g`：那给出朝下的比力 ⇒ z_b 反了 ⇒ 命令的姿态上下颠倒 ⇒ 跟踪 10.2m ✗）
+        // 对照本仓既有约定：`az_w = a_world[2] + g` 是"加速度"；比力 = 加速度 − g_vec，
+        // 而 g_vec = (0,0,+g)（NED 向下为正）⇒ 比力 z = (acc_d + g) − g = acc_d …
+        // 更直接地：悬停 acc_d=0 时必须得 (0,0,-g) ⇒ 取 `acc_d - g`。
+        let f_w = [acc_n, acc_e, acc_d - g];
         let q_des_thrust = crate::vehicle::thrust_to_attitude(f_w, sp.yaw);
         // 旧路径（保留为对照：`G_MAG3D_ALPHA` 式旋钮可切换 —— 此处直接返回推力矢量版）
         #[allow(unreachable_code)]
@@ -526,8 +532,8 @@ impl Controller for PidController {
         //   即**本仓机体系不是标准 FRD**，故"标准"三轴构造不匹配 ✗。
         // ⇒ 回退。下一步须**先从 mixer/plant 反解出本仓的真实机体轴约定**，
         //   再据此改写构造（而不是照搬教科书 FRD）。
-        let _ = q_des_thrust;
-        let q_des = q_des_legacy;
+        let _ = q_des_legacy;
+        let q_des = q_des_thrust; // 符号修正后启用
 
         self.control_attitude(_dt, q_des, des_thrust, est)
     }
