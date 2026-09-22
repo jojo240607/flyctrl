@@ -70,6 +70,11 @@ impl EskfState {
 pub static mut G_ESKF_GRAV_ON: f32 = 1.0;
 /// ★**实验旋钮**：磁量测开关（含 `reset_mag_states` ✓）。默认 1.0 = 开。
 pub static mut G_ESKF_MAG_ON: f32 = 1.0;
+/// ★**整定旋钮**：姿态过程噪声倍率（`q[I_ATT] *= G_ESKF_Q_ATT` ✓）。默认 1.0。
+/// 用途：检验"滤波器是否过度信任陀螺"——若高角速率场景误差随倍率下降 ⇒ 是 ✓。
+pub static mut G_ESKF_Q_ATT: f32 = 1.0;
+/// ★**整定旋钮**：姿态过程噪声基准（默认 1e-4 ✓）。仅诊断用，勿随意改默认 ✗。
+pub static mut G_ESKF_Q_ATT_BASE: f32 = 1e-4;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ImuDelta {
@@ -529,7 +534,10 @@ impl Eskf {
         // ★Q 标定（2026-09-21 第一轮）：由 NIS 一致性反推（非试错 ✓）
         //   实测过度自信 v=204× / b=61× / p=4× ⇒ 需把 Q 放大 ~100~200 倍 ✓
         for i in 0..3 {
-            q[I_ATT + i][I_ATT + i] = 1e-4 * dt;
+            // ★整定旋钮（默认 1.0 × 1e-4 ⇒ 与参照 ekf2_gyr_noise 同量级 ✓）
+            let qa = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_Q_ATT)) }
+                * unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_Q_ATT_BASE)) };
+            q[I_ATT + i][I_ATT + i] = qa * dt;
             q[I_VEL + i][I_VEL + i] = 2.0 * dt;
             q[I_POS + i][I_POS + i] = 1e-4 * dt;
             q[I_BG + i][I_BG + i] = 1e-6 * dt;
