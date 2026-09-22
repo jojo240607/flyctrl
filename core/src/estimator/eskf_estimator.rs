@@ -1,4 +1,6 @@
-//! **C1（误差状态 EKF）的 `Estimator` 适配器** ✓ —— 让 C1 可作产品路径的默认估计器。
+//! **ESKF（误差状态 EKF，`eskf.rs`）的 `Estimator` 适配器** ✓ —— 让它可作产品路径的默认估计器。
+//!
+//! 命名说明 ✓：本文件与 `eskf.rs` 同族（C1+C2 = ESKF 的两项扩展 ✓），故统一用 `eskf` 前缀 ✓。
 //!
 //! 设计纪律（见 `docs/c1-migration-plan.md` ✓）：
 //! - **不改 `eskf.rs` 的算法** ✗ —— 本文件只做接口搬运 ✓
@@ -13,7 +15,7 @@ use crate::vehicle::{
 };
 
 /// C1 适配器：把 [`C1Filter`] 包成统一 [`Estimator`] ✓。
-pub struct C1Estimator {
+pub struct EskfEstimator {
     f: C1Filter,
     /// 世界重力（NED，向下为正 ✓）
     g_ned: [f32; 3],
@@ -37,16 +39,20 @@ pub struct C1Estimator {
     pub n_mag: u32,
     /// 磁被门拒绝次数 ✓
     pub n_mag_rejected: u32,
-    /// GPS 位置/速度更新成功次数 ✓
+    /// GPS 位置/速度更新**成功**次数 ✓
     pub n_gps_pos: u32,
     pub n_gps_vel: u32,
+    /// ★气压/GPS 更新**被门拒绝**次数 ✓（与"成功"分开计 ✗ 绝不混同 ✓）
+    pub n_baro_rejected: u32,
+    pub n_gps_pos_rejected: u32,
+    pub n_gps_vel_rejected: u32,
     /// ★**无等价实现的通路**被显式拒绝的次数（不得静默 ✗）
     pub n_vio_refused: u32,
     pub n_rtk_refused: u32,
     pub n_airspeed_refused: u32,
 }
 
-impl C1Estimator {
+impl EskfEstimator {
     /// 新建：`q0/v0/p0` 初值 + 观测门 `gate`（σ ✓）+ 磁 `mag_I` 先验 ✓。
     pub fn new(q0: Quaternion, v0: [f32; 3], p0: [f32; 3], gate: f32, mag_i_prior: [f32; 3]) -> Self {
         Self {
@@ -63,6 +69,9 @@ impl C1Estimator {
             n_mag_rejected: 0,
             n_gps_pos: 0,
             n_gps_vel: 0,
+            n_baro_rejected: 0,
+            n_gps_pos_rejected: 0,
+            n_gps_vel_rejected: 0,
             n_vio_refused: 0,
             n_rtk_refused: 0,
             n_airspeed_refused: 0,
@@ -75,7 +84,7 @@ impl C1Estimator {
     }
 }
 
-impl Estimator for C1Estimator {
+impl Estimator for EskfEstimator {
     fn step(
         &mut self,
         dt: Second,
@@ -107,11 +116,15 @@ impl Estimator for C1Estimator {
             let pm = [p.pos[0].0, p.pos[1].0, p.pos[2].0];
             if self.f.update_gps_pos(pm).is_ok() {
                 self.n_gps_pos = self.n_gps_pos.wrapping_add(1);
+            } else {
+                self.n_gps_pos_rejected = self.n_gps_pos_rejected.wrapping_add(1);
             }
             if let Some(v) = p.vel {
                 let vm = [v[0].0, v[1].0, v[2].0];
                 if self.f.update_gps_vel(vm).is_ok() {
                     self.n_gps_vel = self.n_gps_vel.wrapping_add(1);
+                } else {
+                    self.n_gps_vel_rejected = self.n_gps_vel_rejected.wrapping_add(1);
                 }
             }
         }
@@ -127,6 +140,8 @@ impl Estimator for C1Estimator {
     fn update_alt(&mut self, alt: f32) {
         if self.f.update_baro(alt).is_ok() {
             self.n_baro = self.n_baro.wrapping_add(1);
+        } else {
+            self.n_baro_rejected = self.n_baro_rejected.wrapping_add(1);
         }
     }
 
