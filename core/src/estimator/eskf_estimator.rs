@@ -78,6 +78,17 @@ impl EskfEstimator {
         }
     }
 
+    /// 四旋翼默认配置（产品路径用 ✓）：水平静止起步 + 磁 `mag_I` 先验（本场地典型值 ✓）。
+    pub fn default_quad() -> Self {
+        Self::new(
+            Quaternion::from_axis_angle([0.0, 0.0, 1.0], crate::units::Radian(0.0)),
+            [0.0; 3],
+            [0.0; 3],
+            5.0,
+            [0.2, 0.0, 0.4],
+        )
+    }
+
     /// 内部滤波器（诊断/测试用 ✓）
     pub fn filter(&self) -> &C1Filter {
         &self.f
