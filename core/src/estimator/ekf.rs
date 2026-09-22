@@ -30,6 +30,11 @@ const N: usize = 10; // pos(3) + vel(3) + gyro_bias(3) + accel_bias_z(1)
 /// 需先 A/B 量化收益与代价（会不会把姿态估计带坏），再定值——不拍脑袋。
 #[used]
 pub static mut G_GYRO_BIAS_K: f32 = 0.0;
+/// **运行时注入的硬铁标定值**（测试用旋钮；产品路径用 `set_mag_hard_iron`）。
+/// 语义与 `mag_hard_iron` 一致（都是"从测量里扣除"），因此可用于对照
+/// "已标定 vs 未标定"两档（见 `fly-sim-core/tests/att_est.rs` 的标定维度）。
+/// 默认 `[0;3]` = 不额外补偿 ✓。
+pub static mut G_MAG_CALIB: [f32; 3] = [0.0; 3];
 
 /// 陀螺零偏估计限幅（rad/s）。消费级 IMU 零偏远小于此；仅防异常值。
 const GYRO_BIAS_MAX: f32 = 0.05;
@@ -1588,9 +1593,9 @@ impl EkfEstimator {
         const W_GYRO: f32 = 1.0;
         // 扣除**离线标定**的硬铁偏置（默认零 = 不补偿）。
         let m = [
-            m[0] - self.mag_hard_iron[0],
-            m[1] - self.mag_hard_iron[1],
-            m[2] - self.mag_hard_iron[2],
+            m[0] - self.mag_hard_iron[0] - unsafe { G_MAG_CALIB[0] },
+            m[1] - self.mag_hard_iron[1] - unsafe { G_MAG_CALIB[1] },
+            m[2] - self.mag_hard_iron[2] - unsafe { G_MAG_CALIB[2] },
         ];
         let m_world = rotate_vec_by_quat(self.att, m);
         let mh = sqrt(m_world[0] * m_world[0] + m_world[1] * m_world[1]);
