@@ -1129,6 +1129,29 @@ mod tests {
     ///
     /// 判据（行为量 ✓）：① 全程无 NaN ✓ ② 速度收敛到 0 ✓ ③ 位置收敛到真值 ✓
     /// ④ 循环内插一个外点 ⇒ 必须被 NIS 门拒绝（且不影响收敛 ✓）
+    /// **V1：`mag_B` 的【代数反解】自检**（2026-09-21 ✓，对齐清单 §12 第 1 项 ✓）
+    ///
+    /// 参照做法（`mag_control.cpp` 412 行 ✓）：给定**独立的 `mag_I` 先验**（WMM 角色 ✓）
+    /// 与姿态 ⇒ `mag_B = mag − Rᵀ·mag_I` **一次解出** ✓（不靠渐近分离 ✓）
+    #[test]
+    fn c2_v1_algebraic_mag_bias_inversion() {
+        use crate::vehicle::rotate_vec_by_quat_inverse;
+        let mag_i_prior = [0.2f32, 0.0, 0.4]; // ★独立先验（真实系统=WMM ✓）
+        let mag_b_true = [0.1f32, -0.05, 0.2];
+        let q = Quaternion::from_axis_angle([0.2, -0.3, 0.5], Radian(0.7)).normalize();
+        // 量测（机体系 ✓）= Rᵀ·mag_I + mag_B ✓
+        let rti = rotate_vec_by_quat_inverse(q, mag_i_prior);
+        let meas = [rti[0] + mag_b_true[0], rti[1] + mag_b_true[1], rti[2] + mag_b_true[2]];
+        // ★代数反解：mag_B = meas − Rᵀ·mag_I ✓
+        let mag_b_solved = [meas[0] - rti[0], meas[1] - rti[1], meas[2] - rti[2]];
+        let dev = ((0..3).map(|i| (mag_b_solved[i] - mag_b_true[i]).powi(2)).sum::<f32>()).sqrt();
+        assert!(
+            dev < 1e-6,
+            "代数反解应【精确】得到 mag_B（偏差 {dev:.2e}）✗ \
+             ⇒ 这正是参照的做法（`mag_B = mag − Rᵀ·mag_I` ✓），不靠渐近分离 ✓"
+        );
+    }
+
     /// **C2 单步【状态】方向检查**（2026-09-21，下一步 ✓）
     ///
     /// 与上一条的区别 ✓：上一条看【预测是否贴近量测】（已通过 ✓）；
