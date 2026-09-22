@@ -49,6 +49,14 @@ pub static mut G_KI_XY: f32 = -1.0;
 #[used]
 pub static mut G_TILT_MAX: f32 = -1.0;
 
+/// [标定] `vmax_xy`（水平期望速度上限，m/s）运行时覆盖。哨兵同规：**<0 = 用编译期值**。
+///
+/// 用途：验证"持续跟踪误差 = 纠偏权限不足"猜想 —— 依据 PX4 文档对"pure-P law's
+/// steady-state tracking lag"的说明与其 `MC_REF_*` 参考模型解法。仓内可算机理：
+/// `e = (vmax_xy − v_ff)/kp_xy`（饱和平衡点）。
+#[used]
+pub static mut G_VMAX_XY: f32 = -1.0;
+
 /// [标定] 水平积分**上限**（m/s）运行时覆盖。哨兵同为 **<0 = 用编译期默认 2.0**。
 /// 为何必须可调：该夹子直接决定残余稳态偏移 —— 当所需稳态速度指令超过它时，
 /// 偏移被夹死为 `(des_v_need - 上限)/kp_xy`，此时**再加 `ki_xy` 也无用**。
@@ -304,6 +312,11 @@ impl Controller for PidController {
             (est.pos[0].0, est.pos[1].0, est.vel[0].0, est.vel[1].0)
         };
 
+        // ⚠️ 旋钮读取必须在**使用之前**（初版插在使用之后 ⇒ 旋钮无效、扫描逐位相同 ✗）
+        let vmax_xy_eff = {
+            let ov = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_VMAX_XY)) };
+            if ov > 0.0 { ov } else { self.vmax_xy }
+        };
         // --- 外环：位置误差 -> 期望速度（限幅，避免饱和） ---
         // 加入设定点速度前馈：轨迹跟踪时直接把 sp.vel 叠加到期望速度，
         // 减少相位滞后（square/circle 场景 RMS 显著下降）。
@@ -349,29 +362,29 @@ impl Controller for PidController {
         let mut iy_final = clampf(self.i_xy[1] + self.ki_xy * ey * dt, -i_xy_max, i_xy_max);
         if !self.rate_mode_xy {
             let dx = pre_ix + ix_final;
-            if dx > self.vmax_xy {
-                ix_final = clampf(self.vmax_xy - pre_ix, -i_xy_max, i_xy_max);
-            } else if dx < -self.vmax_xy {
-                ix_final = clampf(-self.vmax_xy - pre_ix, -i_xy_max, i_xy_max);
+            if dx > vmax_xy_eff {
+                ix_final = clampf(vmax_xy_eff - pre_ix, -i_xy_max, i_xy_max);
+            } else if dx < -vmax_xy_eff {
+                ix_final = clampf(-vmax_xy_eff - pre_ix, -i_xy_max, i_xy_max);
             }
             let dy = pre_iy + iy_final;
-            if dy > self.vmax_xy {
-                iy_final = clampf(self.vmax_xy - pre_iy, -i_xy_max, i_xy_max);
-            } else if dy < -self.vmax_xy {
-                iy_final = clampf(-self.vmax_xy - pre_iy, -i_xy_max, i_xy_max);
+            if dy > vmax_xy_eff {
+                iy_final = clampf(vmax_xy_eff - pre_iy, -i_xy_max, i_xy_max);
+            } else if dy < -vmax_xy_eff {
+                iy_final = clampf(-vmax_xy_eff - pre_iy, -i_xy_max, i_xy_max);
             }
         }
         self.i_xy = [ix_final, iy_final];
         // 速率模式：位置外环旁路，期望速度 = sp.vel（摇杆直通）；否则 P + I + 速度前馈
         let des_vx = if self.rate_mode_xy {
-            clampf(sp.vel[0].0, -self.vmax_xy, self.vmax_xy)
+            clampf(sp.vel[0].0, -vmax_xy_eff, vmax_xy_eff)
         } else {
-            clampf(pre_ix + ix_final, -self.vmax_xy, self.vmax_xy)
+            clampf(pre_ix + ix_final, -vmax_xy_eff, vmax_xy_eff)
         };
         let des_vy = if self.rate_mode_xy {
-            clampf(sp.vel[1].0, -self.vmax_xy, self.vmax_xy)
+            clampf(sp.vel[1].0, -vmax_xy_eff, vmax_xy_eff)
         } else {
-            clampf(pre_iy + iy_final, -self.vmax_xy, self.vmax_xy)
+            clampf(pre_iy + iy_final, -vmax_xy_eff, vmax_xy_eff)
         };
         let des_vz = clampf(pre_iz + self.iz, -self.vmax_z, self.vmax_z);
 
