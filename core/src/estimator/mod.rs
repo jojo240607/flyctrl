@@ -7,6 +7,7 @@ pub mod trait_def;
 pub mod complementary;
 pub mod ekf;
 pub mod learning;
+pub mod c1; // C1 骨架（未接入产品路径 ✓；见 docs/c1-design.md）
 
 pub use trait_def::Estimator;
 pub use complementary::ComplementaryEstimator;
