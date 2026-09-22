@@ -83,6 +83,10 @@ pub static mut G_I_XY_MAX: f32 = -1.0;
 #[used]
 pub static mut G_KI_V_XY: f32 = -1.0;
 
+/// **速度环 P 增益（水平）**运行时旋钮 —— 位置阶跃的**阻尼**主要来自它（默认 0.8）。
+/// 语义同其他 `G_*`：`<0` = 用编译期值 ✓。用于阶段 7 的阻尼整定（免去反复重编译 ✓）。
+pub static mut G_KV_XY: f32 = -1.0;
+
 /// [标定] 水平一阶低通时间常数（s）运行时覆盖。哨兵同规：**<0 = 用编译期值**。
 /// 0 是有效取值（= 关闭低通，即既有行为），故哨兵取 <0。
 #[used]
@@ -463,8 +467,13 @@ impl Controller for PidController {
         self.i_v_xy[0] = clampf(self.i_v_xy[0] + ki_v_eff * ev_n * dt, -I_V_MAX, I_V_MAX);
         self.i_v_xy[1] = clampf(self.i_v_xy[1] + ki_v_eff * ev_e * dt, -I_V_MAX, I_V_MAX);
 
-        let acc_n = self.kv_xy * (des_vx - est_vn) + sp.acc[0].0 + self.i_v_xy[0]; // 北向
-        let acc_e = self.kv_xy * (des_vy - est_ve) + sp.acc[1].0 + self.i_v_xy[1]; // 东向
+        // 运行时旋钮（阶段 7 阻尼整定）：<0 => 用编译期值 ✓
+        let kv = unsafe {
+            let g = core::ptr::read_volatile(core::ptr::addr_of!(G_KV_XY));
+            if g >= 0.0 { g } else { self.kv_xy }
+        };
+        let acc_n = kv * (des_vx - est_vn) + sp.acc[0].0 + self.i_v_xy[0]; // 北向
+        let acc_e = kv * (des_vy - est_ve) + sp.acc[1].0 + self.i_v_xy[1]; // 东向
         let acc_d = self.kv_z * (des_vz - est_vd) + sp.acc[2].0; // 下垂方向（NED），用滤波后垂直速度
 
         // 阶段 11-A 诊断：把控制律内部量存进调试字段，供 host 侧打印（绕开 no_std 无 eprintln）。
