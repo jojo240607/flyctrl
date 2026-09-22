@@ -408,6 +408,9 @@ pub struct C1Filter {
     pub r_baro: f32,
     /// C2：磁量测噪声方差（高斯² ✓；由残差反推 ✓）
     pub r_mag: f32,
+    /// ★`yaw_align` 闩锁（参照 `_control_status.flags.yaw_align` ✓）：
+    /// 初值 false ✓；磁首次可信时置 true，且那一刻执行"由磁重置航向 + 代数反解 mag_B" ✓
+    pub yaw_aligned: bool,
     /// ⚠️ 航向处理开关（**默认关** ✓ —— 参照在"磁健康"时【不清零航向】✗，
     /// 本项是我为验证"姿态吸走残差"而设的【实验性代理】✗ ⇒ 不污染默认行为 ✓）
     pub heading_guard: bool,
@@ -457,6 +460,7 @@ impl C1Filter {
             //   1e-8 过小 ⇒ 增益过大 ⇒ (I − K·h) 变负 ⇒ P 失正定 ⇒ 爆炸到 1e12 ✗✓
             //   ⇒ 取 1e-2（σ ≈ 0.1 高斯 ✓，为地磁量级的一小部分 ✓ 合理）
             r_mag: 1e-2,
+            yaw_aligned: false,
             heading_guard: false,
             mag_applied: 0,
             mag_skipped: 0,
@@ -634,6 +638,36 @@ impl C1Filter {
         let nis = update_scalar(&mut self.p, &h, resid, self.r_baro, self.gate)?;
         self.apply(&e);
         Ok(nis)
+    }
+
+    /// **★照参照实现 `resetMagStates`**（`mag_control.cpp` 401–455 ✓，对齐清单第 1/2/4/5 项 ✓）
+    ///
+    /// 语义（参照 ✓）：
+    ///  · `mag_I = 独立先验`（WMM 的角色 ✓ —— 真实系统用地磁模型，本项目用已知场 ✓）
+    ///  · **`mag_B = meas − Rᵀ·mag_I`（代数反解 ✓✓ —— 一次解出，不靠渐近分离 ✓）**
+    ///  · 重置协方差到 R 量级 + **去相关** ✓（`resetMagEarthCov`/`resetMagBiasCov` ✓）
+    ///  · **闩锁 `yaw_aligned = true`** ✓（此后才允许反解 ✓ —— 参照 424 行的门控 ✓）
+    pub fn reset_mag_states(&mut self, meas: [f32; 3], mag_i_prior: [f32; 3]) {
+        self.mag_i = mag_i_prior;
+        let rt = rotate_vec_by_quat_inverse(self.st.q, mag_i_prior);
+        self.mag_b = [meas[0] - rt[0], meas[1] - rt[1], meas[2] - rt[2]];
+        // 重置协方差：方差 = R 量级 ✓ + 清掉与其余状态的相关 ✓（照参照 ✓）
+        for i in 0..3 {
+            let (ai, bi) = (I_MAGI + i, I_MAGB + i);
+            for j in 0..N {
+                if j != ai {
+                    self.p[ai][j] = 0.0;
+                    self.p[j][ai] = 0.0;
+                }
+                if j != bi {
+                    self.p[bi][j] = 0.0;
+                    self.p[j][bi] = 0.0;
+                }
+            }
+            self.p[ai][ai] = self.r_mag;
+            self.p[bi][bi] = self.r_mag;
+        }
+        self.yaw_aligned = true; // ★闩锁 ✓
     }
 
     /// **C2：机体三轴磁量测更新 —— 逐分量【顺序标量融合】** ✓✓
@@ -1129,6 +1163,28 @@ mod tests {
     ///
     /// 判据（行为量 ✓）：① 全程无 NaN ✓ ② 速度收敛到 0 ✓ ③ 位置收敛到真值 ✓
     /// ④ 循环内插一个外点 ⇒ 必须被 NIS 门拒绝（且不影响收敛 ✓）
+    /// **V4：`reset_mag_states` 后 `mag_B` 应【一次到位】**（对齐清单 §12 ✓）
+    #[test]
+    fn c2_v4_reset_mag_states_solves_bias_once() {
+        use crate::vehicle::rotate_vec_by_quat_inverse;
+        let mag_i_prior = [0.2f32, 0.0, 0.4];
+        let mag_b_true = [0.1f32, -0.05, 0.2];
+        let q = Quaternion::from_axis_angle([0.2, -0.3, 0.5], Radian(0.7)).normalize();
+        let rti = rotate_vec_by_quat_inverse(q, mag_i_prior);
+        let meas = [rti[0] + mag_b_true[0], rti[1] + mag_b_true[1], rti[2] + mag_b_true[2]];
+        let mut f = C1Filter::new(q, [0.0; 3], [0.0; 3], 3.0);
+        assert!(!f.yaw_aligned, "闩锁初值应为 false ✓");
+        f.reset_mag_states(meas, mag_i_prior);
+        assert!(f.yaw_aligned, "重置后闩锁应为 true ✓");
+        let eb = ((0..3).map(|i| (f.mag_b[i] - mag_b_true[i]).powi(2)).sum::<f32>()).sqrt();
+        let ei = ((0..3).map(|i| (f.mag_i[i] - mag_i_prior[i]).powi(2)).sum::<f32>()).sqrt();
+        assert!(
+            eb < 1e-6 && ei < 1e-6,
+            "reset 后 mag_B 应【一次到位】（|Δmag_B|={eb:.2e}、|Δmag_I|={ei:.2e}）✗ \
+             ⇒ 参考 V1 的代数反解（应精确 ✓）"
+        );
+    }
+
     /// **V1：`mag_B` 的【代数反解】自检**（2026-09-21 ✓，对齐清单 §12 第 1 项 ✓）
     ///
     /// 参照做法（`mag_control.cpp` 412 行 ✓）：给定**独立的 `mag_I` 先验**（WMM 角色 ✓）
