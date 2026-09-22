@@ -233,6 +233,42 @@ pub fn update_scalar(
     Ok(nis_sigma)
 }
 
+/// **重力方向观测**（机体系 ✓）：`u = Rᵀ·ĝ`，`ĝ = −g_ned/|g|`（世界"天" ✓）
+///
+/// 用途（§13.4 ✓）：**零加速度段的倾斜不可观测**（物理必然 ✓）⇒ 由比力直接补 ✓
+/// 启用条件（照参照 `gravity_fusion.cpp` line 61 ✓）：`|a_world|` 小时才可信 ✓
+pub fn predicted_gravity_body(q: Quaternion, g_ned: [f32; 3]) -> [f32; 3] {
+    let gn = crate::math::sqrt(g_ned[0] * g_ned[0] + g_ned[1] * g_ned[1] + g_ned[2] * g_ned[2]);
+    if gn < 1e-6 {
+        return [0.0, 0.0, -1.0];
+    }
+    // ĝ = −g/|g|（世界"天" ✓）⇒ 机体系 = Rᵀ·ĝ ✓
+    rotate_vec_by_quat_inverse(q, [-g_ned[0] / gn, -g_ned[1] / gn, -g_ned[2] / gn])
+}
+
+/// **重力方向观测的 H（3×21 ✓）** —— 仅 δθ 块非零 ✓
+///
+/// 推导（与已数值验证的磁 H 同构 ✓）：`u = Rᵀ·ĝ`、`R_new = R_δq·R`（本项目 local ✓）⇒
+///   `u_new ≈ u + Rᵀ(ĝ × δθ)` ⇒ `∂u/∂δθ = **+Rᵀ·[ĝ×]**` ✓
+pub fn gravity_h(q: Quaternion, g_ned: [f32; 3]) -> [[f32; N]; 3] {
+    let mut h = [[0.0f32; N]; 3];
+    let gn = crate::math::sqrt(g_ned[0] * g_ned[0] + g_ned[1] * g_ned[1] + g_ned[2] * g_ned[2]).max(1e-6);
+    let gh = [-g_ned[0] / gn, -g_ned[1] / gn, -g_ned[2] / gn]; // 世界"天" ĝ ✓
+    let basis = [[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+    for (j, e) in basis.iter().enumerate() {
+        let c0 = [
+            gh[1] * e[2] - gh[2] * e[1],
+            gh[2] * e[0] - gh[0] * e[2],
+            gh[0] * e[1] - gh[1] * e[0],
+        ];
+        let c = rotate_vec_by_quat_inverse(q, c0);
+        for i in 0..3 {
+            h[i][I_ATT + j] = c[i];
+        }
+    }
+    h
+}
+
 /// **C2 量测预测**：机体三轴磁 `h(x) = R(q)·mag_I + mag_B` ✓（参照 EKF2 ✓）
 pub fn predicted_mag_body(q: Quaternion, mag_i: [f32; 3], mag_b: [f32; 3]) -> [f32; 3] {
     // ★方向修正（2026-09-21，由"收敛到错值"定位 ✓）
@@ -1698,6 +1734,30 @@ mod tests {
              ⇒ 磁两态不可分/收敛失败（检查 H 的 δθ 与 mag_I 块 ✓）"
         );
         assert!(ei < 0.05, "转动下 mag_I 也应收敛（|Δmag_I|={ei:.4}）✗");
+    }
+
+    /// **重力方向观测的 H 数值对照**（§13.4 ✓ —— 与磁 H 同构，须独立验证 ✓）
+    #[test]
+    fn c2_gravity_h_numeric_check() {
+        let g_ned = [0.0f32, 0.0, 9.81];
+        let q = Quaternion::from_axis_angle([0.3, -0.4, 0.6], Radian(0.8)).normalize();
+        let eng = gravity_h(q, g_ned);
+        let eps = 1e-3f32;
+        let base = predicted_gravity_body(q, g_ned);
+        let mut maxdev = 0.0f32;
+        for j in 0..3 {
+            let mut d = [0.0f32; 3];
+            d[j] = eps;
+            let dq = Quaternion::from_axis_angle([d[0] / eps, d[1] / eps, d[2] / eps], Radian(eps));
+            let out = predicted_gravity_body((dq * q).normalize(), g_ned);
+            for i in 0..3 {
+                maxdev = maxdev.max((((out[i] - base[i]) / eps) - eng[i][I_ATT + j]).abs());
+            }
+        }
+        assert!(
+            maxdev < 1e-3,
+            "重力 H 与数值不符（偏差 {maxdev:.2e}）✗ ⇒ 检查是否用 +Rᵀ[ĝ×]（与磁 H 同构 ✓）"
+        );
     }
 
     /// **C2 的 H 数值对照**（三块逐一 ✓ —— 尤其 δθ 的世界系叉乘 ✗）
