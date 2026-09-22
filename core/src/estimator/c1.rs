@@ -1476,8 +1476,7 @@ mod tests {
     /// 依据 §5 的可观测性分析 ✓：静止时 `R·mag_I + mag_B` 不可分（6 未知/3 方程 ✗）；
     /// **转动时 R 变化** ⇒ 两者可分离 ⇒ yaw 与硬铁同时可观 ✓✓
     /// 做法：每步把 `st.q` 强制为**【真值姿态】**（隔离变量 ✓），仅让磁两态被估计 ✓。
-    #[ignore = "第一版因【强制姿态】导致状态/协方差不一致 ⇒ 已改为 predict 驱动 ✓；重跑待验 ✓"]
-    #[test]
+        #[test]
     fn c2_mag_bias_converges_under_rotation() {
         use crate::vehicle::rotate_vec_by_quat_inverse;
         let mag_i_true = [0.2f32, 0.0, 0.4];
@@ -1545,6 +1544,12 @@ mod tests {
                 rti[1] + mag_b_true[1],
                 rti[2] + mag_b_true[2],
             ];
+            // ★触发条件（照参照 `_mag_counter == 0` ✓）：首个磁样本 ⇒ 对齐/重置 ✓
+            //   （参照另有"磁融合停止 ⇒ 重置 + 解除闩锁"，本测例不涉及 ✓）
+            //   mag_I 先验由【外部】给出（真实系统 = WMM ✓；测试用已知场 ✓）
+            if !f.yaw_aligned {
+                f.reset_mag_states(meas, mag_i_true);
+            }
             // ★★★补回被遗漏的更新调用（2026-09-21 查出 ✓）：
             //   改写三轴转动测例时，替换范围把这一行删掉了 ✗ ⇒ 更新从未被调用
             //   ⇒ 状态初末不变、所有参数"无影响"（这才是真因 ✓✓）
