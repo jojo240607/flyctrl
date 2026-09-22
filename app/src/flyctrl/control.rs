@@ -117,10 +117,14 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
     #[cfg(not(feature = "hil"))]
     let mut wake_tick = last_ticks;
     loop {
-        // 实测控制周期（RTOS tick = 1ms）：控制/EKF 的工作量常超 4ms 预算，实际拍率会掉
-        // （实测注入恒定陀螺 1.0rad/s、SysTick 走 1000ms，EKF 姿态只积到 0.407rad →
-        // 实际周期 ~9.8ms）。EKF/控制若用常量 dt=4ms，会按标称拍数积分而系统性少积。
-        // 这里用「本轮与上轮的 tick 差」作真实 dt，拍率变化时估计/积分仍正确。
+        // 实测控制周期（RTOS tick = 1ms）：取「本轮与上轮的 tick 差」作真实 dt，
+        // 拍率变化时估计/积分仍正确 ✓。
+        //
+        // ★**2026-09-21 更新**：旧注释称"实际周期 ~9.8ms"✗ —— 那是【模拟器优化前】的
+        //   状态（属过时信息 ✗）。**当前实测**（`mcu_simulater` 的
+        //   `zz_ctlprof::ctl_period_and_tick_cost` ✓）：控制拍 **249.7Hz**
+        //   （周期均值 **4.0000ms**、抖动 std 0.84ms ✓）⇒ 固件已能跑满 4ms 预算 ✓。
+        //   本"按差值取 dt"的写法仍保留 ✓（对拍率波动/过载是必要防御 ✓）。
         unsafe { crate::flyctrl::CTRL_TICKS = crate::flyctrl::CTRL_TICKS.wrapping_add(1); }
         let now_ticks = tick_count();
         let dt_ms = now_ticks.wrapping_sub(last_ticks).clamp(1, 50) as f32;
