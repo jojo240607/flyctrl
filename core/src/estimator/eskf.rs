@@ -75,6 +75,9 @@ pub static mut G_ESKF_MAG_ON: f32 = 1.0;
 pub static mut G_ESKF_Q_ATT: f32 = 1.0;
 /// ★**整定旋钮**：姿态过程噪声基准（默认 1e-4 ✓）。仅诊断用，勿随意改默认 ✗。
 pub static mut G_ESKF_Q_ATT_BASE: f32 = 1e-4;
+/// ★**方差地板倍率**（照参照 `cov.cpp` 的条件式过程噪声 ✓）。默认 1.0 = 开 ✓；0 = 关（对照臂 ✓）。
+/// 作用：防协方差塌陷 ⇒ 从而防 `mag_I`/`mag_B` 沿【病态方向】无限漂移 ✓✓（§3.5 的根因 ✓）。
+pub static mut G_ESKF_VAR_FLOOR: f32 = 1.0;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ImuDelta {
@@ -553,6 +556,27 @@ impl Eskf {
             q[I_MAGB + i][I_MAGB + i] = 1e-3 * dt;
         }
         self.p = predict_covariance(&self.p, &fm, &q);
+        // ★**过程噪声方差地板**（照参照 `cov.cpp` 的条件式 ✓；§3.5 的根因修复 ✓✓）
+        //   参照参数：ekf2_mag_e_noise 1e-3 · ekf2_mag_b_noise 1e-4 · ekf2_gyr_noise 1.5e-2 ✓
+        //   语义：某状态方差低于【噪声量级】⇒ 补足过程噪声 ⇒ 协方差不会塌陷 ⇒
+        //         (mag_I, mag_B) 不会沿病态方向无限漂移 ✓
+        {
+            let k = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_VAR_FLOOR)) };
+            let f_mi = 1e-3f32 * k; // sq(ekf2_mag_e_noise) 量级 ✓
+            let f_mb = 1e-4f32 * k; // sq(ekf2_mag_b_noise) 量级 ✓
+            let f_at = 1.5e-2f32 * k; // sq(ekf2_gyr_noise) 量级 ✓
+            for i in 0..3 {
+                if self.p[I_MAGI + i][I_MAGI + i] < f_mi {
+                    self.p[I_MAGI + i][I_MAGI + i] += f_mi * dt;
+                }
+                if self.p[I_MAGB + i][I_MAGB + i] < f_mb {
+                    self.p[I_MAGB + i][I_MAGB + i] += f_mb * dt;
+                }
+                if self.p[I_ATT + i][I_ATT + i] < f_at {
+                    self.p[I_ATT + i][I_ATT + i] += f_at * dt;
+                }
+            }
+        }
         // ★★C2：磁两态的【条件过程噪声】（照参照 cov.cpp 180–200 ✓✓）
         //   参照：`if (P(i,i) < sq(ekf2_mag_noise)) { P(i,i) += sq(dt·σ); }`
         //   ⇒ 方差【下限维持在 R 量级】⇒ 增益不塌陷 ⇒ 估计可持续修正 ✓✓
