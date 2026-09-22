@@ -429,12 +429,24 @@ impl Controller for PidController {
 
         // 关键：机体倾斜后推力竖直分量 = T·cos(φ)，必须按 1/cos(φ) 放大总推力，
         // 否则一倾斜就掉高 -> 高度环进一步减推力 -> 死亡螺旋翻滚。
-        let tilt_mag = crate::math::sqrt(tilt_n * tilt_n + tilt_e * tilt_e);
-        let cos_tilt = if tilt_mag < 1.55 {
-            crate::math::cos(tilt_mag).max(0.2)
+        // ⚠️ **修正（2026-09-21，按轴拆解暴露）**：`cos_tilt` 原先由 **clamp 后的
+        // `tilt_n/tilt_e`** 反算 ⇒ 与**实际构造出的姿态**（现由 `f_w` 得出）**不一致** ✗。
+        // 实测后果：切向偏航下**高度偏差达 10.003m** ✗（标量范数下完全看不出）。
+        //
+        // 正解：与姿态构造**共用同一个 `f_w`** —— 推力竖直分量占比 = |f_w_z|/|f_w| ✓
+        // （悬停时 f_w=(0,0,-g) ⇒ 比值 1 ✓；倾斜时自然给出 cos θ ✓）。
+        let f_w_mag = crate::math::sqrt(
+            acc_n * acc_n + acc_e * acc_e + (acc_d - g) * (acc_d - g),
+        );
+        let cos_tilt = if f_w_mag > 1e-3 {
+            ((acc_d - g).abs() / f_w_mag).clamp(0.2, 1.0)
         } else {
-            0.2
+            1.0
         };
+        let tilt_mag = crate::math::atan2(
+            crate::math::sqrt(acc_n * acc_n + acc_e * acc_e),
+            (acc_d - g).abs(),
+        );
         let dbg_pre = (self.hover_thrust - acc_d / g) / cos_tilt;
         unsafe { DBG_PRE = dbg_pre; }
         let des_thrust = clampf(dbg_pre, 0.1, 1.0);
