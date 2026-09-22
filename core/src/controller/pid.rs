@@ -467,37 +467,8 @@ impl Controller for PidController {
         //       推力沿机体 **-Z** ⇒ 机体 -Z 在世界系 = f_w/|f_w|
         //       ⇒ 机体 +Z（NED 下朝下）世界系 = -f_w/|f_w| = zb
         //       把水平姿的 +Z（即 NED 的 (0,0,1)）旋到 zb，再施加偏航即可。
-        let fw = [acc_n, acc_e, acc_d + g];
-        let fnorm = crate::math::sqrt(fw[0] * fw[0] + fw[1] * fw[1] + fw[2] * fw[2]);
-        let q_des_thrust = {
-            if fnorm > 1e-6 {
-                let zb = [-fw[0] / fnorm, -fw[1] / fnorm, -fw[2] / fnorm];
-                // 轴 = (0,0,1) × zb = (-zb_y, zb_x, 0)
-                let ax = -zb[1];
-                let ay = zb[0];
-                let s = crate::math::sqrt(ax * ax + ay * ay);
-                let c = zb[2].clamp(-1.0, 1.0);
-                let q_align = if s < 1e-9 {
-                    // 已对齐或完全反向
-                    if c > 0.0 {
-                        Quaternion { w: 1.0, x: 0.0, y: 0.0, z: 0.0 }
-                    } else {
-                        // 完全倒扣：绕 +X 转 180°
-                        Quaternion { w: 0.0, x: 1.0, y: 0.0, z: 0.0 }
-                    }
-                } else {
-                    Quaternion::from_axis_angle([ax / s, ay / s, 0.0], Radian(crate::math::atan2(s, c)))
-                };
-                // ⚠️ **乘法序（自检单测实测）**：本仓约定下 `A*B` 意为"**先 A 后 B**"
-                // （与标准四元数相反）—— 自检显示 `q_yaw*q_align` 会把 (0,0,1) 映到
-                // [0.360,-0.032,0.932] ≠ zb=[0.301,-0.201,0.932] ✗（偏航被对准覆盖）。
-                // ⇒ 正确序是"**先按偏航摆正航向，再对准推力方向**"：`q_align * q_yaw`。
-                let q_yaw = Quaternion::from_axis_angle([0.0, 0.0, 1.0], sp.yaw);
-                q_align * q_yaw
-            } else {
-                Quaternion::from_euler(Radian(0.0), Radian(0.0), sp.yaw)
-            }
-        };
+        let f_w = [acc_n, acc_e, acc_d + g];
+        let q_des_thrust = crate::vehicle::thrust_to_attitude(f_w, sp.yaw);
         // 旧路径（保留为对照：`G_MAG3D_ALPHA` 式旋钮可切换 —— 此处直接返回推力矢量版）
         #[allow(unreachable_code)]
         let q_des_legacy = {
@@ -545,6 +516,16 @@ impl Controller for PidController {
         // atan2 求得，在 ±180 附近会跳变，两曲线符号相反即算出 ~360° ✗（非真实误差）。
         // ⇒ **再回退**；待 ①推力矢量实现逐项与自检对齐 ②姿态指标改为**四元数夹角**
         // （无缠绕，如 2·acos|⟨q1,q2⟩|）之后，再启用。
+        // ⚠️ **2026-09-21 第三次回退**：约定自检**已全绿** ✓（`thrust_to_attitude` 的三条
+        // 契约：①机体 (0,0,1)→-f_w/|f_w| ②机体 -Z→f_w ③偏航被保留），姿态估计误差也从
+        // 355° 降到 **3.03°**（甚至优于旧路径的 4.29° ✓）。
+        // **但跟踪仍 10.195m vs 旧路径 1.305m（8× 劣化）** ✗
+        // ⇒ 还有一层**本仓特有的轴约定**未对齐 —— 代码注释自述：
+        //   "飞控机体(**经 X-180 实为前-左-下**)：推力沿机体 -Z_body …
+        //    绕 +Y 正转(+pitch) 把推力旋到 -X(南)… 东向则需 +roll"
+        //   即**本仓机体系不是标准 FRD**，故"标准"三轴构造不匹配 ✗。
+        // ⇒ 回退。下一步须**先从 mixer/plant 反解出本仓的真实机体轴约定**，
+        //   再据此改写构造（而不是照搬教科书 FRD）。
         let _ = q_des_thrust;
         let q_des = q_des_legacy;
 

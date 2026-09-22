@@ -15,6 +15,103 @@ pub struct Quaternion {
     pub z: f32,
 }
 
+/// **由「期望比力方向 + 偏航」构造期望姿态**（推力矢量法，PX4/ArduPilot 做法）。
+///
+/// # 语义
+/// 推力沿机体 **-Z**（FRD）⇒ 若期望比力（世界系 NED，含重力抵消）为 `f_w`，则
+/// **机体 -Z 在世界系应指向 `f_w` 方向** ⇒ 机体 +Z 世界系 = `-f_w/|f_w|`。
+/// 本函数把"水平姿的机体 +Z（= NED 的 (0,0,1)）"旋到该方向，再按 `yaw` 摆正航向。
+///
+/// # 为何返回的是「机体→世界」四元数
+/// 与本仓 `att` 的语义一致（由代码行为推定：`rotate_vec_by_quat(att, 机体) = 世界`
+/// 用于磁观测、`rotate_vec_by_quat_inverse(att, 世界) = 机体` 用于重力）。
+/// **注意 `vperiph` 的文档写"世界系→机体"，与代码行为矛盾** —— 以代码为准。
+///
+/// # ⚠️ 乘法序（实测教训）
+/// 本仓 `A * B` 意为「**先 A 后 B**」（与标准四元数复合相反）⇒ 必须写成
+/// `q_align * q_yaw`（**先按偏航摆正航向，再对准推力方向**）。
+/// 写成 `q_yaw * q_align` 会让对准覆盖偏航（实测姿态假误差 355°）。
+///
+/// # 自检
+/// 契约：`rotate_vec_by_quat(结果, [0,0,1]) ≈ -f_w/|f_w|`。
+/// 见 `fly-sim-core/tests/guidance_track.rs::quaternion_convention_selfcheck`（直接调用本函数）。
+pub fn thrust_to_attitude(f_w: [f32; 3], yaw: Radian) -> Quaternion {
+    let fnorm = crate::math::sqrt(f_w[0] * f_w[0] + f_w[1] * f_w[1] + f_w[2] * f_w[2]);
+    if fnorm < 1e-6 {
+        // 比力退化（失重）：无方向可言 ⇒ 只保留偏航
+        return Quaternion::from_axis_angle([0.0, 0.0, 1.0], yaw);
+    }
+    // **标准「推力 + 航向」构造**（PX4 做法）：由期望机体三轴直接构造旋转矩阵。
+    //
+    // ⚠️ **为何不是"先把 (0,0,1) 旋到 zb，再施加偏航"**（我上一版的做法 ✗）：
+    // 实测**偏航不能被正确保留**（自检 ③c：期望 0.700 rad、实测 1.263 rad ✗）——
+    // 因为绕世界 Z 施加偏航会与已倾斜的姿态耦合，机头水平投影并不等于期望 yaw。
+    // 本会话那次"姿态假误差 355° / 跟踪 10.1m"，根源很可能就是它。
+    //
+    // 正解：**直接构造三轴** —— 偏航由 x_b 的水平投影保证，构造上就是对的 ✓。
+    let zb = [-f_w[0] / fnorm, -f_w[1] / fnorm, -f_w[2] / fnorm];
+    // 期望机头水平方向（yaw 参考）
+    let x_ref = [crate::math::cos(yaw.0), crate::math::sin(yaw.0), 0.0];
+    // y_b = z_b × x_ref（再归一化；z_b 与 x_ref 不平行时有效）
+    let mut yb = [
+        zb[1] * x_ref[2] - zb[2] * x_ref[1],
+        zb[2] * x_ref[0] - zb[0] * x_ref[2],
+        zb[0] * x_ref[1] - zb[1] * x_ref[0],
+    ];
+    let yn = crate::math::sqrt(yb[0] * yb[0] + yb[1] * yb[1] + yb[2] * yb[2]);
+    if yn < 1e-6 {
+        // z_b 与 x_ref 平行（机体 -Z 水平指向机头方向）：退化 ⇒ 只保证推力方向
+        return Quaternion::from_axis_angle([0.0, 0.0, 1.0], yaw);
+    }
+    let yb = [yb[0] / yn, yb[1] / yn, yb[2] / yn];
+    // x_b = y_b × z_b
+    let xb = [
+        yb[1] * zb[2] - yb[2] * zb[1],
+        yb[2] * zb[0] - yb[0] * zb[2],
+        yb[0] * zb[1] - yb[1] * zb[0],
+    ];
+    // 旋转矩阵（列 = 机体系基向量在世界系的像）→ 四元数（Shepperd 分支法，数值稳定）
+    // m[row][col]，col 为机体系轴
+    let m00 = xb[0]; let m01 = yb[0]; let m02 = zb[0];
+    let m10 = xb[1]; let m11 = yb[1]; let m12 = zb[1];
+    let m20 = xb[2]; let m21 = yb[2]; let m22 = zb[2];
+    let tr = m00 + m11 + m22;
+    if tr > 0.0 {
+        let sq = crate::math::sqrt(tr + 1.0) * 2.0; // 4w
+        Quaternion {
+            w: 0.25 * sq,
+            x: (m21 - m12) / sq,
+            y: (m02 - m20) / sq,
+            z: (m10 - m01) / sq,
+        }
+    } else if m00 > m11 && m00 > m22 {
+        let sq = crate::math::sqrt(1.0 + m00 - m11 - m22) * 2.0; // 4x
+        Quaternion {
+            w: (m21 - m12) / sq,
+            x: 0.25 * sq,
+            y: (m01 + m10) / sq,
+            z: (m02 + m20) / sq,
+        }
+    } else if m11 > m22 {
+        let sq = crate::math::sqrt(1.0 + m11 - m00 - m22) * 2.0; // 4y
+        Quaternion {
+            w: (m02 - m20) / sq,
+            x: (m01 + m10) / sq,
+            y: 0.25 * sq,
+            z: (m12 + m21) / sq,
+        }
+    } else {
+        let sq = crate::math::sqrt(1.0 + m22 - m00 - m11) * 2.0; // 4z
+        Quaternion {
+            w: (m10 - m01) / sq,
+            x: (m02 + m20) / sq,
+            y: (m12 + m21) / sq,
+            z: 0.25 * sq,
+        }
+    }
+    .normalize()
+}
+
 impl Quaternion {
     pub const IDENTITY: Self = Self { w: 1.0, x: 0.0, y: 0.0, z: 0.0 };
 
