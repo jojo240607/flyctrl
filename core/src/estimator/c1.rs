@@ -1354,7 +1354,8 @@ mod tests {
         let mag_i_true = [0.2f32, 0.0, 0.4];
         let mag_b_true = [0.1f32, -0.05, 0.2];
         let q0 = Quaternion::from_axis_angle([0.0, 0.0, 1.0], Radian(0.0));
-        let mut f = C1Filter::new(q0, [0.0; 3], [0.0; 3], 1e9); // 门开大 ⇒ 全部参与 ✓
+        // 门 = 3.0σ（参照 mag 门 ✓）；r_mag=1e-2、Q=1e-3·dt 已为干净基线值 ✓
+        let mut f = C1Filter::new(q0, [0.0; 3], [0.0; 3], 3.0);
         // ★按参照做法初始化 mag_I（2026-09-21 ✓）：由【首个量测 + 姿态】给出 ✓
         //   推导：预测 = Rᵀ·mag_I + mag_B ⇒ 令其等于首个量测、mag_B₀ = 0
         //        ⇒ mag_I₀ = R·meas₀（body→world ✓，本项目 rotate_vec_by_quat 方向 ✓）
@@ -1547,6 +1548,8 @@ mod tests {
             );
 
         let (tr_att1, tr_magb1) = (tr_block(&f, I_ATT), tr_block(&f, I_MAGB));
+        // ★前置自检（必先于判据 ✓ —— 本会话教训：自检排在判据后等于摆设 ✗）
+        assert!(f.mag_applied > 1000, "更新须确在运行（应用 {} / 跳过 {}）✗", f.mag_applied, f.mag_skipped);
         let eb = ((0..3).map(|i| (f.mag_b[i] - mag_b_true[i]).powi(2)).sum::<f32>()).sqrt();
         // 判据：若 mag_B 真在被估计 ⇒ 其 P 的迹应显著下降 ✓；
         //   若它几乎不动而【姿态块】在降 ⇒ 残差被姿态吸走 ✓（歧义证实 ✓）
