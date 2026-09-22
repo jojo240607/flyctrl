@@ -676,6 +676,84 @@ impl C1Filter {
         Ok(nis)
     }
 
+    /// **重力辅助量测更新**（照参照 `gravity_fusion.cpp` ✓，上线要点 §13.4 ✓）
+    ///
+    /// · 观测量：**归一化的机体比力** ✓（静止/零加速度时 = Rᵀ·ĝ ✓ 与预测同式 ✓）
+    /// · ★**加速度门控**：`|a_world − (−g_ned)|` 超过阈值 ⇒ 拒绝 ✓（照 line 61 的语义 ✓）
+    /// · 逐分量顺序融合 ✓（与磁同法 ✓）· 新息门控用 `self.gate` ✓
+    pub fn update_gravity(&mut self, accel_body: [f32; 3], g_ned: [f32; 3]) -> Result<u32, &'static str> {
+        let an = crate::math::sqrt(
+            accel_body[0] * accel_body[0] + accel_body[1] * accel_body[1] + accel_body[2] * accel_body[2],
+        );
+        if an < 1e-3 {
+            return Err("重力辅助：比力退化（失重）⇒ 拒绝 ✓");
+        }
+        // ★加速度门控（参照 line 61 的语义 ✓）：静止时比力 = −g_ned ✓
+        let gn = crate::math::sqrt(g_ned[0] * g_ned[0] + g_ned[1] * g_ned[1] + g_ned[2] * g_ned[2]).max(1e-6);
+        let a_world = rotate_vec_by_quat(self.st.q, accel_body);
+        let dev = crate::math::sqrt(
+            { let d0=a_world[0]+g_ned[0]; let d1=a_world[1]+g_ned[1]; let d2=a_world[2]+g_ned[2]; d0*d0+d1*d1+d2*d2 },
+        );
+        if dev > 0.25 * gn {
+            return Err("重力辅助：总加速度过大 ⇒ 关闭 ✓（照参照 ✓）");
+        }
+        let meas = [accel_body[0] / an, accel_body[1] / an, accel_body[2] / an];
+        let mut applied = 0u32;
+        for i in 0..3 {
+            let pred = predicted_gravity_body(self.st.q, g_ned);
+            let resid = meas[i] - pred[i];
+            let hfull = gravity_h(self.st.q, g_ned);
+            let h = hfull[i];
+            let mut ph = [0.0f32; N];
+            for (k, v) in ph.iter_mut().enumerate() {
+                let mut acc = 0.0f32;
+                for m in 0..N {
+                    acc += self.p[k][m] * h[m];
+                }
+                *v = acc;
+            }
+            let mut s_ = self.r_mag; // 重力观测噪声（用 mag 量级占位 ⇒ 后续按参照 ekf2_grav_noise ✓）
+            for k in 0..N {
+                s_ += h[k] * ph[k];
+            }
+            if s_ <= 0.0 {
+                continue;
+            }
+            let nis = resid.abs() / crate::math::sqrt(s_);
+            if nis > self.gate {
+                continue;
+            }
+            let mut dx = [0.0f32; N];
+            for k in 0..N {
+                dx[k] = ph[k] / s_ * resid;
+            }
+            let mut e = ErrorState::default();
+            for kk in 0..3 {
+                e.dtheta[kk] = dx[I_ATT + kk];
+                e.dv[kk] = dx[I_VEL + kk];
+                e.dp[kk] = dx[I_POS + kk];
+                e.dbg[kk] = dx[I_BG + kk];
+                e.dba[kk] = dx[I_BA + kk];
+                e.d_mag_i[kk] = dx[I_MAGI + kk];
+                e.d_mag_b[kk] = dx[I_MAGB + kk];
+            }
+            let mut newp = [[0.0f32; N]; N];
+            for aa in 0..N {
+                for bb in 0..N {
+                    let mut acc = self.p[aa][bb];
+                    for m in 0..N {
+                        acc -= ph[aa] / s_ * h[m] * self.p[m][bb];
+                    }
+                    newp[aa][bb] = acc;
+                }
+            }
+            self.p = newp;
+            self.apply(&e);
+            applied += 1;
+        }
+        Ok(applied)
+    }
+
     /// **★照参照实现 `resetMagStates`**（`mag_control.cpp` 401–455 ✓，对齐清单第 1/2/4/5 项 ✓）
     ///
     /// 语义（参照 ✓）：
