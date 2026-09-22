@@ -101,6 +101,15 @@ pub static mut G_ATT_INNOV_GATE: f32 = -1.0;
 /// 此值则线性抑制到 0 ✓）。
 pub static mut G_AW_RAWGATE: f32 = -1.0;
 
+/// **B 阶段：平移幅值门的下限**（`|a_world|/g`，线性开启的起点）。
+///
+/// 既有实现【硬编码】为 0.05（起点）/0.15（斜率 ⇒ 0.20 全开）—— 注释自述
+/// "小平移时是纯负担（实测悬停 RMSE 0.95°→2.20°）" ✓，但那是在**特定噪声级**下标定 ✗。
+/// 而本会话 A/B 实测：`G_AW_GPS=1` 时 **A1 悬停 −148.6% ✗ / A2 巡航 −2391% ✗✗**
+/// ⇒ 说明**多普勒噪声的伪参考已超过 0.05g 门限** ✗ ⇒ 需要可整定 ✓。
+/// 语义：`≤0` = 用编译期值（0.05 ✓，行为不变）；`>0` = 该值作起点（全开点 = 起点×4 ✓）。
+pub static mut G_AW_MAG_GATE: f32 = -1.0;
+
 /// 水平非重力加速度门控的编译期默认满闭阈值（m/s²）。
 /// 注意：**默认 0 = 关闭**（保持历史"三门槛"行为）。实测瞬时门控过于抖动，
 /// 见 `G_ATT_ACC_AC`（交流能量门控，本项的正解）。
@@ -659,7 +668,13 @@ impl Estimator for EkfEstimator {
                     1.0
                 } else {
                     let m = sqrt(aw[0] * aw[0] + aw[1] * aw[1] + aw[2] * aw[2]) / g;
-                    ((m - 0.05) / 0.15).clamp(0.0, 1.0)
+                    // 起点可整定（见 G_AW_MAG_GATE；≤0 ⇒ 沿用 0.05 ✓ 行为不变）
+                    let lo = unsafe {
+                        let v = core::ptr::read_volatile(core::ptr::addr_of!(G_AW_MAG_GATE));
+                        if v > 0.0 { v } else { 0.05 }
+                    };
+                    let span = (lo * 3.0).max(1e-6);
+                    ((m - lo) / span).clamp(0.0, 1.0)
                 };
                 // ★ B 阶段：用【补偿前】的原始比力做 plausibility 门（非循环 ✓）
                 let raw_gate = unsafe {
