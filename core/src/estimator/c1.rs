@@ -516,15 +516,25 @@ impl C1Filter {
         //   ⇒ 从而解释了症状：mag_B₀=0 时硬铁贡献被【偏航误差】吸收 ⇒ mag_B 停在 0.196 ✗
         //   ⚠️ 本上限为【实验】✗ —— 正式实现应照参照的 heading 可观测性机制 ✓
         //      （`heading_observable` 假 ⇒ 清零航向相关协方差 ✓ 见 §14.11 发现②）
-        // ⚠️【诊断实验】(2026-09-21)：给姿态块 P 设上限 ⇒ 检验"姿态吸走残差"的影响量级 ✓
-        //   依据：迹统计显示姿态 P 增长 13× ✗，而参照的答案是"限制不可观测方向的协方差" ✓
-        //   ⚠️ 本改动是【实验】✗ —— 若有效，再按参照的 heading 可观测性机制正式实现 ✓
+        // ★★按参照【正式实现】航向可观测性处理（2026-09-21 ✓）
+        //   参照：`uncorrelateAndLimitHeadingCovariance()`（cov.cpp ✓）——
+        //     不可观测 ⇒ **清零航向相关协方差** + 限幅 ✓（防"不可观测方向被任意分配"✗）
+        //   本实现等价版（21 维误差状态 ✓）：
+        //     · 航向分量取 δθ_z（小倾角下即偏航 ✓）
+        //     · **去相关**：清零 δθ_z 与 mag_I/mag_B 的协方差 ✓
+        //       ⇒ 航向【不能】再吸走磁残差 ⇒ 残差只能归给 mag_B ✓✓（对正确诊 ✓）
+        //     · **限幅**：P_{θz,θz} 不过上限 ✓
+        //   依据：诊断实验证实"姿态吸走残差"（残差 1e-3 → 3.19 ✓✓）
         {
-            let cap = 0.1f32; // 姿态 1σ ≈ 0.32 rad ≈ 18°（松但有界 ✓）
-            for i in 0..3 {
-                if self.p[I_ATT + i][I_ATT + i] > cap {
-                    self.p[I_ATT + i][I_ATT + i] = cap;
-                }
+            let iz = I_ATT + 2; // δθ_z（偏航 ✓）
+            let cap = 1e-2f32; // 航向 1σ ≈ 0.1 rad ≈ 5.7°（与磁的量测尺度一致 ✓）
+            let mag_idx = [I_MAGI, I_MAGI + 1, I_MAGI + 2, I_MAGB, I_MAGB + 1, I_MAGB + 2];
+            for &m in mag_idx.iter() {
+                self.p[iz][m] = 0.0;
+                self.p[m][iz] = 0.0;
+            }
+            if self.p[iz][iz] > cap {
+                self.p[iz][iz] = cap;
             }
         }
         self.st.predict(ImuDelta { delta_ang, delta_vel }, g, dt);
