@@ -450,6 +450,54 @@ impl Controller for PidController {
             ];
         }
 
+        // ================= 期望姿态：**推力矢量构造**（PX4/ArduPilot 做法）=================
+        //
+        // ⚠️ **为何换成这个**（2026-09-21，阶段 5 的切向偏航实验暴露）：
+        // 旧做法 `from_euler(roll, pitch, yaw)` 的 roll/pitch 是**机体系**欧拉角，而
+        // `acc_n/acc_e` 是**世界系** ⇒ 二者仅在 `yaw = 0` 时相同 ✗（我已修过其中一处
+        // 实例：手工按 yaw 旋转倾角）。但**手工旋转换是补丁**：它忽略了高阶耦合项，
+        // 且每加一处引用都要记得转 ✗。
+        //
+        // 成熟飞控（PX4/ArduPilot）不用欧拉角：它们把**期望姿态直接由推力矢量构造** ——
+        // 让机体 -Z（推力轴）对准"所需比力方向"，再把偏航绕该方向独立施加 ⇒
+        // **构造上就坐标系正确**，与偏航无关，无需任何手工旋转 ✓。
+        //
+        // 推导：推力须同时提供重力与期望加速度 ⇒ 期望比力（世界系 NED）
+        //       `f_w = (acc_n, acc_e, acc_d + g)`
+        //       推力沿机体 **-Z** ⇒ 机体 -Z 在世界系 = f_w/|f_w|
+        //       ⇒ 机体 +Z（NED 下朝下）世界系 = -f_w/|f_w| = zb
+        //       把水平姿的 +Z（即 NED 的 (0,0,1)）旋到 zb，再施加偏航即可。
+        let fw = [acc_n, acc_e, acc_d + g];
+        let fnorm = crate::math::sqrt(fw[0] * fw[0] + fw[1] * fw[1] + fw[2] * fw[2]);
+        let q_des_thrust = {
+            if fnorm > 1e-6 {
+                let zb = [-fw[0] / fnorm, -fw[1] / fnorm, -fw[2] / fnorm];
+                // 轴 = (0,0,1) × zb = (-zb_y, zb_x, 0)
+                let ax = -zb[1];
+                let ay = zb[0];
+                let s = crate::math::sqrt(ax * ax + ay * ay);
+                let c = zb[2].clamp(-1.0, 1.0);
+                let q_align = if s < 1e-9 {
+                    // 已对齐或完全反向
+                    if c > 0.0 {
+                        Quaternion { w: 1.0, x: 0.0, y: 0.0, z: 0.0 }
+                    } else {
+                        // 完全倒扣：绕 +X 转 180°
+                        Quaternion { w: 0.0, x: 1.0, y: 0.0, z: 0.0 }
+                    }
+                } else {
+                    Quaternion::from_axis_angle([ax / s, ay / s, 0.0], Radian(crate::math::atan2(s, c)))
+                };
+                // 偏航在世界系施加（左乘）
+                let q_yaw = Quaternion::from_axis_angle([0.0, 0.0, 1.0], sp.yaw);
+                q_yaw * q_align
+            } else {
+                Quaternion::from_euler(Radian(0.0), Radian(0.0), sp.yaw)
+            }
+        };
+        // 旧路径（保留为对照：`G_MAG3D_ALPHA` 式旋钮可切换 —— 此处直接返回推力矢量版）
+        #[allow(unreachable_code)]
+        let q_des_legacy = {
         // 期望姿态四元数：由（roll=+tilt_e, pitch=-tilt_n, yaw=sp.yaw）构成。
         // 飞控机体(经 X-180 实为前-左-下)：推力沿机体 -Z_body。绕 +Y 正转(+pitch) 把推力
         // 旋到 -X(南)，故北向(+X)加速需 -pitch；东向(+Y)则需 +roll（绕 +X 正转把 -Z 旋到 +Y，
@@ -477,7 +525,18 @@ impl Controller for PidController {
         let (sy, cy) = crate::math::sin_cos(yaw.0);
         let tilt_fwd = tilt_n * cy + tilt_e * sy;
         let tilt_right = -tilt_n * sy + tilt_e * cy;
-        let q_des = Quaternion::from_euler(Radian(tilt_right), Radian(-tilt_fwd), yaw);
+        Quaternion::from_euler(Radian(tilt_right), Radian(-tilt_fwd), yaw)
+        }; // end 旧路径对照块
+        // ⚠️ **2026-09-21 回退**：推力矢量版（`q_des_thrust`）首次实现**数值有误** ——
+        // 实测姿态误差跳到 **355.37°**（四元数约定/符号错误的特征 ✗）、圆轨迹跟踪由
+        // 1.305m 劣化到 **10.119m** ✗。约定未核实前**不能启用**，故回退到已验证的旧路径。
+        //
+        // **注意**：这不否定该架构（PX4/ArduPilot 确实用推力矢量构造期望姿态 ✓），
+        // 只说明**我的实现需要先做约定核对**（`Quaternion` 的乘法序、`from_axis_angle`
+        // 的旋转方向、以及 `att` 是"世界→机体"还是"机体→世界"）—— 这正是本会话反复
+        // 教训的"仪表/约定先自检"。
+        let _ = q_des_thrust;
+        let q_des = q_des_legacy;
 
         self.control_attitude(_dt, q_des, des_thrust, est)
     }
