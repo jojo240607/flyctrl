@@ -125,6 +125,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         //   `zz_ctlprof::ctl_period_and_tick_cost` ✓）：控制拍 **249.7Hz**
         //   （周期均值 **4.0000ms**、抖动 std 0.84ms ✓）⇒ 固件已能跑满 4ms 预算 ✓。
         //   本"按差值取 dt"的写法仍保留 ✓（对拍率波动/过载是必要防御 ✓）。
+        flyctrl_core::perf::probe(40); // 段40 起：循环顶（dt/ticks ✓）
         unsafe { crate::flyctrl::CTRL_TICKS = crate::flyctrl::CTRL_TICKS.wrapping_add(1); }
         let now_ticks = tick_count();
         let dt_ms = now_ticks.wrapping_sub(last_ticks).clamp(1, 50) as f32;
@@ -133,7 +134,9 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         hil.dt = dt;
         let _dt = dt;
         // 应用地面站参数（每周期原子读 G_PARAM_VALS -> pid 增益；PARAM_SET 即时生效）。
+        flyctrl_core::perf::probe(41); // 段41 起：参数同步后
         crate::flyctrl::uplink::sync_gains_to_pid(&mut hil.ctrl);
+        flyctrl_core::perf::probe(42); // 段42 起：sync_gains 完（含读帧前 ✓）
         if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: loop enter"); }
 
         // --- 取最新传感器帧（seqlock：control 优先级高于所有写者，读不被打断） ---
@@ -328,6 +331,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         // IMU 单次消费已在上方 SENSOR_FRAME 读取时完成（HIL 下 `f.imu = None`）；
         // SimImu 回退、姿态/位置初始化门控、EKF 估计 + 气压观测、FDIR、控制环健康闸、
         // 执行器限幅全部在 `step_hil` 内部完成，与 SIL（fly-sim-core）完全一致。
+        flyctrl_core::perf::probe(43); // 段43 起：读帧+设定点完，进 step_hil
         let r = hil.step_hil(
             imu, gps, baro_alt, None, None, mag, &setpoint, setpoint_valid, armed_eff, rc.fresh, &mut sim_imu,
         );
@@ -345,6 +349,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
             alt_locked = false;
         }
 
+        flyctrl_core::perf::probe(44); // 段44 起：step_hil 完（★放属性之前 ✓）
         // HIL：回传执行器指令供 telemetry 组 HIL_ACTUATOR_CONTROLS（PC 端注入 plant）。
         #[cfg(feature = "hil")]
         crate::flyctrl::uplink::set_actuator_cmd(&cmd.motor);
@@ -357,6 +362,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         unsafe {
             DBG_MOTOR = cmd.motor;
         }
+        flyctrl_core::perf::probe(45); // 段45 起：set_actuator_cmd 完，PWM 前
         for i in 0..4 {
             if let Some(d) = &pwm_dev[i] {
                 let m = cmd.motor[i].clamp(0.0, 1.0);
@@ -374,6 +380,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
             info!(tag: "ctrl", "dbg: est-mtx count={} sensor-seq={}", ec, unsafe { SENSOR_SEQ });
         }
 
+        flyctrl_core::perf::probe(46); // 段46 起：PWM 完（此后为遥测/发布 + delay ✓）
         // --- 发布估计状态（telemetry/monitor 读） ---
         {
             let _g = unsafe { EST_MTX.guard() };
