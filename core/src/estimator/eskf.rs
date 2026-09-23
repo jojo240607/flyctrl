@@ -988,7 +988,7 @@ impl Eskf {
                     newp[aa][bb] = acc;
                 }
             }
-            self.p = newp;
+            // （已就地更新 ✓，无需 newp ✓）
             self.apply(&e);
             applied += 1;
         }
@@ -1053,17 +1053,24 @@ impl Eskf {
                 }
                 g
             };
-            let mut newp = [[0.0f32; N]; N];
+            // ★去 N³（同 update_vec3/update_gravity 的【逐项等价】法 ✓）：
+            //   ① (h·P)[b] = Σ_m h[m]·P[m][b] ⇒ N² 一次 ✓
+            //   ② P[a][b] -= K[a]·(h·P)[b]    ⇒ N² ✓   合计 2N² 而非 N³ ✓
+            let mut hpq = [0.0f32; N];
+            for b in 0..N {
+                let mut acc = 0.0f32;
+                for m in 0..N {
+                    acc += h[m] * self.p[m][b];
+                }
+                hpq[b] = acc;
+            }
             for a in 0..N {
+                let ka = kk_gain[a];
                 for b in 0..N {
-                    let mut acc = self.p[a][b];
-                    for m in 0..N {
-                        acc -= kk_gain[a] * h[m] * self.p[m][b];
-                    }
-                    newp[a][b] = acc;
+                    self.p[a][b] -= ka * hpq[b];
                 }
             }
-            self.p = newp;
+            // （已就地更新 ✓，无需 newp ✓）
             // 状态注入（在该分量之后立即生效 ⇒ 下一分量看到新状态 ✓✓）
             self.apply(&e);
         }
