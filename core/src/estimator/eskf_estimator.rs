@@ -96,7 +96,7 @@ impl EskfEstimator {
             mag_first_done: false,
             omega_body: [0.0; 3],
             aid_div: 0,
-            aid_period: 10,
+            aid_period: 15, // ★250Hz 下 ⇒ 16.7Hz ✓（§5.86）
             n_step: 0,
             n_grav_applied: 0,
             n_grav_gated: 0,
