@@ -137,7 +137,9 @@ impl Estimator for EskfEstimator {
         // 1) 标称态 + 协方差推进 ✓（速率×dt ✓）
         let d_ang = [gyr[0] * dtf, gyr[1] * dtf, gyr[2] * dtf];
         let d_vel = [acc[0] * dtf, acc[1] * dtf, acc[2] * dtf];
+        crate::perf::probe(18); // ESKF: step 进入
         self.f.predict(d_ang, d_vel, dtf, self.g_ned);
+        crate::perf::probe(19); // ESKF: predict 完成
 
         // 2) 重力辅助 ✓（= C1 版的"重力锚定" ✓；机制门在 C1 内部 ✓）
         match self.f.update_gravity(acc, self.g_ned) {
@@ -146,6 +148,7 @@ impl Estimator for EskfEstimator {
             Err(_) => { self.n_grav_gated = self.n_grav_gated.wrapping_add(1); bump(2); } // ★门关闭 ✓
         }
 
+        crate::perf::probe(20); // ESKF: 重力辅助完成
         // 3) GPS 位置/速度 ✓
         if let Some(p) = pos {
             let pm = [p.pos[0].0, p.pos[1].0, p.pos[2].0];
@@ -173,6 +176,7 @@ impl Estimator for EskfEstimator {
             self.n_airspeed_refused = self.n_airspeed_refused.wrapping_add(1);
         }
 
+        crate::perf::probe(21); // ESKF: 其余观测/组装完成
         self.state()
     }
 

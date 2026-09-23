@@ -254,18 +254,29 @@ pub fn update_scalar(
         }
         kk
     };
-    // P ← (I − K·h)·P（在更新前的 P 上计算 ✓，避免就地污染 ✓）
-    let mut newp = [[0.0f32; N]; N];
-    for i in 0..N {
+    // ★★P ← (I − K·h)·P，改为 **P − K·(h·P)**（2026-09-23，§5.33 ✓）——数学等价 ✗：
+    //   原式内层对 m 求和 ⇒ **N³ = 9261 次/路** ✗；本式先算行向量 h·P（N² ✓，
+    //   h 稀疏时更少 ✓），再做外积减法（N² ✓）⇒ **每路降 21 倍** ✓✓
+    //   （每拍 10~15 路观测 ⇒ 这是单拍指令数的主要来源 ✓，见 §5.32 的账 ✓）
+    let mut hp = [0.0f32; N];
+    for kk in 0..N {
+        let hk = h[kk];
+        if hk == 0.0 {
+            continue; // ★h 稀疏 ⇒ 跳过零 ✓
+        }
         for j in 0..N {
-            let mut s = p[i][j];
-            for m in 0..N {
-                s -= k[i] * h[m] * p[m][j];
-            }
-            newp[i][j] = s;
+            hp[j] += hk * p[kk][j];
         }
     }
-    *p = newp;
+    for i in 0..N {
+        let ki = k[i];
+        if ki == 0.0 {
+            continue;
+        }
+        for j in 0..N {
+            p[i][j] -= ki * hp[j];
+        }
+    }
     Ok(nis_sigma)
 }
 
