@@ -70,6 +70,10 @@ impl EskfState {
 pub static mut G_ESKF_GRAV_ON: f32 = 1.0;
 /// ★**实验旋钮**：磁量测开关（含 `reset_mag_states` ✓）。默认 1.0 = 开。
 pub static mut G_ESKF_MAG_ON: f32 = 1.0;
+/// ★**消融开关**（诊断用 ✓，默认 1.0 = 开）：GPS 位/速融合 ✓
+pub static mut G_ESKF_GPS_ON: f32 = 1.0;
+/// ★**消融开关**：气压融合 ✓（`Eskf::update_baro` 内检查 ✓）
+pub static mut G_ESKF_BARO_ON: f32 = 1.0;
 /// ★**整定旋钮**：姿态过程噪声倍率（`q[I_ATT] *= G_ESKF_Q_ATT` ✓）。默认 1.0。
 /// 用途：检验"滤波器是否过度信任陀螺"——若高角速率场景误差随倍率下降 ⇒ 是 ✓。
 pub static mut G_ESKF_Q_ATT: f32 = 1.0;
@@ -713,6 +717,9 @@ impl Eskf {
 
     /// 气压高度（标量 ✓，h = −d ✓ 已数值验证 ✓）
     pub fn update_baro(&mut self, alt: f32) -> Result<f32, &'static str> {
+        if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_BARO_ON)) } < 0.5 {
+            return Err("气压：消融开关关闭 ✓（诊断用，非静默 ✗）");
+        }
         let mut h = [0.0f32; N];
         h[I_POS + 2] = -1.0;
         let resid = alt - (-self.st.p[2]);
