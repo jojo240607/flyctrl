@@ -26,6 +26,7 @@
 pub mod control;
 #[cfg(feature = "hil")]
 pub mod hil_shmem;
+pub mod pace;
 pub mod sensors_task;
 pub mod telemetry;
 pub mod uplink;

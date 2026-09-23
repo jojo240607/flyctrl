@@ -116,6 +116,13 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
     // 绝对节拍基准（仅非 HIL；HIL 由 HIL_EVT 事件驱动，不用节拍）。
     #[cfg(not(feature = "hil"))]
     let mut wake_tick = last_ticks;
+    // ★控制节拍源（§5.91–5.94）：非 HIL 下由【硬件定时器 timer3/TIM7 + ISR + 信号量】
+    //   给出 **4.000ms 精确**节拍（84MHz 时钟域 ⇒ 不受 1ms 系统 tick 网格限制 ✗）；
+    //   初始化失败则**回退** delay_until（反静默降级 ✓）。HIL 仍由 HIL_EVT 事件驱动 ✓。
+    #[cfg(not(feature = "hil"))]
+    let paced = crate::flyctrl::pace::init();
+    #[cfg(not(feature = "hil"))]
+    info!(tag: "ctrl", "pace: {}", if paced { "timer3/TIM7 4.000ms 精确节拍 ✓" } else { "回退 delay_until(4 tick) ✗" });
     loop {
         // 实测控制周期（RTOS tick = 1ms）：取「本轮与上轮的 tick 差」作真实 dt，
         // 拍率变化时估计/积分仍正确 ✓。
@@ -452,7 +459,11 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         unsafe { HIL_EVT.wait(); }
         unsafe { crate::flyctrl::CTRL_PHASE = 4; }
         #[cfg(not(feature = "hil"))]
-        delay_until(&mut wake_tick, CONTROL_PERIOD_TICKS);
+        if paced {
+            crate::flyctrl::pace::wait_tick();   // ★硬件定时器节拍：4.000ms 精确 ✓
+        } else {
+            delay_until(&mut wake_tick, CONTROL_PERIOD_TICKS);
+        }
         if VERBOSE && seq < 5 {
             info!(tag: "ctrl", "dbg: after sleep seq={}", seq);
         }
