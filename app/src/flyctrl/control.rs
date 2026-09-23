@@ -428,12 +428,18 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
             };
             // 精简行：日志缓冲 180B（SDK emit 截断点）——去掉冗余 gps_v/baro_h，
             // 行末 m=[...] 不再被截断（此前 19 参数 ≈186B 尾部被截，见 SDK 越界修复）。
-            info!(tag: "ctrl", "hb seq={} armed={} crit={} alt={:.1} imu_ok={} mag={} gps={} gv=({:.1},{:.1},{:.1}) baro={} gpsd={:.1} gz={:.1} m=[{:.2},{:.2},{:.2},{:.2}]",
-                  seq, armed_eff, health == Health::Critical, est.pos[2].0,
+            // ★全整数/定点（避开 `flt2dec` ✗ —— 它是单次日志极贵的主因 ✓，
+            //   见 §5.76/§5.77：`log::emit` 22% + 浮点格式化 3% ✓）；
+            //   ★保留 `"hb seq="` 子串（多处测试依赖 ✓，如 x_flyctrl_modes ✓）
+            info!(tag: "ctrl", "hb seq={} armed={} crit={} alt_mm={} imu_ok={} mag={} gps={} gv_cms=({},{},{}) baro={} gpsd_mm={} gz_cms={} m_permille=[{},{},{},{}]",
+                  seq, armed_eff, health == Health::Critical, (est.pos[2].0 * 1000.0) as i32,
                   imu.is_some(), mag.is_some(), gps.is_some(),
-                  gv[0], gv[1], gv[2], baro_alt.is_some(),
-                  gps.map(|g| g.pos[2].0).unwrap_or(0.0), est.vel[2].0,
-                  cmd.motor[0], cmd.motor[1], cmd.motor[2], cmd.motor[3]);
+                  (gv[0] * 100.0) as i32, (gv[1] * 100.0) as i32, (gv[2] * 100.0) as i32,
+                  baro_alt.is_some(),
+                  (gps.map(|g| g.pos[2].0).unwrap_or(0.0) * 1000.0) as i32,
+                  (est.vel[2].0 * 100.0) as i32,
+                  (cmd.motor[0] * 1000.0) as i32, (cmd.motor[1] * 1000.0) as i32,
+                  (cmd.motor[2] * 1000.0) as i32, (cmd.motor[3] * 1000.0) as i32);
         }
 
         // 【HIL 事件驱动】不依赖 control 自身 4ms 时钟：阻塞等待下一帧 HIL_SENSOR
