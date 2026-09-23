@@ -171,26 +171,41 @@ pub type Cov = [[f32; N]; N];
 /// **可以实现的理由**：F 已 5/5 块数值/参照双证通过 ✓（§12.5–§12.8）。
 /// 实现纪律：先用**不变量**自检（对称性 / F=I 时退化为 P+Q ✓），再谈精度 ✓。
 pub fn predict_covariance(p: &Cov, f: &[[f32; N]; N], q: &Cov) -> Cov {
+    // ★**稀疏 + 对称优化**（2026-09-23，§5.30 ✓）——原为两次朴素三重循环（2·N³=18522 次 ✓）
+    //
+    // 依据 ✓（`transition_matrix` 的结构）：
+    //  · F **高度稀疏**：磁状态（mag_I/mag_B）只出现在自己的行（对角 ✓）；
+    //    姿态/速度/位置/零偏之间只有少数耦合块 ✓ ⇒ 大量 f[i][k]==0 ✓
+    //  · 结果 P' = F·P·Fᵀ **必然对称** ✓ ⇒ 第二重只需算上三角再镜像 ✓
+    // ⇒ 语义与数值**完全不变** ✓（只是跳过零项/镜像对称项 ✓）
     // FP = F·P
     let mut fp = [[0.0f32; N]; N];
-    for (i, fp_i) in fp.iter_mut().enumerate() {
-        for (j, v) in fp_i.iter_mut().enumerate() {
-            let mut s = 0.0f32;
-            for k in 0..N {
-                s += f[i][k] * p[k][j];
+    for i in 0..N {
+        for k in 0..N {
+            let fik = f[i][k];
+            if fik == 0.0 {
+                continue; // ★跳过零（稀疏 ✓）
             }
-            *v = s;
+            for j in 0..N {
+                fp[i][j] += fik * p[k][j];
+            }
         }
     }
-    // P' = FP·Fᵀ + Q
+    // P' = FP·Fᵀ + Q（只算 j>=i，再镜像 ✓）
     let mut out = [[0.0f32; N]; N];
-    for (i, out_i) in out.iter_mut().enumerate() {
-        for (j, v) in out_i.iter_mut().enumerate() {
+    for i in 0..N {
+        for j in i..N {
             let mut s = 0.0f32;
             for k in 0..N {
-                s += fp[i][k] * f[j][k];
+                let fjk = f[j][k];
+                if fjk == 0.0 {
+                    continue; // ★跳过零 ✓
+                }
+                s += fp[i][k] * fjk;
             }
-            *v = s + q[i][j];
+            let v = s + q[i][j];
+            out[i][j] = v;
+            out[j][i] = v; // ★对称镜像 ✓
         }
     }
     out
