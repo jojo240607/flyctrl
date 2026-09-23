@@ -51,6 +51,12 @@ pub struct EskfEstimator {
     mag_first_done: bool,
     /// 陀螺/加计读数（供 `state()` 的 `omega` ✓）
     omega_body: [f32; 3],
+    /// ★**辅助观测降频**（§5.84 ✓）：每 N 拍才融合一次重力辅助与磁 ✓
+    /// 物理依据：重力方向/磁方向的变化率远低于 IMU 采样率 ✓ ⇒ 无需每拍融合 ✓
+    /// （同时消除"同一保持样本每拍重复融合"的隐患 ✓）
+    aid_div: u32,
+    /// 降频周期（1 = 每拍 ✓；10 ⇒ 250Hz 下 25Hz ✓）
+    pub aid_period: u32,
 
     // ---- ★机制计数（"证明它在运行" ✓）----
     /// `step` 调用次数 ✓
@@ -89,6 +95,8 @@ impl EskfEstimator {
             mag_i_prior,
             mag_first_done: false,
             omega_body: [0.0; 3],
+            aid_div: 0,
+            aid_period: 10,
             n_step: 0,
             n_grav_applied: 0,
             n_grav_gated: 0,
@@ -177,11 +185,14 @@ impl Estimator for EskfEstimator {
         self.f.predict(d_ang, d_vel, dtf, self.g_ned);
         crate::perf::probe(9); // ESKF: predict 完成
 
-        // 2) 重力辅助 ✓（= C1 版的"重力锚定" ✓；机制门在 C1 内部 ✓）
+        // 2) 重力辅助 ✓（★降频：每 aid_period 拍融合一次 ✓）
+        self.aid_div = self.aid_div.wrapping_add(1);
+        if self.aid_div % self.aid_period.max(1) == 0 {
         match self.f.update_gravity(acc, self.g_ned) {
             Ok(n) if n > 0 => { self.n_grav_applied = self.n_grav_applied.wrapping_add(1); bump(1); }
             Ok(_) => {}
             Err(_) => { self.n_grav_gated = self.n_grav_gated.wrapping_add(1); bump(2); } // ★门关闭 ✓
+        }
         }
 
         crate::perf::probe(10); // ESKF: 重力辅助完成
@@ -247,6 +258,10 @@ impl Estimator for EskfEstimator {
         if ra > 0.0 {
             let n = self.f.reanchor_mag_i(self.mag_i_prior, ra);
             self.n_mag_reanchored = self.n_mag_reanchored.wrapping_add(n);
+        }
+        // ★磁同样降频 ✓（磁方向变化更慢 ✓）
+        if self.aid_div % self.aid_period.max(1) != 0 {
+            return;
         }
         match self.f.update_mag(m) {
             Ok(_) => { self.n_mag = self.n_mag.wrapping_add(1); bump(9); }

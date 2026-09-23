@@ -855,10 +855,14 @@ impl Eskf {
         }
         let meas = [accel_body[0] / an, accel_body[1] / an, accel_body[2] / an];
         let mut applied = 0u32;
+        // ★把 H 与预测【提到分量循环外】算一次 ✓（原在循环内被重建 3 次 ✗，
+        //   每次含 3 次四元数旋转 ⇒ 白做 2/3 ✓；与 N³/H·P 两轮同类的"重复构造"缺陷 ✓）
+        let pred_all = predicted_gravity_body(self.st.q, g_ned);
+        let h_all = gravity_h(self.st.q, g_ned);
         for i in 0..3 {
-            let pred = predicted_gravity_body(self.st.q, g_ned);
+            let pred = pred_all;
             let resid = meas[i] - pred[i];
-            let hfull = gravity_h(self.st.q, g_ned);
+            let hfull = h_all;
             let h = hfull[i];
             let mut ph = [0.0f32; N];
             for (k, v) in ph.iter_mut().enumerate() {

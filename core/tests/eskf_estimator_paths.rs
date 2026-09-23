@@ -28,6 +28,7 @@ fn every_adapter_path_is_exercised() {
     let q0 = flyctrl_core::vehicle::Quaternion::from_axis_angle([0.0, 0.0, 1.0], Radian(0.0));
     let mut e = EskfEstimator::new(q0, [0.0; 3], [0.0; 3], 5.0, [0.2, 0.0, 0.4]);
     let dt = Second(0.004);
+    e.aid_period = 1; // ★测例验证通路是否走到⇒ 关闭降频以逐拍融合 ✓
 
     // 1) 悬停拍 ⇒ 重力辅助【应用】✓（比力 ≈ 纯重力 ⇒ 门开 ✓）
     for _ in 0..20 {
