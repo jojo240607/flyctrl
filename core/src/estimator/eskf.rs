@@ -516,16 +516,24 @@ pub fn update_vec3(
         }
     }
     // P ← (I − K·H)·P（在更新前的 P 上算 ✓）
+    // ★★一次算好 (H·P)（3×N² ✓）—— 必须【循环外】算 ✗
+    //   （曾把它放在 (i,j,a) 最内层 ⇒ 每对 (i,j) 重算 N 次 ⇒ **又是 N³** ✗✓）
+    let mut hp = [[0.0f32; N]; 3];
+    for a in 0..3 {
+        for j in 0..N {
+            let mut acc = 0.0f32;
+            for kk in 0..N {
+                acc += h[a][kk] * p[kk][j];
+            }
+            hp[a][j] = acc;
+        }
+    }
     let mut newp = [[0.0f32; N]; N];
     for i in 0..N {
         for j in 0..N {
             let mut s = p[i][j];
             for a in 0..3 {
-                let mut hpa = 0.0f32;
-                for kk in 0..N {
-                    hpa += h[a][kk] * p[kk][j]; // ★直接算 (H·P)[a][j] ✓
-                }
-                s -= k[i][a] * hpa;
+                s -= k[i][a] * hp[a][j]; // ★用【循环外算好】的 (H·P) ✓
             }
             newp[i][j] = s;
         }
@@ -751,8 +759,11 @@ impl Eskf {
         let resid = [meas[0] - self.st.p[0], meas[1] - self.st.p[1], meas[2] - self.st.p[2]];
         let r = diag3(self.r_gps_p);
         // ⚠️ 顺序：**先用更新前的 P 算增益** ✓，再更新 P，最后注入 ✓（经典顺序 ✓）
+        crate::perf::probe(19); // GPS位内1：构 H 完，进 gain_apply
         let e = self.gain_apply(&h, &resid, &r);
+        crate::perf::probe(20); // GPS位内2：gain_apply 完
         let nis = update_vec3(&mut self.p, &h, &resid, &r, self.gate)?;
+        crate::perf::probe(21); // GPS位内3：update_vec3 完
         self.apply(&e);
         Ok(nis)
     }
