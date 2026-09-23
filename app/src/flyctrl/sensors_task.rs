@@ -74,9 +74,13 @@ impl Sensors {
                 }
 
                 // ---- 读取各类传感器（统一 trait 接口，不区分虚拟/真实）----
+                flyctrl_core::perf::probe(30); // 段1 起（sensors 循环顶 ✓）
                 let imu_sample: Option<ImuSample> = Some(stack.read_imu());
+                flyctrl_core::perf::probe(31); // 段2 起（IMU 读完 ✓）
                 let baro_sample: Option<f32> = Some(stack.read_altitude());
+                flyctrl_core::perf::probe(32); // 段3 起（气压读完 ✓）
                 let gps_sample: Option<PosSample> = stack.read_gps();
+                flyctrl_core::perf::probe(33); // 段4 起（GPS 读完 ✓）
                 // GPS 样本保持（见循环外注释）：无新帧时保持最近有效样本
                 // （超时清理由下方写段按 gps_stale 处理，这里只维护过期计数）。
                 if gps_sample.is_some() {
@@ -85,6 +89,7 @@ impl Sensors {
                     gps_stale += 1;
                 }
                 let rc_input: RcInput = stack.read_rc();
+                flyctrl_core::perf::probe(34); // 段5 起（RC 读完 ✓）
                 // 磁力计：real-sensors 经 I2C 读 QMC5883L（0x0D），虚拟源直出。
                 // read() 内部失败会置 unhealthy；读后 health 反映链路真实状态。
                 let mag_sample: [f32; 3] = stack.read_mag();
