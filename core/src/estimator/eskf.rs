@@ -521,9 +521,11 @@ pub fn update_vec3(
         for j in 0..N {
             let mut s = p[i][j];
             for a in 0..3 {
-                for m in 0..N {
-                    s -= k[i][a] * h[a][m] * p[m][j];
+                let mut hpa = 0.0f32;
+                for kk in 0..N {
+                    hpa += h[a][kk] * p[kk][j]; // ★直接算 (H·P)[a][j] ✓
                 }
+                s -= k[i][a] * hpa;
             }
             newp[i][j] = s;
         }
@@ -880,17 +882,25 @@ impl Eskf {
                 e.d_mag_i[kk] = dx[I_MAGI + kk];
                 e.d_mag_b[kk] = dx[I_MAGB + kk];
             }
-            let mut newp = [[0.0f32; N]; N];
+            // ★去 N³（原 9261/分量 ✗）：P ← P − K·(h·P)
+            //   ① 先算行向量 (h·P)[bb] = Σ_m h[m]·P[m][bb] ⇒ **N² 一次** ✓
+            //   ② 再做外积减法 P[aa][bb] -= K[aa]·(h·P)[bb] ⇒ **N²** ✓
+            //   ⇒ 合计 2N²(882) 而非 N³(9261) ✓；且**逐项等价** ✓（不用对称近似 ✗）
+            let mut hp = [0.0f32; N];
+            for bb in 0..N {
+                let mut acc = 0.0f32;
+                for m in 0..N {
+                    acc += h[m] * self.p[m][bb];
+                }
+                hp[bb] = acc;
+            }
             for aa in 0..N {
+                let ka = ph[aa] / s_;
                 for bb in 0..N {
-                    let mut acc = self.p[aa][bb];
-                    for m in 0..N {
-                        acc -= ph[aa] / s_ * h[m] * self.p[m][bb];
-                    }
-                    newp[aa][bb] = acc;
+                    self.p[aa][bb] -= ka * hp[bb];
                 }
             }
-            self.p = newp;
+            // （已就地更新 ✓，无需 newp ✓）
             self.apply(&e);
             applied += 1;
         }
