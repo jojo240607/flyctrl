@@ -403,7 +403,13 @@ where
         probe(2); // 姿态/位置初始化门控完成
 
         // 4) 状态估计（predict-then-correct；HIL 无空速通道 → airspeed=None）。
-        let est_state = self.est.step(self.dt, imu_sample, gps, None);
+        // ★只融合【新】GPS 样本 ✓（stale=保持样本 ⇒ 跳过 ✗，见 PosSample::stale ✓）
+        //   历史缺陷 ✗：保持样本被每拍融合 ⇒ 同一量测重复使用 ⇒ 权重放大 ~12× ✗
+        let gps_fresh = match &gps {
+            Some(g) if !g.stale => gps,
+            _ => None,
+        };
+        let est_state = self.est.step(self.dt, imu_sample, gps_fresh, None);
         probe(3); // EKF 预测+更新完成
         // 气压高度观测（垂直通道最紧锚）：在 step 之后注入（predict-then-correct），
         // 下一拍预测从修正后状态出发。此前 baro 只进 FDIR、垂直通道仅靠 GPS 锚定

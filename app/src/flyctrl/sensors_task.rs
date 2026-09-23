@@ -100,9 +100,14 @@ impl Sensors {
                         // （避免 control 拍错过 2ms 窗口导致 pos_available 大面积
                         // false → FDIR 误判 GPS lost）；超时（500ms 无帧）置 None。
                         if gps_sample.is_some() {
-                            f.gps = gps_sample;
+                            f.gps = gps_sample; // 新帧 ✓（stale=false ✓）
                         } else if gps_stale > GPS_VALID_STEPS {
-                            f.gps = None;
+                            f.gps = None; // 超时 ⇒ 真丢失 ✓
+                        } else {
+                            // ★保持旧样本时【打 stale 标记】✓（2026-09-23，§5.33 ✓）
+                            //   FDIR 仍需看到"有 GPS"✓；但估计器【不得重复融合】同一量测 ✗
+                            //   （历史缺陷：保持样本被每拍融合 ⇒ ~12× 重复 ⇒ 权重失衡 ✗）
+                            f.gps = f.gps.map(|g| g.mark_stale());
                         }
                         f.mag = if mag_ok { Some(mag_sample) } else { None };
                         f.rc = rc_input;

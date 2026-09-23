@@ -259,16 +259,27 @@ pub struct ImuSample {
 pub struct PosSample {
     pub pos: [Meter; 3],                       // NED 位置
     pub vel: Option<[MeterPerSecond; 3]>,      // 可选 Doppler 速度（NED）
+    /// ★**是否为保持的旧样本**（2026-09-23，§5.33 ✓）：
+    /// 固件为喂 FDIR 会"保持最近有效样本"✗ ⇒ 若照常融合，同一量测会被
+    /// **每拍重复融合**（250Hz vs 真实 20Hz ⇒ 权重被放大 ~12× ✗，算法缺陷 ✓）。
+    /// ⇒ 标记 stale ⇒ `step_hil` **跳过融合** ✓ 但仍让 FDIR 看到"有 GPS"✓。
+    pub stale: bool,
 }
 
 impl PosSample {
     /// 仅位置观测（默认，零回归）。
     pub fn pos_only(pos: [Meter; 3]) -> Self {
-        PosSample { pos, vel: None }
+        PosSample { pos, vel: None, stale: false }
     }
+    /// ★标记为"保持的旧样本"✓（`step_hil` 将跳过融合 ✓，FDIR 仍可见 ✓）
+    pub fn mark_stale(mut self) -> Self {
+        self.stale = true;
+        self
+    }
+
     /// 位置 + Doppler 速度观测。
     pub fn with_vel(pos: [Meter; 3], vel: [MeterPerSecond; 3]) -> Self {
-        PosSample { pos, vel: Some(vel) }
+        PosSample { pos, vel: Some(vel), stale: false }
     }
 }
 
