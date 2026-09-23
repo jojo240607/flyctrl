@@ -989,17 +989,23 @@ impl Eskf {
             }
             let mut e = ErrorState::default();
             e.d_mag_i[i] = ph[idx] / s_ * resid;
-            let mut newp = [[0.0f32; N]; N];
+            // ★去 N³（同型缺陷 ✗）：此处 `h` 是【单位向量】（只打在行 idx 上 ✓）
+            //   ⇒ (h·P)[bb] = Σ_m h[m]·P[m][bb] = **P[idx][bb]** ✓（无需相乘 ✓）
+            //   ⇒ 先【快照该行】✗ 再做外积 ⇒ **N² 而非 N³** ✓（每拍 3 分量省 ~2.8 万乘加 ✓）
+            let row = self.p[idx];
+            let ka_all: [f32; N] = {
+                let mut v = [0.0f32; N];
+                for aa in 0..N {
+                    v[aa] = ph[aa] / s_;
+                }
+                v
+            };
             for aa in 0..N {
+                let ka = ka_all[aa];
                 for bb in 0..N {
-                    let mut acc = self.p[aa][bb];
-                    for m in 0..N {
-                        acc -= ph[aa] / s_ * h[m] * self.p[m][bb];
-                    }
-                    newp[aa][bb] = acc;
+                    self.p[aa][bb] -= ka * row[bb];
                 }
             }
-            // （已就地更新 ✓，无需 newp ✓）
             self.apply(&e);
             applied += 1;
         }
