@@ -120,7 +120,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
     //   给出 **4.000ms 精确**节拍（84MHz 时钟域 ⇒ 不受 1ms 系统 tick 网格限制 ✗）；
     //   初始化失败则**回退** delay_until（反静默降级 ✓）。HIL 仍由 HIL_EVT 事件驱动 ✓。
     #[cfg(not(feature = "hil"))]
-    let paced = crate::flyctrl::pace::init();
+    let paced = crate::flyctrl::pace::control::init();
     #[cfg(not(feature = "hil"))]
     info!(tag: "ctrl", "pace: {}", if paced { "timer3/TIM7 4.000ms 精确节拍 ✓" } else { "回退 delay_until(4 tick) ✗" });
     loop {
@@ -460,7 +460,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         unsafe { crate::flyctrl::CTRL_PHASE = 4; }
         #[cfg(not(feature = "hil"))]
         if paced {
-            crate::flyctrl::pace::wait_tick();   // ★硬件定时器节拍：4.000ms 精确 ✓
+            crate::flyctrl::pace::control::wait_tick();   // ★硬件定时器节拍：4.000ms 精确 ✓
         } else {
             delay_until(&mut wake_tick, CONTROL_PERIOD_TICKS);
         }
