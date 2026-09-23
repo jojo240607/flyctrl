@@ -188,7 +188,7 @@ impl Estimator for EskfEstimator {
         // 3) GPS 位置/速度 ✓
         let gps_on = unsafe {
             core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_GPS_ON))
-        } >= 0.5;
+        } != 2.0; // ★0 = 默认开 ✓（裸 bin 的 .data 初值不生效 ✗）
         if let Some(p) = pos.filter(|_| gps_on) {
             let pm = [p.pos[0].0, p.pos[1].0, p.pos[2].0];
             crate::perf::probe(11); // ESKF: GPS 位置更新前

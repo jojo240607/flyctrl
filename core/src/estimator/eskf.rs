@@ -79,6 +79,12 @@ pub static mut ESKF_LAST_REJ: [f32; 4] = [0.0; 4];
 /// ★最近一次**成功**更新的诊断 ✓（同布局 ✓）
 #[used]
 pub static mut ESKF_LAST_OK: [f32; 4] = [0.0; 4];
+/// ★重力辅助三分支计数 `[退化, 门关, 应用]` ✓（定位"哪一支在拒"✓）
+#[used]
+pub static mut ESKF_GRAV_BRANCH: [f32; 3] = [0.0; 3];
+/// ★最近一次的 `dev/gn`（加速度门输入 ✓）
+#[used]
+pub static mut ESKF_LAST_DEV: [f32; 2] = [0.0; 2];
 /// ★**消融开关**：气压融合 ✓（`Eskf::update_baro` 内检查 ✓）
 pub static mut G_ESKF_BARO_ON: f32 = 1.0;
 /// ★**整定旋钮**：姿态过程噪声倍率（`q[I_ATT] *= G_ESKF_Q_ATT` ✓）。默认 1.0。
@@ -765,7 +771,7 @@ impl Eskf {
 
     /// 气压高度（标量 ✓，h = −d ✓ 已数值验证 ✓）
     pub fn update_baro(&mut self, alt: f32) -> Result<f32, &'static str> {
-        if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_BARO_ON)) } < 0.5 {
+        if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_BARO_ON)) } == 2.0 {
             return Err("气压：消融开关关闭 ✓（诊断用，非静默 ✗）");
         }
         let mut h = [0.0f32; N];
@@ -808,13 +814,16 @@ impl Eskf {
     /// · ★**加速度门控**：`|a_world − (−g_ned)|` 超过阈值 ⇒ 拒绝 ✓（照 line 61 的语义 ✓）
     /// · 逐分量顺序融合 ✓（与磁同法 ✓）· 新息门控用 `self.gate` ✓
     pub fn update_gravity(&mut self, accel_body: [f32; 3], g_ned: [f32; 3]) -> Result<u32, &'static str> {
-        if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_GRAV_ON)) } < 0.5 {
+        // ★★**0 = 默认开** ✓（固件裸 bin 加载 ⇒ `.data` 初值不生效 ⇒ 旋钮读到 0 ✗）
+        //   显式关闭用 **2.0** ✓（2026-09-23，§5.52 ✓）—— 否则诊断开关会把观测全关 ✗
+        if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_GRAV_ON)) } == 2.0 {
             return Err("重力辅助：对照臂【旋钮关闭】✓（实验用，非静默 ✗）");
         }
         let an = crate::math::sqrt(
             accel_body[0] * accel_body[0] + accel_body[1] * accel_body[1] + accel_body[2] * accel_body[2],
         );
         if an < 1e-3 {
+            unsafe { ESKF_GRAV_BRANCH[0] += 1.0; }
             return Err("重力辅助：比力退化（失重）⇒ 拒绝 ✓");
         }
         // ★加速度门控（参照 line 61 的语义 ✓）：静止时比力 = −g_ned ✓
@@ -823,7 +832,12 @@ impl Eskf {
         let dev = crate::math::sqrt(
             { let d0=a_world[0]+g_ned[0]; let d1=a_world[1]+g_ned[1]; let d2=a_world[2]+g_ned[2]; d0*d0+d1*d1+d2*d2 },
         );
+        unsafe {
+            ESKF_LAST_DEV[0] = dev;
+            ESKF_LAST_DEV[1] = dev / gn;
+        }
         if dev > 0.25 * gn {
+            unsafe { ESKF_GRAV_BRANCH[1] += 1.0; }
             return Err("重力辅助：总加速度过大 ⇒ 关闭 ✓（照参照 ✓）");
         }
         let meas = [accel_body[0] / an, accel_body[1] / an, accel_body[2] / an];
@@ -972,7 +986,7 @@ impl Eskf {
     }
 
     pub fn update_mag(&mut self, meas_body: [f32; 3]) -> Result<f32, &'static str> {
-        if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_ON)) } < 0.5 {
+        if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_ON)) } == 2.0 {
             return Err("磁量测：对照臂【旋钮关闭】✓（实验用，非静默 ✗）");
         }
         let mut worst = 0.0f32;
