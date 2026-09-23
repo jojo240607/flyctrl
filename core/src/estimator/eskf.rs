@@ -469,7 +469,34 @@ pub fn update_vec3(
     }
     let nis_sigma = crate::math::sqrt(nis);
     if nis_sigma > gate_sigma {
+        // ★记录被拒现场（3 DOF ✓）：最大 residual 分量 · ||ν|| · NIS ✓
+        unsafe {
+            let d = core::ptr::addr_of_mut!(ESKF_LAST_REJ);
+            let mut mx = 0.0f32;
+            let mut nv = 0.0f32;
+            for a in 0..3 {
+                if residual[a].abs() > mx.abs() { mx = residual[a]; }
+                nv += residual[a] * residual[a];
+            }
+            (*d)[0] = mx;
+            (*d)[1] = crate::math::sqrt(nv);
+            (*d)[2] = nis_sigma;
+            (*d)[3] += 1.0;
+        }
         return Err("C1: 新息超门限 ⇒ 拒绝该量测 ✓（P 与状态保持不变 ✓）");
+    }
+    unsafe {
+        let d = core::ptr::addr_of_mut!(ESKF_LAST_OK);
+        let mut mx = 0.0f32;
+        let mut nv = 0.0f32;
+        for a in 0..3 {
+            if residual[a].abs() > mx.abs() { mx = residual[a]; }
+            nv += residual[a] * residual[a];
+        }
+        (*d)[0] = mx;
+        (*d)[1] = crate::math::sqrt(nv);
+        (*d)[2] = nis_sigma;
+        (*d)[3] += 1.0;
     }
     // K = PHᵀ·S⁻¹（15×3）
     let mut k = [[0.0f32; 3]; N];
