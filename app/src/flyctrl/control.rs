@@ -199,6 +199,8 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         // HIL：设定点直接来自 PC 仿真器（SET_POSITION_TARGET_LOCAL_NED），RC 路径编译期关闭。
         // 设定点在共享单步**之前**构造：非 HIL 高度基准 / HIL 回退定高均用上一拍估计
         // `last_est`（EKF 位置 4ms 内变化远小于 1mm，与"本拍估计后构造"等价）。
+        // ★分段探针：读帧【已完成】、设定点构造开始 ✓（把 0→1 一分为二 ✓，§5.88）
+        unsafe { crate::flyctrl::CTRL_PHASE = 5; }
         let (setpoint, setpoint_valid) = {
             #[cfg(feature = "hil")]
             {
