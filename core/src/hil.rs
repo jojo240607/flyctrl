@@ -421,7 +421,9 @@ where
                 self.baro_ref = alt;
                 self.baro_locked = true;
             }
+            crate::perf::probe(26); // step_hil: 气压更新前
             self.est.update_alt(alt - self.baro_ref);
+            crate::perf::probe(27); // step_hil: 气压更新后
         }
         // VIO/RTK 多源融合（P3-B1）：与 `HilContext::step` 旧路径保持一致——SIL 注入
         // 模拟 VIO/RTK 观测（含噪声），MCU HIL 无此通道则传 None（`update_vio`/
@@ -430,6 +432,7 @@ where
         self.est.update_vio(vio);
         self.est.update_rtk(rtk);
         // 磁力计航向锚定（EKF yaw 观测；None 时无动作，其他估计器默认 no-op）。
+        crate::perf::probe(28); // step_hil: 磁更新前
         self.est.update_mag(mag);
         probe(4); // 外部观测（baro/vio/rtk/mag）注入完成
 

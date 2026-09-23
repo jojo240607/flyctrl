@@ -152,6 +152,7 @@ impl Estimator for EskfEstimator {
         // 3) GPS 位置/速度 ✓
         if let Some(p) = pos {
             let pm = [p.pos[0].0, p.pos[1].0, p.pos[2].0];
+            crate::perf::probe(22); // ESKF: GPS 位置更新前
             if self.f.update_gps_pos(pm).is_ok() {
                 self.n_gps_pos = self.n_gps_pos.wrapping_add(1);
                 bump(5);
@@ -159,6 +160,7 @@ impl Estimator for EskfEstimator {
                 self.n_gps_pos_rejected = self.n_gps_pos_rejected.wrapping_add(1);
                 bump(6);
             }
+            crate::perf::probe(23); // ESKF: GPS 位置更新后
             if let Some(v) = p.vel {
                 let vm = [v[0].0, v[1].0, v[2].0];
                 if self.f.update_gps_vel(vm).is_ok() {
@@ -171,12 +173,14 @@ impl Estimator for EskfEstimator {
             }
         }
 
+        crate::perf::probe(24); // ESKF: GPS 速度更新后
         // 4) 空速：C1 **无等价观测** ✗ ⇒ 显式拒绝 + 计数 ✓（绝不静默 ✗）
         if airspeed.is_some() {
             self.n_airspeed_refused = self.n_airspeed_refused.wrapping_add(1);
         }
 
-        crate::perf::probe(21); // ESKF: 其余观测/组装完成
+        crate::perf::probe(25); // ESKF: 空速检查后
+        crate::perf::probe(29); // ESKF: state() 组装前（单调 ✓：18→19→20→22..25→29）
         self.state()
     }
 
