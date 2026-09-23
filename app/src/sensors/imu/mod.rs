@@ -7,4 +7,4 @@ pub mod bmi088;
 pub mod mpu6050;
 
 pub use bmi088::ImuBmi088;
-pub use mpu6050::ImuMpu6050;
+pub use mpu6050::ImuMpu6050; // ⚠️ 旧型号驱动（保留备用 ✓）；**现役实机为 ImuBmi088** ✓

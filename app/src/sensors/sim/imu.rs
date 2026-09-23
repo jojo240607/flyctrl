@@ -1,6 +1,6 @@
 //! 虚拟 IMU 驱动：从全局 `PLAYBACK` 读取回放数据集，伪装成真实 IMU（accel+gyro）。
 //!
-//! 与 `imu::mpu6050::ImuMpu6050` 实现同一 `ImuSensor` trait，使 `sensors_task`
+//! 与真实驱动（现为 `imu::bmi088::ImuBmi088` ✓）实现同一 `ImuSensor` trait，使 `sensors_task`
 //! 只需切换数据源即可，无需改动采集逻辑。
 
 use flyctrl_core::hal::sensor::ImuSensor;

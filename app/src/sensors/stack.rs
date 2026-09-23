@@ -6,7 +6,7 @@
 //!
 //! 切换方式：编译期 `cfg(feature = "real-sensors")`。
 //! - 默认（不开启）：四路全部使用虚拟源（`VirtualImu` 等），无需外接硬件即可闭环调试。
-//! - 开启 `real-sensors` 后：四路自动替换为真实驱动（`ImuMpu6050` / `BaroBmp280` /
+//! - 开启 `real-sensors` 后：四路自动替换为真实驱动（**`ImuBmi088`** / `BaroBmp280` /
 //!   `GpsUblox` / `RcSbus`）。真实驱动读取失败时返回安全值并 `healthy()==false`，
 //!   由上层 FDIR 降级，无需改算法层。
 //!
@@ -75,7 +75,7 @@ impl SensorStack {
         #[cfg(feature = "real-sensors")]
         {
             // 探测/打开失败 → None（传感器缺失/断线），不 panic；health() 报 false
-            // 由 FDIR 降级（历史：ImuMpu6050 唤醒写 NACK 直接 expect panic，启动即崩）。
+            // 由 FDIR 降级（历史：旧 IMU 驱动唤醒写 NACK 直接 expect panic，启动即崩）。
             Self {
                 imu: crate::sensors::imu::ImuBmi088::new("bmi088"),
                 baro: crate::sensors::baro::BaroBmp280::new("i2c2", 0x76),

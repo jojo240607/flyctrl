@@ -23,6 +23,12 @@ use crate::vehicle::{
 ///  9 n_mag · 10 n_mag_rejected · 11 n_mag_reanchored
 #[used]
 pub static mut ESKF_COUNTS: [u32; 12] = [0; 12];
+/// ★**固件侧诊断快照** `[f32;16]` ✓（经 ELF 符号读 ✓；布局由本仓控制 ⇒ ABI 安全 ✓）
+/// `[0..3)` gyro · `[3..6)` accel · `[6..10)` q(w,x,y,z) · `[10..13)` bg · `[13]` gps.pos[2] · `[14]` gps.pos[0] · `[15]` 步数
+#[used]
+pub static mut ESKF_DIAG: [f32; 16] = [0.0; 16];
+/// 快照采样步（默认第 5 步 ⇒ 已过初始对齐 ✓）
+pub static mut ESKF_DIAG_AT: u32 = 5;
 
 /// 递增全局诊断计数（诊断用 ✓，不与实例计数冲突 ✓）
 #[inline]
@@ -133,6 +139,28 @@ impl Estimator for EskfEstimator {
         let gyr = [imu.gyro[0].0, imu.gyro[1].0, imu.gyro[2].0];
         let acc = [imu.accel[0].0, imu.accel[1].0, imu.accel[2].0];
         self.omega_body = gyr;
+        // ★诊断快照（采一次 ✓；`acc`/`gyr` 已在上方绑定 ✓）
+        {
+            // ★用【常量】比较 ✓ —— 不能用 `static = 5`：app 以裸 bin 加载 ⇒ `.data` 初值
+            //   可能未生效（实测 `ESKF_DIAG_AT` 实为 0 ⇒ 永不触发 ✗）
+            if self.n_step == 1500 { // ★采在 boot 之后（≈6s ✓）—— 第 5 步是 boot 瞬态 ✗
+                unsafe {
+                    let d = core::ptr::addr_of_mut!(ESKF_DIAG);
+                    for i in 0..3 {
+                        (*d)[i] = gyr[i];
+                        (*d)[3 + i] = acc[i];
+                        (*d)[10 + i] = self.f.st.bg[i];
+                    }
+                    (*d)[6] = self.f.st.q.w;
+                    (*d)[7] = self.f.st.q.x;
+                    (*d)[8] = self.f.st.q.y;
+                    (*d)[9] = self.f.st.q.z;
+                    (*d)[13] = if let Some(pp) = pos { pp.pos[2].0 } else { -999.0 };
+                    (*d)[14] = if let Some(pp) = pos { pp.pos[0].0 } else { -999.0 };
+                    (*d)[15] = self.n_step as f32;
+                }
+            }
+        }
 
         // 1) 标称态 + 协方差推进 ✓（速率×dt ✓）
         let d_ang = [gyr[0] * dtf, gyr[1] * dtf, gyr[2] * dtf];
