@@ -4,7 +4,11 @@
 //! 地址由 `joc-rtos-app-sdk/linker/app.ld` 的 `.app_hilprobe` 节钉死，测试侧常量直读。
 //! 分段号分配（跨模块唯一）：
 //! - `1..=7`：`hil.rs` 的 `step_hil` 外层分段
-//! - `8..=11`：`estimator/ekf.rs` 的 `EkfEstimator::step` 内部分段
+//! - `8..=11`：`estimator/ekf.rs` 的 `EkfEstimator::step` 内部分段（Legacy ✓）
+//! - **`8..=18`（现役 ✓）**：`estimator/eskf_estimator.rs` + `hil.rs` 的 **ESKF 分段** ✓
+//!   8 step 进入 · 9 predict 完 · 10 重力完 · 11 GPS位前 · 12 GPS位后 · 13 GPS速后
+//!   14 空速后 · 15 state 前 · 16 气压前 · 17 气压后 · 18 磁前 ✓
+//!   ★**必须连续编号** ✓（Legacy 用 8..11 ✓；照其方式 ✓），且每个 id 一拍内只出现一次 ✓
 //!
 //! 写探针的开销是两次 32 位存 + 一次比较，相对被测分段（数十微秒以上）可忽略。
 

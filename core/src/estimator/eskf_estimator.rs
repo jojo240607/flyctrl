@@ -137,9 +137,9 @@ impl Estimator for EskfEstimator {
         // 1) 标称态 + 协方差推进 ✓（速率×dt ✓）
         let d_ang = [gyr[0] * dtf, gyr[1] * dtf, gyr[2] * dtf];
         let d_vel = [acc[0] * dtf, acc[1] * dtf, acc[2] * dtf];
-        crate::perf::probe(18); // ESKF: step 进入
+        crate::perf::probe(8); // ESKF: step 进入
         self.f.predict(d_ang, d_vel, dtf, self.g_ned);
-        crate::perf::probe(19); // ESKF: predict 完成
+        crate::perf::probe(9); // ESKF: predict 完成
 
         // 2) 重力辅助 ✓（= C1 版的"重力锚定" ✓；机制门在 C1 内部 ✓）
         match self.f.update_gravity(acc, self.g_ned) {
@@ -148,14 +148,14 @@ impl Estimator for EskfEstimator {
             Err(_) => { self.n_grav_gated = self.n_grav_gated.wrapping_add(1); bump(2); } // ★门关闭 ✓
         }
 
-        crate::perf::probe(20); // ESKF: 重力辅助完成
+        crate::perf::probe(10); // ESKF: 重力辅助完成
         // 3) GPS 位置/速度 ✓
         let gps_on = unsafe {
             core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_GPS_ON))
         } >= 0.5;
         if let Some(p) = pos.filter(|_| gps_on) {
             let pm = [p.pos[0].0, p.pos[1].0, p.pos[2].0];
-            crate::perf::probe(22); // ESKF: GPS 位置更新前
+            crate::perf::probe(11); // ESKF: GPS 位置更新前
             if self.f.update_gps_pos(pm).is_ok() {
                 self.n_gps_pos = self.n_gps_pos.wrapping_add(1);
                 bump(5);
@@ -163,7 +163,7 @@ impl Estimator for EskfEstimator {
                 self.n_gps_pos_rejected = self.n_gps_pos_rejected.wrapping_add(1);
                 bump(6);
             }
-            crate::perf::probe(23); // ESKF: GPS 位置更新后
+            crate::perf::probe(12); // ESKF: GPS 位置更新后
             if let Some(v) = p.vel {
                 let vm = [v[0].0, v[1].0, v[2].0];
                 if self.f.update_gps_vel(vm).is_ok() {
@@ -176,14 +176,14 @@ impl Estimator for EskfEstimator {
             }
         }
 
-        crate::perf::probe(24); // ESKF: GPS 速度更新后
+        crate::perf::probe(13); // ESKF: GPS 速度更新后
         // 4) 空速：C1 **无等价观测** ✗ ⇒ 显式拒绝 + 计数 ✓（绝不静默 ✗）
         if airspeed.is_some() {
             self.n_airspeed_refused = self.n_airspeed_refused.wrapping_add(1);
         }
 
-        crate::perf::probe(25); // ESKF: 空速检查后
-        crate::perf::probe(29); // ESKF: state() 组装前（单调 ✓：18→19→20→22..25→29）
+        crate::perf::probe(14); // ESKF: 空速检查后
+        crate::perf::probe(15); // ESKF: state() 组装前（单调 ✓：18→19→20→22..25→29）
         self.state()
     }
 
