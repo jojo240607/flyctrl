@@ -14,6 +14,26 @@ use crate::vehicle::{
     AirspeedSample, ImuSample, PosSample, Quaternion, RtkSample, VehicleState, VioSample,
 };
 
+/// ★★★**全局诊断计数**（供 M 场经 ELF 符号读取 ✓ —— 回答"固件上 ESKF 实际收到了
+/// 哪些观测、各多少次" ✗✓，即"先证明机制在运行"✓）。
+///
+/// 索引约定 ✓（与 `EskfEstimator` 的实例计数同义）：
+///  0 n_step · 1 n_grav_applied · 2 **n_grav_gated** · 3 n_baro · 4 n_baro_rejected
+///  5 n_gps_pos · 6 n_gps_pos_rejected · 7 n_gps_vel · 8 n_gps_vel_rejected
+///  9 n_mag · 10 n_mag_rejected · 11 n_mag_reanchored
+#[used]
+pub static mut ESKF_COUNTS: [u32; 12] = [0; 12];
+
+/// 递增全局诊断计数（诊断用 ✓，不与实例计数冲突 ✓）
+#[inline]
+fn bump(idx: usize) {
+    unsafe {
+        let p = core::ptr::addr_of_mut!(ESKF_COUNTS);
+        let cur = core::ptr::read_volatile((*p).as_ptr().add(idx));
+        core::ptr::write_volatile((*p).as_mut_ptr().add(idx), cur.wrapping_add(1));
+    }
+}
+
 /// C1 适配器：把 [`Eskf`] 包成统一 [`Estimator`] ✓。
 pub struct EskfEstimator {
     f: Eskf,
@@ -108,6 +128,7 @@ impl Estimator for EskfEstimator {
     ) -> VehicleState {
         let dtf = dt.0;
         self.n_step = self.n_step.wrapping_add(1);
+        bump(0);
 
         let gyr = [imu.gyro[0].0, imu.gyro[1].0, imu.gyro[2].0];
         let acc = [imu.accel[0].0, imu.accel[1].0, imu.accel[2].0];
@@ -120,9 +141,9 @@ impl Estimator for EskfEstimator {
 
         // 2) 重力辅助 ✓（= C1 版的"重力锚定" ✓；机制门在 C1 内部 ✓）
         match self.f.update_gravity(acc, self.g_ned) {
-            Ok(n) if n > 0 => self.n_grav_applied = self.n_grav_applied.wrapping_add(1),
+            Ok(n) if n > 0 => { self.n_grav_applied = self.n_grav_applied.wrapping_add(1); bump(1); }
             Ok(_) => {}
-            Err(_) => self.n_grav_gated = self.n_grav_gated.wrapping_add(1), // ★门关闭 ✓
+            Err(_) => { self.n_grav_gated = self.n_grav_gated.wrapping_add(1); bump(2); } // ★门关闭 ✓
         }
 
         // 3) GPS 位置/速度 ✓
@@ -130,15 +151,19 @@ impl Estimator for EskfEstimator {
             let pm = [p.pos[0].0, p.pos[1].0, p.pos[2].0];
             if self.f.update_gps_pos(pm).is_ok() {
                 self.n_gps_pos = self.n_gps_pos.wrapping_add(1);
+                bump(5);
             } else {
                 self.n_gps_pos_rejected = self.n_gps_pos_rejected.wrapping_add(1);
+                bump(6);
             }
             if let Some(v) = p.vel {
                 let vm = [v[0].0, v[1].0, v[2].0];
                 if self.f.update_gps_vel(vm).is_ok() {
                     self.n_gps_vel = self.n_gps_vel.wrapping_add(1);
+                    bump(7);
                 } else {
                     self.n_gps_vel_rejected = self.n_gps_vel_rejected.wrapping_add(1);
+                    bump(8);
                 }
             }
         }
@@ -154,8 +179,10 @@ impl Estimator for EskfEstimator {
     fn update_alt(&mut self, alt: f32) {
         if self.f.update_baro(alt).is_ok() {
             self.n_baro = self.n_baro.wrapping_add(1);
+            bump(3);
         } else {
             self.n_baro_rejected = self.n_baro_rejected.wrapping_add(1);
+            bump(4);
         }
     }
 
@@ -175,8 +202,8 @@ impl Estimator for EskfEstimator {
             self.n_mag_reanchored = self.n_mag_reanchored.wrapping_add(n);
         }
         match self.f.update_mag(m) {
-            Ok(_) => self.n_mag = self.n_mag.wrapping_add(1),
-            Err(_) => self.n_mag_rejected = self.n_mag_rejected.wrapping_add(1),
+            Ok(_) => { self.n_mag = self.n_mag.wrapping_add(1); bump(9); }
+            Err(_) => { self.n_mag_rejected = self.n_mag_rejected.wrapping_add(1); bump(10); }
         }
     }
 
