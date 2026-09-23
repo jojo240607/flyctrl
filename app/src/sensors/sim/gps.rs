@@ -11,6 +11,9 @@ use crate::sensors::sim::dataset::{
     Frame, GPS_ORIGIN, METERS_PER_DEG_LAT, METERS_PER_DEG_LON, PLAYBACK,
 };
 
+/// ★GPS 高度基准（懒初始化 = 首个帧的高度 ✓）—— 使垂直与气压/发射点同基准 ✓
+static mut ALT_ORIGIN: f32 = 0.0;
+
 pub struct VirtualGps;
 
 impl VirtualGps {
@@ -29,10 +32,20 @@ impl GpsSensor for VirtualGps {
         // 相对起点的局部 NED（米）：经纬度差 × 米/度近似。
         let north = (lat - GPS_ORIGIN.0) * METERS_PER_DEG_LAT;
         let east = (lon - GPS_ORIGIN.1) * METERS_PER_DEG_LON;
+        // ★垂直也取【相对起点】✓（2026-09-23，§5.46 ✓）—— 与上面两行的水平处理自洽 ✓
+        //   原实现用【绝对】`-alt` ✗ ⇒ 与气压的 `update_alt(alt − baro_ref)`（相对 ✓）
+        //   相差约 10.5m ⇒ 滤波在垂直方向被对拉 ⇒ 高度偏差 4.665m ✗（实测 ✓）
+        //   基准取【首个 GPS 帧的高度】✓（懒初始化 ⇒ 不依赖 .data 初值 ✓）
+        unsafe {
+            if ALT_ORIGIN == 0.0 {
+                ALT_ORIGIN = alt;
+            }
+        }
+        let z_rel = unsafe { ALT_ORIGIN } - alt; // NED：向上为负，且发射点处 ≈ 0 ✓
         Some(PosSample::pos_only([
             Meter(north),
             Meter(east),
-            Meter(-alt), // NED：高度向上为负 z
+            Meter(z_rel),
         ]))
     }
 
