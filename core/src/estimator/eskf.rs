@@ -171,41 +171,42 @@ pub type Cov = [[f32; N]; N];
 /// **可以实现的理由**：F 已 5/5 块数值/参照双证通过 ✓（§12.5–§12.8）。
 /// 实现纪律：先用**不变量**自检（对称性 / F=I 时退化为 P+Q ✓），再谈精度 ✓。
 pub fn predict_covariance(p: &Cov, f: &[[f32; N]; N], q: &Cov) -> Cov {
-    // ★**稀疏 + 对称优化**（2026-09-23，§5.30 ✓）——原为两次朴素三重循环（2·N³=18522 次 ✓）
-    //
-    // 依据 ✓（`transition_matrix` 的结构）：
-    //  · F **高度稀疏**：磁状态（mag_I/mag_B）只出现在自己的行（对角 ✓）；
-    //    姿态/速度/位置/零偏之间只有少数耦合块 ✓ ⇒ 大量 f[i][k]==0 ✓
-    //  · 结果 P' = F·P·Fᵀ **必然对称** ✓ ⇒ 第二重只需算上三角再镜像 ✓
-    // ⇒ 语义与数值**完全不变** ✓（只是跳过零项/镜像对称项 ✓）
-    // FP = F·P
-    let mut fp = [[0.0f32; N]; N];
+    // ★★**G = F − I 分解**（2026-09-23，§5.31 ✓）——经典 INS 技巧 ✓，数学恒等 ✗：
+    //     P' = F·P·Fᵀ + Q = (I+G)·P·(I+G)ᵀ + Q
+    //        = P + G·P + (G·P)ᵀ + G·(G·P)ᵀ + Q        （P 对称 ✓）
+    // 为何快 ✓：F 里绝大多数非零其实是【对角 1】（状态自身延续 ✓），而 **G = F−I 极稀疏** ✓
+    //   ⇒ 两个 G·X 乘法各只需 O(nnz(G)·N) ✓，远小于 N³=9261 ✓
+    //   ⇒ G·(G·P)ᵀ 为二阶小项 ✓（nnz 小时可忽略）
+    // 数值等价 ✓（仅重排乘序 ✓）；由既有协方差数值对照测试守护 ✓。
+    let mut gp = [[0.0f32; N]; N]; // G·P
     for i in 0..N {
         for k in 0..N {
-            let fik = f[i][k];
-            if fik == 0.0 {
-                continue; // ★跳过零（稀疏 ✓）
+            let g = if i == k { f[i][k] - 1.0 } else { f[i][k] };
+            if g == 0.0 {
+                continue; // ★跳过零（G 极稀疏 ✓）
             }
             for j in 0..N {
-                fp[i][j] += fik * p[k][j];
+                gp[i][j] += g * p[k][j];
             }
         }
     }
-    // P' = FP·Fᵀ + Q（只算 j>=i，再镜像 ✓）
+    // G·(G·P)ᵀ
+    let mut gg = [[0.0f32; N]; N];
+    for i in 0..N {
+        for k in 0..N {
+            let g = if i == k { f[i][k] - 1.0 } else { f[i][k] };
+            if g == 0.0 {
+                continue;
+            }
+            for j in 0..N {
+                gg[i][j] += g * gp[j][k]; // (GP)ᵀ[k][j] = gp[j][k] ✓
+            }
+        }
+    }
     let mut out = [[0.0f32; N]; N];
     for i in 0..N {
-        for j in i..N {
-            let mut s = 0.0f32;
-            for k in 0..N {
-                let fjk = f[j][k];
-                if fjk == 0.0 {
-                    continue; // ★跳过零 ✓
-                }
-                s += fp[i][k] * fjk;
-            }
-            let v = s + q[i][j];
-            out[i][j] = v;
-            out[j][i] = v; // ★对称镜像 ✓
+        for j in 0..N {
+            out[i][j] = p[i][j] + gp[i][j] + gp[j][i] + gg[i][j] + q[i][j];
         }
     }
     out
