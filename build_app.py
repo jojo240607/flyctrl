@@ -64,9 +64,27 @@ def main():
     run(["arm-none-eabi-objcopy", "-O", "binary", app_elf, args.out])
     sz = os.path.getsize(args.out)
     print(f"[OK] app.bin 产出: {args.out} ({sz} bytes, 须 < {APP_FLASH_BUDGET})")
+    sync_to_test_artifact(args.out, app_elf)
     if sz > APP_FLASH_BUDGET:
         print(f"[ERR] App 镜像超过 APP_FLASH {APP_FLASH_BUDGET // 1024}K 预算", file=sys.stderr)
         sys.exit(1)
+
+def sync_to_test_artifact(out: str, app_elf: str) -> None:
+    """★把构建产物同步到【M 场实际加载的路径】✓（`mcu_simulater/src/artifact.rs:143`）。
+
+    为何 ✓：M 场加载的是 `/tmp/flyctrl_real.bin`（或 `flyctrl/app_real.bin`）✗，
+    而不是 `app.bin` ✗ —— 曾因此出现"重建了固件、M 场却仍在测旧货"✗✓（§5.29 教训 ✓）。
+    ⇒ 统一构建脚本负责保证【输出文件名/路径一致】✓，避免再踩 ✗。
+    """
+    dsts = ["/tmp/flyctrl_real.bin",
+            os.path.join(os.path.dirname(app_elf), "app_real.bin")]
+    for dst in dsts:
+        try:
+            shutil.copyfile(out, dst)
+            print(f"[SYNC] {dst} ({os.path.getsize(dst)} bytes) ✓")
+        except OSError as e:  # 只读/权限等 ⇒ 明确告警，不静默 ✗
+            print(f"[WARN] 同步到 {dst} 失败：{e}", file=sys.stderr)
+
 
 if __name__ == "__main__":
     main()
