@@ -143,7 +143,7 @@ impl Estimator for EskfEstimator {
         {
             // ★用【常量】比较 ✓ —— 不能用 `static = 5`：app 以裸 bin 加载 ⇒ `.data` 初值
             //   可能未生效（实测 `ESKF_DIAG_AT` 实为 0 ⇒ 永不触发 ✗）
-            if self.n_step == 1500 { // ★采在 boot 之后（≈6s ✓）—— 第 5 步是 boot 瞬态 ✗
+            if self.n_step == 10 { // ★采在【估计器第 10 次调用】—— 抓最早的分歧 ✓
                 unsafe {
                     let d = core::ptr::addr_of_mut!(ESKF_DIAG);
                     for i in 0..3 {
