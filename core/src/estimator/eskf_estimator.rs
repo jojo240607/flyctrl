@@ -26,7 +26,7 @@ pub static mut ESKF_COUNTS: [u32; 12] = [0; 12];
 /// ★**固件侧诊断快照** `[f32;16]` ✓（经 ELF 符号读 ✓；布局由本仓控制 ⇒ ABI 安全 ✓）
 /// `[0..3)` gyro · `[3..6)` accel · `[6..10)` q(w,x,y,z) · `[10..13)` bg · `[13]` gps.pos[2] · `[14]` gps.pos[0] · `[15]` 步数
 #[used]
-pub static mut ESKF_DIAG: [f32; 16] = [0.0; 16];
+pub static mut ESKF_DIAG: [f32; 64] = [0.0; 64]; // 4 槽 × 16 ✓（槽 k ⇒ [16k, 16k+16) ✓）
 /// 快照采样步（默认第 5 步 ⇒ 已过初始对齐 ✓）
 pub static mut ESKF_DIAG_AT: u32 = 5;
 
@@ -143,21 +143,29 @@ impl Estimator for EskfEstimator {
         {
             // ★用【常量】比较 ✓ —— 不能用 `static = 5`：app 以裸 bin 加载 ⇒ `.data` 初值
             //   可能未生效（实测 `ESKF_DIAG_AT` 实为 0 ⇒ 永不触发 ✗）
-            if self.n_step == 10 { // ★采在【估计器第 10 次调用】—— 抓最早的分歧 ✓
+            // ★4 个时刻各采一次 ✓（常量 ✓；用于分清"瞬态 vs 稳态偏差" ✓）
+            let slot: usize = match self.n_step {
+                10 => 0,
+                300 => 1,
+                800 => 2,
+                1500 => 3,
+                _ => usize::MAX,
+            };
+            if slot != usize::MAX {
                 unsafe {
                     let d = core::ptr::addr_of_mut!(ESKF_DIAG);
                     for i in 0..3 {
-                        (*d)[i] = gyr[i];
-                        (*d)[3 + i] = acc[i];
-                        (*d)[10 + i] = self.f.st.bg[i];
+                        (*d)[slot * 16 + i] = gyr[i];
+                        (*d)[slot * 16 + 3 + i] = acc[i];
+                        (*d)[slot * 16 + 10 + i] = self.f.st.bg[i];
                     }
-                    (*d)[6] = self.f.st.q.w;
-                    (*d)[7] = self.f.st.q.x;
-                    (*d)[8] = self.f.st.q.y;
-                    (*d)[9] = self.f.st.q.z;
-                    (*d)[13] = if let Some(pp) = pos { pp.pos[2].0 } else { -999.0 };
-                    (*d)[14] = if let Some(pp) = pos { pp.pos[0].0 } else { -999.0 };
-                    (*d)[15] = self.n_step as f32;
+                    (*d)[slot * 16 + 6] = self.f.st.q.w;
+                    (*d)[slot * 16 + 7] = self.f.st.q.x;
+                    (*d)[slot * 16 + 8] = self.f.st.q.y;
+                    (*d)[slot * 16 + 9] = self.f.st.q.z;
+                    (*d)[slot * 16 + 13] = if let Some(pp) = pos { pp.pos[2].0 } else { -999.0 };
+                    (*d)[slot * 16 + 14] = if let Some(pp) = pos { pp.pos[0].0 } else { -999.0 };
+                    (*d)[slot * 16 + 15] = self.n_step as f32;
                 }
             }
         }
