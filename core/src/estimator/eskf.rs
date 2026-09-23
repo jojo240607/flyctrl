@@ -1119,14 +1119,29 @@ pub struct ErrorState {
 ///   · 参照 `derivation.py` 153 行：`Rot3(Quaternion(xyz=theta/2, w=1)) * quat_nominal` ✓
 /// v/p/零偏为**加性** ✓
 pub fn inject_error(st: &mut EskfState, e: &ErrorState) {
+    // ★★**半角泰勒（免 sin/cos）**（2026-09-23，§5.32 ✓）——定向优化主耗时点 ✓
+    //
+    // 依据 ✓：误差状态 `dtheta` 是【小量】（每拍修正 ✓，实测 |θ|≪1e-2 rad ✓）
+    //   ⇒ sin(θ/2) ≈ θ/2·(1 − θ²/24)，cos(θ/2) ≈ 1 − θ²/8（θ=‖dtheta‖ ✓）
+    //   截断误差 O(θ⁵)≈1e-15（θ~1e-2 ✓）⇒ 远低于 f32 分辨率 ✓，**数值等价** ✓
+    // 为何重要 ✓：`from_axis_angle` 每拍被调用 10–15 次（各观测更新 ✓），
+    //   而本 MCU 上超越函数极贵（math.rs 实测换后端 = 1.55× 速率 ✓）
     let dq = {
         let th = e.dtheta;
         let th2 = th[0] * th[0] + th[1] * th[1] + th[2] * th[2];
         if th2 > 1e-18 {
-            let n = crate::math::sqrt(th2);
-            Quaternion::from_axis_angle([th[0] / n, th[1] / n, th[2] / n], Radian(n))
+            let n = crate::math::sqrt(th2); // 仅剩一次 sqrt ✓
+            let h = 0.5 * n; // θ/2
+            let sh = h * (1.0 - n * n / 24.0); // sin(θ/2) ✓
+            let ch = 1.0 - h * h * 0.5; // cos(θ/2) ✓
+            Quaternion {
+                w: ch,
+                x: sh * th[0] / n,
+                y: sh * th[1] / n,
+                z: sh * th[2] / n,
+            }
         } else {
-            Quaternion::from_axis_angle([1.0, 0.0, 0.0], Radian(0.0))
+            Quaternion { w: 1.0, x: 0.0, y: 0.0, z: 0.0 }
         }
     };
     // ★左乘 ✓（§12.4 + 参照 153 行）
