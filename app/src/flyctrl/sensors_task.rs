@@ -55,14 +55,13 @@ impl Sensors {
         let mut loop_cnt: u32 = 0;
         // 绝对节拍基准：周期恒为 sample_dt，不被 control 抢占"吸附"。
         let mut wake_tick = rtos_app_sdk::rtos::tick_count();
-        // ★节拍源（与控制系统同型，见 docs/c1-migration-plan.md §5.97）：硬件定时器
-        //   `timer5`/TIM9 ⇒ **2.000ms 精确** + **阻塞等待**（不忙等 ✗）+ 独立相位 ✓；
-        //   初始化失败则回退 delay_until（反静默降级 ✓）。
-        #[cfg(not(feature = "hil"))]
-        let paced = crate::flyctrl::pace::sensors::init();
-        #[cfg(not(feature = "hil"))]
-        info!(tag: "sensor", "pace: {}",
-              if paced { "timer5/TIM9 2.000ms 精确节拍 ✓" } else { "回退 delay_until(2 tick) ✗" });
+        // ★§5.118 回退（诚实登记 ✓）：传感器侧的硬件定时器节拍（timer5/TIM9 @500Hz）
+        //   在 M 场实测 **产出 0 帧** ✗ —— `init()` 报成功（设备 open + ioctl=0 ✓）
+        //   但 **TIM9(IRQ24) 中断从未到达** ✗ ⇒ `sem_wait()` 永久阻塞 ✗ ⇒ 传感器任务停摆
+        //   ⇒ 控制环吃陈旧样本 ⇒ 连带 x_env_faults 三项与多处时序窗失败 ✗（单一根 ✓）。
+        //   按"不留未经验证的改动"铁律 ⇒ **先回退到 delay_until** ✓（恢复现场 ✓）；
+        //   控制侧的 timer3/TIM7 节拍**已验证**（4.000ms/250.0Hz ✓）**保留** ✓。
+        //   TIM9/IRQ24 的中断交付问题另立条目排查 ✓（疑与 IRQ24 共享 TIM1_BRK 有关 ✓）。
         // GPS 样本保持：真实 GPS 20Hz 帧，两次帧之间 read_gps 返回 None；若每拍
         // 直接把 None 写进 SENSOR_FRAME，control(4ms) 只在 2ms Some 窗口内读到样本
         // （约一半拍），FDIR 的 pos_available 大面积 false → gps_lost_steps 累积
@@ -139,13 +138,6 @@ impl Sensors {
             }
             loop_cnt += 1;
 
-            #[cfg(not(feature = "hil"))]
-            if paced {
-                crate::flyctrl::pace::sensors::wait_tick();   // ★硬件定时器节拍：2.000ms 精确 ✓
-            } else {
-                rtos_app_sdk::rtos::delay_until(&mut wake_tick, (sample_dt * 1000.0) as u32);
-            }
-            #[cfg(feature = "hil")]
             rtos_app_sdk::rtos::delay_until(&mut wake_tick, (sample_dt * 1000.0) as u32);
         }
     }
