@@ -72,6 +72,13 @@ pub static mut G_ESKF_GRAV_ON: f32 = 1.0;
 pub static mut G_ESKF_MAG_ON: f32 = 1.0;
 /// ★**消融开关**（诊断用 ✓，默认 1.0 = 开）：GPS 位/速融合 ✓
 pub static mut G_ESKF_GPS_ON: f32 = 1.0;
+/// ★**被拒量测的诊断**（`[residual, sigma, nis, seq]` ✓）—— 记录【最近一次被拒】的新息 ✓
+/// 用途 ✓：一步区分"量纲/基准不符（新息巨大 ✗）"还是"门太紧（新息略超 ✗）"✓
+#[used]
+pub static mut ESKF_LAST_REJ: [f32; 4] = [0.0; 4];
+/// ★最近一次**成功**更新的诊断 ✓（同布局 ✓）
+#[used]
+pub static mut ESKF_LAST_OK: [f32; 4] = [0.0; 4];
 /// ★**消融开关**：气压融合 ✓（`Eskf::update_baro` 内检查 ✓）
 pub static mut G_ESKF_BARO_ON: f32 = 1.0;
 /// ★**整定旋钮**：姿态过程噪声倍率（`q[I_ATT] *= G_ESKF_Q_ATT` ✓）。默认 1.0。
@@ -248,7 +255,21 @@ pub fn update_scalar(
     }
     let nis_sigma = residual.abs() / crate::math::sqrt(s_);
     if nis_sigma > gate_sigma {
+        unsafe {
+            let d = core::ptr::addr_of_mut!(ESKF_LAST_REJ);
+            (*d)[0] = residual;
+            (*d)[1] = crate::math::sqrt(s_);
+            (*d)[2] = nis_sigma;
+            (*d)[3] += 1.0;
+        }
         return Err("C1: 新息超门限 ⇒ 拒绝该量测 ✓（P 与状态保持不变 ✓）");
+    }
+    unsafe {
+        let d = core::ptr::addr_of_mut!(ESKF_LAST_OK);
+        (*d)[0] = residual;
+        (*d)[1] = crate::math::sqrt(s_);
+        (*d)[2] = nis_sigma;
+        (*d)[3] += 1.0;
     }
     // K = P·hᵀ / S
     let k: [f32; N] = {
