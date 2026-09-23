@@ -403,13 +403,11 @@ where
         probe(2); // 姿态/位置初始化门控完成
 
         // 4) 状态估计（predict-then-correct；HIL 无空速通道 → airspeed=None）。
-        // ★只融合【新】GPS 样本 ✓（stale=保持样本 ⇒ 跳过 ✗，见 PosSample::stale ✓）
-        //   历史缺陷 ✗：保持样本被每拍融合 ⇒ 同一量测重复使用 ⇒ 权重放大 ~12× ✗
-        let gps_fresh = match &gps {
-            Some(g) if !g.stale => gps,
-            _ => None,
-        };
-        let est_state = self.est.step(self.dt, imu_sample, gps_fresh, None);
+        // ⚠️ 曾尝试"仅融合新鲜 GPS"（PosSample.stale ✓）—— **已回退** ✗：
+        //   该字段会让 `PosSample` 变大 ⇒ 破坏【固件↔宿主共享帧 ABI】（§5.39 ✓）。
+        //   现状：M 场虚拟 GPS 每拍皆为新鲜 ⇒ 本就不触发 ✓；真实"保持样本"场景的
+        //   重复融合问题**另行解决**（带外标记 / 测试侧按符号读 ✓，见 §5.39 待办 ✓）。
+        let est_state = self.est.step(self.dt, imu_sample, gps, None);
         probe(3); // EKF 预测+更新完成
         // 气压高度观测（垂直通道最紧锚）：在 step 之后注入（predict-then-correct），
         // 下一拍预测从修正后状态出发。此前 baro 只进 FDIR、垂直通道仅靠 GPS 锚定

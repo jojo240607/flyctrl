@@ -103,12 +103,10 @@ impl Sensors {
                             f.gps = gps_sample; // 新帧 ✓（stale=false ✓）
                         } else if gps_stale > GPS_VALID_STEPS {
                             f.gps = None; // 超时 ⇒ 真丢失 ✓
-                        } else {
-                            // ★保持旧样本时【打 stale 标记】✓（2026-09-23，§5.33 ✓）
-                            //   FDIR 仍需看到"有 GPS"✓；但估计器【不得重复融合】同一量测 ✗
-                            //   （历史缺陷：保持样本被每拍融合 ⇒ ~12× 重复 ⇒ 权重失衡 ✗）
-                            f.gps = f.gps.map(|g| g.mark_stale());
                         }
+                        // ⚠️ 曾在此给保持样本打 `stale` 标记 —— **已回退** ✗：
+                        //   该字段使 `PosSample` 变大 ⇒ 破坏【固件↔宿主共享帧 ABI】✗（§5.39 ✓）。
+                        //   修复方向见 §5.39：staleness 走【带外】或测试侧按符号读 ✓。
                         f.mag = if mag_ok { Some(mag_sample) } else { None };
                         f.rc = rc_input;
                         f.armed = rc_input.armed;

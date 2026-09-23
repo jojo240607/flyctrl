@@ -57,7 +57,6 @@ fn every_adapter_path_is_exercised() {
                 MeterPerSecond(0.0),
                 MeterPerSecond(0.0),
             ]),
-            stale: false,
         }),
         None,
     );
