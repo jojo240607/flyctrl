@@ -64,18 +64,30 @@ def main():
     run(["arm-none-eabi-objcopy", "-O", "binary", app_elf, args.out])
     sz = os.path.getsize(args.out)
     print(f"[OK] app.bin 产出: {args.out} ({sz} bytes, 须 < {APP_FLASH_BUDGET})")
-    sync_to_test_artifact(args.out, app_elf)
+    sync_to_test_artifact(args.out, app_elf, args.features)
     if sz > APP_FLASH_BUDGET:
         print(f"[ERR] App 镜像超过 APP_FLASH {APP_FLASH_BUDGET // 1024}K 预算", file=sys.stderr)
         sys.exit(1)
 
-def sync_to_test_artifact(out: str, app_elf: str) -> None:
+def sync_to_test_artifact(out: str, app_elf: str, features: str = "") -> None:
     """★把构建产物同步到【M 场实际加载的路径】✓（`mcu_simulater/src/artifact.rs:143`）。
 
-    为何 ✓：M 场加载的是 `/tmp/flyctrl_real.bin`（或 `flyctrl/app_real.bin`）✗，
-    而不是 `app.bin` ✗ —— 曾因此出现"重建了固件、M 场却仍在测旧货"✗✓（§5.29 教训 ✓）。
+    为何 ✓：real-sensors 固件的 M 场加载路径是 `/tmp/flyctrl_real.bin`（或
+    `flyctrl/app_real.bin`）✗，而不是 `app.bin` ✗ —— 曾因此出现"重建了固件、
+    M 场却仍在测旧货"✗✓（§5.29 教训 ✓）。
     ⇒ 统一构建脚本负责保证【输出文件名/路径一致】✓，避免再踩 ✗。
+
+    ★只同步 real-sensors 构建 ✓（2026-09-24 修）：原实现无条件把【每次】构建产物
+    都覆盖到 /tmp/flyctrl_real.bin ⇒ do_firmware 顺序 real→hil 时，hil 构建
+    最后写入，把 HIL 固件覆盖进 real 路径 ⇒ x_flyctrl_real_sensors /
+    unlock_flight / fault_injection 三个真传感器测试实际加载 HIL 固件
+    （sensor 任务 real=0/hil=1 ⇒ 走 HIL 数据路径 ⇒ 零总线 I/O ⇒ 无 hb，
+    确定性失败）。其余 feature（默认/hil/demo/…）M 场各取其约定路径
+    （flyctrl/app.bin / JOC_APP_FLYCTRL=/tmp/flyctrl_hil.bin），无需同步。
     """
+    feats = {f.strip() for f in (features or "").split(",") if f.strip()}
+    if "real-sensors" not in feats:
+        return
     dsts = ["/tmp/flyctrl_real.bin",
             os.path.join(os.path.dirname(app_elf), "app_real.bin")]
     for dst in dsts:
