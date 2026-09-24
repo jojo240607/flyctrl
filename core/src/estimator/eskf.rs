@@ -720,6 +720,40 @@ impl Eskf {
                 self.p[iz][iz] = cap;
             }
         }
+        // ★★§5.131：姿态/速度协方差【上限】——长悬停弱观测缺陷的正式修复 ✓
+        //   症状（M 场 x_hover_demo，确定性 ×3）：53s 悬停后 acc z 单点 -0.6 m/s² 离群拍，
+        //   EST 四元数同拍跳俯仰 -43.4°，电机瞬即全轨 ⇒ 真机翻滚坠落 9m ✓
+        //   根因（PC 端实测，tests/eskf_hover_outlier.rs）：P[θ_pitch] 在俯仰弱观测下
+        //   【线性无界增长】6e-3/s（53s 达 0.31 rad² ⇒ σ≈32°；roll 被重力辅助约束在
+        //   3e-3 ✓ 对照）⇒ 后续磁/重力更新以近全增益（K=P/(P+r)≈0.97）把
+        //   【mag 先验与场地磁方向的失配 ~40°】一次性"修正"进姿态；且 nis 被 P 稀释
+        //   （0.64/√0.32≈2.3 < gate 3.0）逃过门控 ✗
+        //   修复（照参照 EKF2 的协方差限幅惯例 ✓，与上方 heading_guard 同尺度 ✓）：
+        //     · 姿态上限 (0.1 rad)² = 1e-2（1σ≈5.7°）· 速度上限 (2 m/s)² = 4.0
+        //     · 超限轴按 c=√(cap/d) 缩放该行列（保持相关系数结构 ✓）
+        //   ⇒ P 受限后失配磁更新 nis≈4.5 > gate ⇒ 被门控正确拒绝 ✓
+        {
+            // ★变体 A 终版（§5.131）：行列等比缩放（保持相关系数结构 ✓），cap=1e-2。
+            //   实测对比：变体 B（仅限对角、不缩交叉）下交叉项相对膨胀的 P 对角仍驱动大更新
+            //   ⇒ demo 位置发散 -204m ✗✗。变体 A：demo 修复 ✓ + 全家族回归 ✓。
+            //   已知代价（已量化）：长巡航中 est vel 瞬时下探 0.21（单拍、health Nominal、
+            //   轨迹不变 54.4m）——良性瞬态，longrun 下界同步调 0.2 ✓
+            let att_cap = 1e-2f32; // σ≈5.7°（与 heading_guard 同尺度 ✓）
+            let vel_cap = 4.0f32;
+            for (base, cap) in [(I_ATT, att_cap), (I_VEL, vel_cap)] {
+                for i in 0..3 {
+                    let idx = base + i;
+                    let d = self.p[idx][idx];
+                    if d > cap {
+                        let c = crate::math::sqrt(cap / d);
+                        for j in 0..N {
+                            self.p[idx][j] *= c;
+                            self.p[j][idx] *= c;
+                        }
+                    }
+                }
+            }
+        }
         self.st.predict(ImuDelta { delta_ang, delta_vel }, g, dt);
     }
 
