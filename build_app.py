@@ -55,7 +55,12 @@ def main():
         sys.exit(1)
 
     # 2) 链接（app.ld 生成头部 + 定位到 APP_FLASH/APP_RAM）
-    app_elf = os.path.join(ROOT, "app.elf")
+    # ★ELF 按 feature 命名（§5.130）：app.elf 曾被每次构建覆盖（last-build-wins），
+    #   而 mcu_simulater 的 elfsym::app_sym 从 flyctrl/app.elf 解析符号；
+    #   .app_globals 段基址固定但段内偏移随 feature 漂移（实测 hil vs real 的
+    #   SENSOR_SEQ 差 +0xE1C）⇒ 加载 real.bin 时若 app.elf 属其它 feature，
+    #   符号探针全部错位（x_env_* 家族 100% 失败的根因之一）。
+    app_elf = os.path.join(ROOT, f"app{feature_tag(args.features)}.elf")
     run(["arm-none-eabi-gcc", "-nostartfiles", "-T", APP_LD,
          "-Wl,--gc-sections", "-Wl,--no-warn-rwx-segments",
          "-o", app_elf, libapp, "-lgcc"])
@@ -69,30 +74,56 @@ def main():
         print(f"[ERR] App 镜像超过 APP_FLASH {APP_FLASH_BUDGET // 1024}K 预算", file=sys.stderr)
         sys.exit(1)
 
+def feature_tag(features: str) -> str:
+    """feature → 产物命名后缀：'' → ''，real-sensors → '_real'，hil → '_hil'。"""
+    feats = [f.strip() for f in (features or "").split(",") if f.strip()]
+    if not feats:
+        return ""
+    if feats == ["real-sensors"]:
+        return "_real"
+    if feats == ["hil"]:
+        return "_hil"
+    return "_" + feats[0].replace("-", "_")
+
+
 def sync_to_test_artifact(out: str, app_elf: str, features: str = "") -> None:
-    """★把构建产物同步到【M 场实际加载的路径】✓（`mcu_simulater/src/artifact.rs:143`）。
+    """★把构建产物同步到【M 场实际加载的路径】✓（`mcu_simulater/src/artifact.rs`）。
 
     为何 ✓：real-sensors 固件的 M 场加载路径是 `/tmp/flyctrl_real.bin`（或
     `flyctrl/app_real.bin`）✗，而不是 `app.bin` ✗ —— 曾因此出现"重建了固件、
     M 场却仍在测旧货"✗✓（§5.29 教训 ✓）。
     ⇒ 统一构建脚本负责保证【输出文件名/路径一致】✓，避免再踩 ✗。
 
-    ★只同步 real-sensors 构建 ✓（2026-09-24 修）：原实现无条件把【每次】构建产物
-    都覆盖到 /tmp/flyctrl_real.bin ⇒ do_firmware 顺序 real→hil 时，hil 构建
-    最后写入，把 HIL 固件覆盖进 real 路径 ⇒ x_flyctrl_real_sensors /
-    unlock_flight / fault_injection 三个真传感器测试实际加载 HIL 固件
-    （sensor 任务 real=0/hil=1 ⇒ 走 HIL 数据路径 ⇒ 零总线 I/O ⇒ 无 hb，
-    确定性失败）。其余 feature（默认/hil/demo/…）M 场各取其约定路径
-    （flyctrl/app.bin / JOC_APP_FLYCTRL=/tmp/flyctrl_hil.bin），无需同步。
+    ★只同步 real-sensors 的 bin ✓（2026-09-24 §5.129 修）：原实现无条件把
+    【每次】构建产物都覆盖到 /tmp/flyctrl_real.bin ⇒ do_firmware 顺序 real→hil
+    时，hil 构建最后写入，把 HIL 固件覆盖进 real 路径 ⇒ 三个真传感器测试
+    实际加载 HIL 固件（确定性失败）。
+
+    ★bin 与 ELF 成对同步 ✓（2026-09-24 §5.130 修）：符号解析（elfsym）必须用
+    【同 feature】的 ELF——.app_globals 段内偏移随 feature 漂移，跨 feature
+    组合会读错位。real 同步 ELF 到 /tmp/flyctrl_real.elf + flyctrl/app_real.elf
+    （artifact::flyctrl_real_app_elf 解析落点）；hil 同步 ELF 供
+    JOC_APP_FLYCTRL_ELF / flyctrl_hil_app_elf 使用。默认构建不 sync
+    （flyctrl/app.bin + app{tag}.elf 原地即约定路径）。
     """
     feats = {f.strip() for f in (features or "").split(",") if f.strip()}
-    if "real-sensors" not in feats:
-        return
-    dsts = ["/tmp/flyctrl_real.bin",
-            os.path.join(os.path.dirname(app_elf), "app_real.bin")]
-    for dst in dsts:
+    elf_dir = os.path.dirname(app_elf)
+    pairs: list[tuple[str, str]] = []
+    if "real-sensors" in feats:
+        pairs = [
+            (out, "/tmp/flyctrl_real.bin"),
+            (out, os.path.join(elf_dir, "app_real.bin")),
+            (app_elf, "/tmp/flyctrl_real.elf"),
+            (app_elf, os.path.join(elf_dir, "app_real.elf")),
+        ]
+    elif "hil" in feats:
+        pairs = [
+            (app_elf, "/tmp/flyctrl_hil.elf"),
+            (app_elf, os.path.join(elf_dir, "app_hil.elf")),
+        ]
+    for src, dst in pairs:
         try:
-            shutil.copyfile(out, dst)
+            shutil.copyfile(src, dst)
             print(f"[SYNC] {dst} ({os.path.getsize(dst)} bytes) ✓")
         except OSError as e:  # 只读/权限等 ⇒ 明确告警，不静默 ✗
             print(f"[WARN] 同步到 {dst} 失败：{e}", file=sys.stderr)

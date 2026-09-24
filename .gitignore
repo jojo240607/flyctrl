@@ -20,3 +20,5 @@ Thumbs.db
 app.bin
 app.elf
 app/target
+app_*.bin
+app_*.elf
