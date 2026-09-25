@@ -569,6 +569,8 @@ pub struct Eskf {
     /// 诊断（2026-09-21 ✓）：磁更新实际【应用】与【跳过】的计数 ✓
     pub mag_applied: u32,
     pub mag_skipped: u32,
+    /// ★§5.136：apply() 因非有限误差状态而拒绝注入的次数（NaN 兜底计数）
+    pub nan_inject_rejected: u32,
     /// **冻结零偏修正**（定位用 ✓）：静止场景下零偏本就【不可观测】✗
     /// （无足够量测激励 ✓）⇒ 用于判定"长循环慢性发散是否由零偏块引起" ✓
     pub freeze_bias: bool,
@@ -621,6 +623,7 @@ impl Eskf {
             heading_guard: false,
             mag_applied: 0,
             mag_skipped: 0,
+            nan_inject_rejected: 0,
             freeze_bias: false,
         }
     }
@@ -736,6 +739,22 @@ impl Eskf {
     /// ⇒ 修正必须取【负】：`x̂ ← x̂ ⊖ δx̂` ✓
     /// 若写成相加 ⇒ **正反馈 ⇒ 发散** ✗（实测 |v|² 冲到 88430 ✓✓）
     fn apply(&mut self, e: &ErrorState) {
+        // ★§5.136 第二层防护（NaN 兜底，商用同款 isfinite 检查）：误差状态若含
+        //   非有限值则**拒绝注入**并计数——防止任何未预料的 NaN 源（历史实测：
+        //   mag_i/mag_b 变 NaN 经此路径污染姿态 ⇒ M 场慢振荡/飞散）。第一层为四处
+        //   `!(s_ > 0.0)` 守卫（§5.136 补遗13）✓，两层叠加覆盖"守卫漏网的 NaN"。
+        {
+            let mut bad = false;
+            let chk = |v: f32| !v.is_finite();
+            for i in 0..3 {
+                bad |= chk(e.dtheta[i]) | chk(e.dv[i]) | chk(e.dp[i])
+                    | chk(e.dbg[i]) | chk(e.dba[i]) | chk(e.d_mag_i[i]) | chk(e.d_mag_b[i]);
+            }
+            if bad {
+                self.nan_inject_rejected = self.nan_inject_rejected.wrapping_add(1);
+                return;
+            }
+        }
         // ⚠️ **符号更正（2026-09-21，由最小方向检查定位 ✓）**：
         //   `inject_error` 的语义是 `x ← x ⊕ e`（e 为"真值相对名义的偏差" ✓）
         //   ⇒ Kalman 的 `δx̂ = K·ν` 正是该偏差 ⇒ 修正应【相加】✓
