@@ -68,6 +68,12 @@ impl EskfState {
 /// ★**实验旋钮**（对照臂用 ✓，默认 1.0 = 开）：重力辅助开关。
 /// 置 0 ⇒ `update_gravity` 立即返回**带理由的** `Err` ✗（绝不静默跳过 ✗）。
 pub static mut G_ESKF_GRAV_ON: f32 = 1.0;
+/// ★§5.136 方案 B 旋钮：`2.0` ⇒ 回退【三轴磁矢量融合】（legacy A/B 对照）；
+/// 其余值（含裸 bin 的 0）⇒ 默认走【仅 yaw 观测】(update_mag_yaw ✓)。
+pub static mut G_ESKF_MAG_YAW_ON: f32 = 0.0;
+/// ★§5.136 方案 A 旋钮：`2.0` ⇒ 回退"mag_B 自由估计"（legacy A/B）；其余（含裸 bin 的 0）
+/// ⇒ 默认【冻结 mag_B】（消除 mag_I↔mag_B 对倒零空间 ⇒ 无慢漂；保留三轴 roll/pitch 信息）
+pub static mut G_ESKF_MAG_FREEZE_B: f32 = 0.0;
 /// ★**实验旋钮**：磁量测开关（含 `reset_mag_states` ✓）。默认 1.0 = 开。
 pub static mut G_ESKF_MAG_ON: f32 = 1.0;
 /// ★**消融开关**（诊断用 ✓，默认 1.0 = 开）：GPS 位/速融合 ✓
@@ -942,7 +948,13 @@ impl Eskf {
                 e.dbg[kk] = dx[I_BG + kk];
                 e.dba[kk] = dx[I_BA + kk];
                 e.d_mag_i[kk] = dx[I_MAGI + kk];
-                e.d_mag_b[kk] = dx[I_MAGB + kk];
+                // ★§5.136 方案 A（实验）：冻结硬铁 mag_B（= 地面标定值）——三轴融合保留
+                //   roll/pitch 可观测性（验收表口径 ✓），但"mag_I↔mag_B 对倒"零空间消失
+                //   ⇒ mag_I 三轴可观测 ⇒ 无慢漂（对照方案 B：仅 yaw ⇒ 丢 roll/pitch 信息 ✗）
+                let freeze_magb = unsafe {
+                    core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_FREEZE_B))
+                } != 2.0;
+                e.d_mag_b[kk] = if freeze_magb { 0.0 } else { dx[I_MAGB + kk] };
             }
             // ★去 N³（原 9261/分量 ✗）：P ← P − K·(h·P)
             //   ① 先算行向量 (h·P)[bb] = Σ_m h[m]·P[m][bb] ⇒ **N² 一次** ✓
@@ -1064,6 +1076,89 @@ impl Eskf {
             applied += 1;
         }
         applied
+    }
+
+    /// ★§5.136 方案 B：**磁仅作 yaw 观测**（对齐 PX4 EKF2 航向融合）——
+    /// 实测机体磁场经【当前姿态】转到导航系，与 `mag_I`（先验 = 地面标定方向，
+    /// 也等价于"无航向误差时实测应指向的方向"）的水平投影求**有符号航向误差**，
+    /// 作为**标量观测**只修正 yaw（H 仅含 δθ_z）。
+    ///
+    /// 为何这样改（实证）：三轴磁矢量融合下 `mag_I` 与 `mag_B` 沿"对倒方向"不可观测
+    /// ⇒ 慢漂（PHY 实测 mag_i 模长 0.447→0.08，t≈8~9s 起）⇒ 环路 t≈12s 失稳；而
+    /// reanchor（设计解药）开启后与 σ 无关地给姿态注入 ±8° 振荡（§5.136 补遗 15）。
+    /// 仅 yaw 观测 ⇒ **不再更新 mag_I/mag_B** ⇒ 结构性消除该不可观测方向 ⇒ 无慢漂、
+    /// 也无需 reanchor ✓（本仓 mag_I 初值即地面标定值 ✓）
+    pub fn update_mag_yaw(&mut self, meas_body: [f32; 3]) -> Result<f32, &'static str> {
+        if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_ON)) } == 2.0 {
+            return Err("磁量测：对照臂【旋钮关闭】✓（实验用，非静默 ✗）");
+        }
+        // 实测磁场 → 导航系（用当前姿态）
+        let m_n = rotate_vec_by_quat(self.st.q, meas_body);
+        let (mx, my) = (m_n[0], m_n[1]);
+        let (px, py) = (self.mag_i[0], self.mag_i[1]);
+        // 水平分量有符号夹角（正 = 实测相对先验偏 +yaw）
+        let yaw_err = crate::math::atan2(mx * py - my * px, mx * px + my * py);
+        if !yaw_err.is_finite() {
+            self.mag_skipped = self.mag_skipped.wrapping_add(1);
+            return Err("磁量测：航向残差非有限 ⇒ 跳过 ✓");
+        }
+        // 标量观测：H 仅含 δθ_z；S = P[θz][θz] + R
+        let idx = I_ATT + 2;
+        let mut h = [0.0f32; N];
+        h[idx] = 1.0;
+        let mut ph = [0.0f32; N];
+        for k in 0..N {
+            ph[k] = self.p[k][idx];
+        }
+        let mut s_ = self.r_mag;
+        for k in 0..N {
+            s_ += h[k] * ph[k];
+        }
+        if !(s_ > 0.0) {
+            self.mag_skipped = self.mag_skipped.wrapping_add(1);
+            return Err("磁量测：S 非正/NaN ⇒ 跳过 ✓");
+        }
+        let nis = yaw_err.abs() / crate::math::sqrt(s_);
+        if nis > self.gate {
+            self.mag_skipped = self.mag_skipped.wrapping_add(1);
+            return Err("磁量测：航向新息超门 ⇒ 拒 ✓");
+        }
+        self.mag_applied = self.mag_applied.wrapping_add(1);
+        let mut e = ErrorState::default();
+        // 与既有约定一致：dx = K·ν，ν = 实测 − 预测（"真值相对名义"）⇒ 相加注入 ✓
+        let dxz = ph[idx] / s_ * yaw_err;
+        e.dtheta[2] = dxz;
+        // P ← (I − K·h)·P：h 只有 idx 列非零 ⇒ (h·P)[b] = P[idx][b]；
+        // K[a] = (P·hᵀ)[a]/S = P[a][idx]/S = ph[a]/s_（**所有行**一般非零 ✓）
+        for a in 0..N {
+            let ka = ph[a] / s_;
+            if ka == 0.0 {
+                continue;
+            }
+            for b in 0..N {
+                self.p[a][b] -= ka * self.p[idx][b];
+            }
+        }
+        self.apply(&e);
+        // ★航向参考学习（PX4 同型：磁罗盘的地面标定偏置/磁偏角在线吸收）——
+        //   **只旋转 mag_I 的水平方向**朝实测方向、**模长保持标定值**（1 自由度 ⇒
+        //   良态；不会进入 mag_I/mag_B 的"对倒"零空间 ⇒ 无慢漂 ✓）
+        {
+            let h_meas = crate::math::sqrt(mx * mx + my * my);
+            let h_prior = crate::math::sqrt(px * px + py * py);
+            if h_meas > 1e-3 && h_prior > 1e-3 {
+                let b = 0.02f32; // 慢学习（≈每拍 2%，16.7Hz ⇒ 时间常数 ~3s ✓）
+                let nx = (1.0 - b) * px + b * mx;
+                let ny = (1.0 - b) * py + b * my;
+                let nn = crate::math::sqrt(nx * nx + ny * ny);
+                if nn > 1e-6 {
+                    // 保持原水平模长 ⇒ 只学方向 ✓
+                    self.mag_i[0] = nx / nn * h_prior;
+                    self.mag_i[1] = ny / nn * h_prior;
+                }
+            }
+        }
+        Ok(nis)
     }
 
     pub fn update_mag(&mut self, meas_body: [f32; 3]) -> Result<f32, &'static str> {

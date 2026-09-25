@@ -268,7 +268,14 @@ impl Estimator for EskfEstimator {
         if self.aid_div % self.aid_period.max(1) != 0 {
             return;
         }
-        match self.f.update_mag(m) {
+        // ★§5.136 方案 B：默认走【仅 yaw 观测】；legacy 三轴路径保留在旋钮后
+        //   （`G_ESKF_MAG_YAW_ON == 2.0` ⇒ 回退三轴，供 A/B 与回归对照 ✓）
+        // ★§5.136 实验切换：默认=方案 A（三轴 + 冻结 mag_B）；旋钮 2.0 ⇒ 方案 B（仅 yaw）
+        let yaw_only = unsafe {
+            core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_YAW_ON))
+        } == 2.0;
+        let r = if yaw_only { self.f.update_mag_yaw(m) } else { self.f.update_mag(m) };
+        match r {
             Ok(_) => { self.n_mag = self.n_mag.wrapping_add(1); bump(9); }
             Err(_) => { self.n_mag_rejected = self.n_mag_rejected.wrapping_add(1); bump(10); }
         }
