@@ -256,7 +256,8 @@ pub fn update_scalar(
     for i in 0..N {
         s_ += h[i] * ph[i];
     }
-    if s_ <= 0.0 {
+    // ★§5.136：NaN 安全（见 update_mag 同款注释）
+    if !(s_ > 0.0) {
         return Err("C1: S 非正 ⇒ 协方差异常 ✗（拒绝更新 ✓）");
     }
     let nis_sigma = residual.abs() / crate::math::sqrt(s_);
@@ -900,7 +901,10 @@ impl Eskf {
             for k in 0..N {
                 s_ += h[k] * ph[k];
             }
-            if s_ <= 0.0 {
+            // ★§5.136：NaN 安全（原 `s_ <= 0.0` 对 NaN 为 false ⇒ NaN 直穿 ⇒
+            //   `dx = ph/NaN` ⇒ 状态 NaN ⇒ mag_i/mag_b NaN ⇒ 姿态污染 ⇒ M 场慢发散，
+            //   实测 mag_i 在 t≈5-8s 变 NaN 后环路 t≈10s 起振荡）
+            if !(s_ > 0.0) {
                 continue;
             }
             let nis = resid.abs() / crate::math::sqrt(s_);
@@ -1008,7 +1012,10 @@ impl Eskf {
             for k in 0..N {
                 s_ += h[k] * ph[k];
             }
-            if s_ <= 0.0 {
+            // ★§5.136：NaN 安全（原 `s_ <= 0.0` 对 NaN 为 false ⇒ NaN 直穿 ⇒
+            //   `dx = ph/NaN` ⇒ 状态 NaN ⇒ mag_i/mag_b NaN ⇒ 姿态污染 ⇒ M 场慢发散，
+            //   实测 mag_i 在 t≈5-8s 变 NaN 后环路 t≈10s 起振荡）
+            if !(s_ > 0.0) {
                 continue;
             }
             let resid = prior[i] - self.mag_i[i];
@@ -1064,7 +1071,10 @@ impl Eskf {
             for k in 0..N {
                 s_ += h[k] * ph[k];
             }
-            if s_ <= 0.0 {
+            // ★§5.136：NaN 安全（原 `s_ <= 0.0` 对 NaN 为 false ⇒ NaN 直穿 ⇒
+            //   `dx = ph/NaN` ⇒ 状态 NaN ⇒ mag_i/mag_b NaN ⇒ 姿态污染 ⇒ M 场慢发散，
+            //   实测 mag_i 在 t≈5-8s 变 NaN 后环路 t≈10s 起振荡）
+            if !(s_ > 0.0) {
                 self.mag_skipped += 1;
                 continue;
             }
