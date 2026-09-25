@@ -26,3 +26,33 @@ fn yaw_only_update_drives_estimate_toward_measurement() {
             y0.to_degrees(), y1.to_degrees(), err0, err1);
     }
 }
+
+/// ★§5.136【已知限制】先验/实测磁场**方向失配**（未标定的磁偏角/安装角）下的行为记录：
+/// **恒定航向新息在"参考偏置"与"真实姿态 yaw 误差"之间本质不可分** ⇒ 本实现里姿态
+/// 以远高于学习的增益把失配"解释掉" ⇒ 估计收敛到【错误航向】（补偿量 ≈ 失配角）。
+///
+/// 实测：decl=−20° ⇒ est yaw ≈ +19°（而 mag_i 不动）。
+/// ⇒ 对齐 PX4 需要【第二个航向源】做交叉校验（PX4：陀螺积分航向/GSF 航向估计器 +
+///    MAG_DECL 配置先验），而非从磁单独学习（§5.136 补遗 17）。
+/// 本测例把该行为**固化**（防静默变化），并作为"引入第二航向源后应转为收敛"的靶子。
+#[test]
+fn yaw_only_reference_misalignment_is_documented_limitation() {
+    let d = (-20.0f32).to_radians();
+    let (sd, cd) = (d.sin(), d.cos());
+    let mag_i_prior = [0.2f32, 0.0, 0.4];
+    let mag_world = [0.2 * cd - 0.0 * sd, 0.2 * sd + 0.0 * cd, 0.4];
+    let m_b = mag_world; // 静止且真值 yaw=0 ⇒ 机体场 = 世界场
+    let mut f = Eskf::new(Quaternion::from_axis_angle([0.0, 0.0, 1.0], Radian(0.0)), [0.0; 3], [0.0; 3], 5.0);
+    f.mag_i = mag_i_prior;
+    f.mag_b = [0.0; 3];
+    for _ in 0..3000 {
+        let _ = f.update_mag_yaw(m_b);
+    }
+    let yaw = f.st.q.yaw().to_degrees();
+    println!("[已知限制] decl=-20° ⇒ est yaw={yaw:+.2}°（真值 0°；补偿量 ≈ 失配角 ✓ 见文档）");
+    // 固化当前行为：误差量级 ≈ 失配角（同号、±6° 容差）
+    assert!(
+        (yaw - 20.0).abs() < 6.0,
+        "行为已变化：decl=-20° 下 est yaw={yaw:.2}°（此前 ≈+19°，即把失配解释成航向）         —— 若已引入第二航向源，请把本测例改为断言 |yaw| < 3° ✓"
+    );
+}
