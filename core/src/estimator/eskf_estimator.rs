@@ -7,7 +7,7 @@
 //! - **绝不静默 no-op** ✗ —— 无等价实现的通路【显式拒绝】并计数 ✓
 //! - **每条通路都有计数** ✓（"先证明机制确实在运行" ✓）
 
-use crate::estimator::eskf::{Eskf, ESKF_LAST_REJ};
+use crate::estimator::eskf::Eskf;
 use crate::estimator::trait_def::Estimator;
 use crate::units::Second;
 use crate::vehicle::{
