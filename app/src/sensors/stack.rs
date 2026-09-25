@@ -81,7 +81,12 @@ impl SensorStack {
                 baro: crate::sensors::baro::BaroBmp280::new("i2c2", 0x76),
                 gps: crate::sensors::gps::GpsUblox::new("uart1"),
                 rc: crate::sensors::rc::RcSbus::new("uart2"),
-                mag: crate::sensors::mag::MagQmc5883::new("i2c2", 0x0D),
+                // ★§5.136：**磁力计改用独立 I2C（i2c0 = I2C1，PB6/PB7）**，与气压计
+                //   （i2c2 = I2C3）分总线、各自 DMA 搬运：① 消除“两传感器共享一条
+                //   I2C”带来的事务交错/相位耦合（MAP 实测：物理正确的磁输入下 yaw
+                //   修正会扰动环路，而 SIL 干净磁样本则稳定）② I2C1 的 RX 流（S0）
+                //   独占、TX（S6）由 USART2_TX 让出（RM0090 第二条硬件流 S7）✓
+                mag: crate::sensors::mag::MagQmc5883::new("i2c0", 0x0D),
             }
         }
     }
