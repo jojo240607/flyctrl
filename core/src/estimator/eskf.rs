@@ -577,6 +577,9 @@ pub struct Eskf {
     pub mag_skipped: u32,
     /// ★§5.136：apply() 因非有限误差状态而拒绝注入的次数（NaN 兜底计数）
     pub nan_inject_rejected: u32,
+    /// ★§5.136 阶段2：对准标定剩余次数（>0 ⇒ 仍允许重对准；用于"姿态收敛前"重复对准，
+    /// 避免把未收敛的姿态误差烙进参考 ⇒ 实测 A1 劣化 1.15° 的根因 ✓）
+    pub align_remaining: u32,
     /// **冻结零偏修正**（定位用 ✓）：静止场景下零偏本就【不可观测】✗
     /// （无足够量测激励 ✓）⇒ 用于判定"长循环慢性发散是否由零偏块引起" ✓
     pub freeze_bias: bool,
@@ -630,6 +633,7 @@ impl Eskf {
             mag_applied: 0,
             mag_skipped: 0,
             nan_inject_rejected: 0,
+            align_remaining: 0,
             freeze_bias: false,
         }
     }
@@ -1088,9 +1092,57 @@ impl Eskf {
     /// reanchor（设计解药）开启后与 σ 无关地给姿态注入 ±8° 振荡（§5.136 补遗 15）。
     /// 仅 yaw 观测 ⇒ **不再更新 mag_I/mag_B** ⇒ 结构性消除该不可观测方向 ⇒ 无慢漂、
     /// 也无需 reanchor ✓（本仓 mag_I 初值即地面标定值 ✓）
+    /// ★§5.136 阶段2（对齐 PX4）：**航向对准标定**——在首个有效磁样本（静止/解锁前，
+    /// 磁场干净）时，把 `mag_I` 的**水平方向对准实测方向**（模长与垂直分量保持先验 =
+    /// 地磁强度/倾角的配置先验 ✓）⇒ 磁偏角/安装偏置/硬铁在**参考**中被一次性吸收 ✓
+    ///
+    /// 为何必须"对准"而不能"在线学习"（实证 §5.136 补遗17）：恒定航向新息在
+    /// "参考偏置"与"真实姿态 yaw 误差"间**本质不可分**——姿态增益 ~40× 于学习增益 ⇒
+    /// 会把失配解释成航向（实测 decl=−20° ⇒ est yaw +18.5°）。对准发生在"已知航向可信"
+    /// 的时刻（起飞前静止），故无此歧义 ✓（PX4 同型：磁定初始航向 + MAG_DECL 配置先验）。
+    /// ★§5.136 阶段2：设置对准窗口（首次磁样本时调用；窗口内每次磁更新重复对准，
+    /// 使参考跟随"正在收敛的姿态"⇒ 收敛后参考即正确 ✓ 窗口结束即锁定 ✓）
+    pub fn begin_mag_alignment(&mut self, n: u32) {
+        self.align_remaining = n;
+    }
+
+    pub fn align_yaw_to_mag(&mut self, meas_body: [f32; 3]) {
+        let m_n = rotate_vec_by_quat(self.st.q, meas_body);
+        let h_meas = crate::math::sqrt(m_n[0] * m_n[0] + m_n[1] * m_n[1]);
+        let h_prior = crate::math::sqrt(self.mag_i[0] * self.mag_i[0] + self.mag_i[1] * self.mag_i[1]);
+        if h_meas < 1e-3 || h_prior < 1e-3 {
+            return; // 水平分量过小（近极区/数据异常）⇒ 保持先验 ✓
+        }
+        // 只改水平方向（模长 = 先验水平模长 ✓；垂直分量 = 先验倾角 ✓）
+        self.mag_i[0] = m_n[0] / h_meas * h_prior;
+        self.mag_i[1] = m_n[1] / h_meas * h_prior;
+        // mag_B 保持（冻结的标定值）✓；清理协方差中 mag 两态的相关（对齐后此前估计失效）
+        for i in 0..3 {
+            let (ai, bi) = (I_MAGI + i, I_MAGB + i);
+            for j in 0..N {
+                if j != ai {
+                    self.p[ai][j] = 0.0;
+                    self.p[j][ai] = 0.0;
+                }
+                if j != bi {
+                    self.p[bi][j] = 0.0;
+                    self.p[j][bi] = 0.0;
+                }
+            }
+        }
+        self.yaw_aligned = true;
+    }
+
     pub fn update_mag_yaw(&mut self, meas_body: [f32; 3]) -> Result<f32, &'static str> {
         if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_ON)) } == 2.0 {
             return Err("磁量测：对照臂【旋钮关闭】✓（实验用，非静默 ✗）");
+        }
+        // ★对准窗口内：**先重复对准**（跟随收敛中的姿态 ⇒ 参考逐步正确 ✓），
+        //   然后**继续走正常融合**（不提前返回！——否则窗口结束时 P[θz] 未收敛 ⇒
+        //   接管瞬间为大步长修正 ⇒ 踢一下 ⇒ M 场实测 t≈5s 失稳 ✗）
+        if self.align_remaining > 0 {
+            self.align_remaining -= 1;
+            self.align_yaw_to_mag(meas_body);
         }
         // 实测磁场 → 导航系（用当前姿态）
         let m_n = rotate_vec_by_quat(self.st.q, meas_body);

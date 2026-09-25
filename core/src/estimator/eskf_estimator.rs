@@ -253,7 +253,18 @@ impl Estimator for EskfEstimator {
         let Some(m) = mag else { return };
         // ★首个磁样本：代数反解 `mag_B`（需独立 `mag_I` 先验 ✓）—— 照参照 `resetMagStates` ✓
         if !self.mag_first_done {
-            self.f.reset_mag_states(m, self.mag_i_prior);
+            // ★§5.136 阶段2：yaw-only 路径 ⇒ **对准标定**（吸收磁偏角/安装偏置）；
+            //   legacy 三轴路径（旋钮 2.0）仍走代数反解 mag_B ✓
+            let yaw_only = unsafe {
+                core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_YAW_ON))
+            } != 2.0;
+            if yaw_only {
+                // ★对准窗口：前 60 次磁更新（≈3.6s @16.7Hz）内重复对准，跟随姿态收敛 ✓
+                self.f.begin_mag_alignment(60);
+                self.f.align_yaw_to_mag(m);
+            } else {
+                self.f.reset_mag_states(m, self.mag_i_prior);
+            }
             self.mag_first_done = true;
         }
         // ★重锚定（§3.6 ✓）：持续旋转时把 `mag_I` 软拉回先验（旋钮默认 0 = 关 ✓）
