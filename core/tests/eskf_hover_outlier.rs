@@ -1,11 +1,18 @@
-//! ★**长悬停 + 单点加计离群 ⇒ 姿态单拍大跳复现**（§5.131 补遗 2，hover_demo M 场事件的 H 场复现）
+//! ★P 无界增长诊断与复现留档（§5.131 补遗 2/3，hover_demo M 场事件的根因记录）
 //!
 //! M 场现场（x_hover_demo，确定性 ×3）：53s 完美悬停后，**单拍** acc z 样本
 //! -9.64 → -9.04（-0.6 m/s²，≈5σ），EST 四元数同拍跳到俯仰 -43.4°，电机瞬即
-//! 全轨 ⇒ 真机被踢翻滚坠落 9m。归一化新息 ≤0.06 本不可能线性产出 43° ⇒
-//! ESKF 数值/逻辑缺陷。本测试在 PC 端复现同款输入序列，抓出缺陷通道。
+//! 全轨 ⇒ 真机被踢翻滚坠落 9m。
 //!
-//! 修复验收：注入离群样本后 |Δatt|（单拍）< 5°，且 53s 悬停期间无单拍 >5° 跳变。
+//! 本文件三层诊断（当前全绿 = 记录现状，非回归防护）：
+//!   1) 纯 ESKF：单点离群响应 + 噪声激励下 53s 悬停
+//!   2) HilContext 全链路（含 40Hz 陷波 + 20Hz 低通 IIR 状态）
+//!   3) diag_p_cross：**P[θ_pitch] 无界增长实测**（6e-3/s 线性，roll 有界对照）
+//!      —— 俯仰弱观测缺陷的直接证据 ✓
+//!
+//! 修复（协方差限幅）已实现并验证可消除 M 场事件，但因牵动 att_est.rs 的
+//! 整定验收表（eskf_final_tuning A7 / reanchor_quiet / freq_response）需
+//! 正式整定会话重过验收 ⇒ 暂缓合入（见 c1-migration-plan §5.131 补遗 3）。
 
 use flyctrl_core::estimator::eskf_estimator::EskfEstimator;
 use flyctrl_core::estimator::trait_def::Estimator;
