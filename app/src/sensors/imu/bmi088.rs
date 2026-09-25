@@ -53,6 +53,21 @@ impl ImuBmi088 {
         if si.accel.iter().any(|v| !v.is_finite()) || si.gyro.iter().any(|v| !v.is_finite()) {
             return None;
         }
+        // ★§5.136 输入合理性校验（驱动层，仅真传感器路径）：传输链偶发投递垃圾样本
+        //   实测（逐拍探针）：陀螺单点 −57.6 / −3541 / **20165 rad/s**、加计异常——
+        //   它们会污染【控制器速率阻尼项】att_kd·ω ⇒ 混控瞬时饱和（推力骤减+力矩尖峰）
+        //   ⇒ 位置环被反复踢 ⇒ LOITER 增长型振荡（而 ESKF 自身门控使估计仍准）。
+        //   判据：陀螺单轴 ≤ 35 rad/s（BMI088 2000 dps 物理量程 ✓）；比力模长
+        //   1..200 m/s²（悬停 ≈g=9.8，自由落体 ≈0 允许到 1；>200 为非物理）。
+        //   不合格 ⇒ 返回 None ⇒ `step_hil` 采样保持上一有效帧 ✓（不污染滤波/控制）
+        let gn22 = si.gyro[0] * si.gyro[0] + si.gyro[1] * si.gyro[1] + si.gyro[2] * si.gyro[2];
+        if gn22 > 35.0 * 35.0 {
+            return None;
+        }
+        let an2 = si.accel[0] * si.accel[0] + si.accel[1] * si.accel[1] + si.accel[2] * si.accel[2];
+        if !(1.0..=(200.0 * 200.0)).contains(&an2) {
+            return None;
+        }
         Some(ImuSample {
             accel: [
                 MeterPerSecondSquared(si.accel[0]),

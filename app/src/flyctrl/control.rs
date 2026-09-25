@@ -97,6 +97,9 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
     // [联调诊断] 最近一拍执行器指令（静态，测试直读；定位后移除）
     #[used]
     static mut DBG_MOTOR: [f32; 4] = [0.0; 4];
+    // ★§5.136 临时诊断：本拍 control 消费的陀螺/加计（[0..3)=gyr [3..6)=acc）
+    #[used]
+    static mut DBG_IMU: [f32; 6] = [0.0; 6];
     // PWM 设备（4 路，control 专用）
     let mut pwm_dev: [Option<Device>; 4] = [None, None, None, None];
     let mut pwm_period: [u32; 4] = [0; 4];
@@ -157,10 +160,29 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         // 写者被本任务抢占在置奇与置偶之间），忙等会让低优先级写者永远得不到调度，
         // control 无限自旋 → 整机卡死（HIL 注入期间已实测复现：运行数秒后日志/下行全停）。
         // 正确处理：直接采用本拍快照（可能新老混合/略旧），下一 4ms 拍自然取得一致新帧。
-        let (imu, rc, gps, baro_alt, mag, armed);
+        let (mut imu, rc, gps, baro_alt, mag, armed);
         unsafe {
             let f = &mut *core::ptr::addr_of_mut!(SENSOR_FRAME);
             imu = f.imu;
+            // ★§5.136 读者侧一致性校验（对标 ArduPilot `check_gyro`/PX4 DataValidator 的
+            //   量程校验）：seqlock 读者不校验 seq、**明确允许新老混合快照**（见上方注释的
+            //   实时性约束：本任务优先级高于写者 ⇒ 重试在本拍必然读到同一撕裂态，无效）。
+            //   撕裂帧会把 `imu` 的字节与相邻字段拼接 ⇒ 合成物理不可能的浮点值
+            //   （实测陀螺 −57.6 / −3541 / **20165 rad/s**，且**超出驱动换算上限
+            //   34.9 rad/s** ⇒ 可断言非驱动产物、而是帧撕裂）。此处做量程校验，
+            //   不合格 ⇒ 当作无 IMU 帧（回退上一有效帧/SimImu ⇒ 不污染滤波与控制）✓
+            if let Some(s) = imu.as_ref() {
+                let g = [s.gyro[0].0, s.gyro[1].0, s.gyro[2].0];
+                let a = [s.accel[0].0, s.accel[1].0, s.accel[2].0];
+                let gmax = g.iter().fold(0.0f32, |m, v| if v.abs() > m { v.abs() } else { m });
+                let amax = a.iter().fold(0.0f32, |m, v| if v.abs() > m { v.abs() } else { m });
+                let ok = g.iter().chain(a.iter()).all(|v| v.is_finite())
+                    && gmax <= 35.0   // 2000 dps 物理量程
+                    && amax <= 200.0; // 比力上界
+                if !ok {
+                    imu = None;
+                }
+            }
             rc = f.rc;
             gps = f.gps;
             baro_alt = f.baro_alt;
@@ -176,6 +198,14 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
                 f.imu = None;
             }
             core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        }
+        // ★§5.136 临时诊断
+        unsafe {
+            let d = core::ptr::addr_of_mut!(DBG_IMU);
+            if let Some(s) = imu.as_ref() {
+                (*d)[0] = s.gyro[0].0; (*d)[1] = s.gyro[1].0; (*d)[2] = s.gyro[2].0;
+                (*d)[3] = s.accel[0].0; (*d)[4] = s.accel[1].0; (*d)[5] = s.accel[2].0;
+            }
         }
         // 指令解锁：与地面站上行命令做逻辑或（RC 解锁 或 指令解锁 任一为真）。
         let cmd_armed = crate::flyctrl::uplink::G_CMD_ARMED.load(Ordering::Relaxed);
