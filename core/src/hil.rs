@@ -74,6 +74,8 @@ where
 {
     pub est: E,
     pub ctrl: C,
+    /// ★§5.134 IMU 输入合理性门控拒收计数（诊断/验收用 ✓）
+    pub n_imu_rejected: u32,
     pub fdir: Fdir,
     /// 固定控制周期。
     pub dt: Second,
@@ -140,6 +142,7 @@ where
         Self {
             est,
             ctrl,
+            n_imu_rejected: 0,
             fdir: Fdir::new(),
             dt,
             failsafe_engaged: false,
@@ -338,23 +341,46 @@ where
         let mut raw_accel: Option<[f32; 3]> = None;
         let imu_sample = match imu {
             Some(s) => {
-                raw_accel = Some([s.accel[0].0, s.accel[1].0, s.accel[2].0]);
-                let mut acc = [0.0f32; 3];
-                let mut gy = [0.0f32; 3];
-                for i in 0..3 {
-                    acc[i] = self.imu_accel_lowpass[i].process(self.imu_accel_notch[i].process(s.accel[i].0));
-                    gy[i] = self.imu_gyro_notch[i].process(s.gyro[i].0);
+                // ★§5.134 输入合理性门控：拒收物理不可能的 IMU 样本。
+                //   动机（实测）：M 场传输链偶发原始/垃圾值（陀螺 z 挖出 2.7e6 rad/s、
+                //   磁 8191 raw）⇒ 前者经 predict 污染 F/P ⇒ **P→NaN** ⇒ 估计算失效。
+                //   判据【宽界】：只拦【非物理量级垃圾】（实测 1e6 级），不拦合法极端
+                //   动力学（自由落体 |a|≈0 ✓、湍流/桨洗大比力 ✓、高速翻滚 ✓）——
+                //   首版用 35 rad/s/4..40 m/s² 误伤 a6 滚转/a8 湍流/a10 桨洗 ✗ ⇒ 改宽界：
+                //   陀螺 ≤ 100 rad/s、比力 ≤ 200 m/s²、全有限；不合格 ⇒ **丢弃本帧**
+                //   （采样保持回退），且【不进 IIR】以免污染滤波器内部状态 ✓
+                let a = [s.accel[0].0, s.accel[1].0, s.accel[2].0];
+                let g = [s.gyro[0].0, s.gyro[1].0, s.gyro[2].0];
+                let mut an2 = 0.0f32;
+                for v in a.iter() { an2 += v * v; }
+                let mut gn2 = 0.0f32;
+                for v in g.iter() { gn2 += v * v; }
+                let an = crate::math::sqrt(an2);
+                let gn = crate::math::sqrt(gn2);
+                let finite = a.iter().chain(g.iter()).all(|v| v.is_finite());
+                if !finite || gn > 100.0 || an > 200.0 {
+                    self.n_imu_rejected = self.n_imu_rejected.wrapping_add(1);
+                    self.last_real_imu
+                        .unwrap_or_else(|| sim_imu.next(self.dt.0))
+                } else {
+                    raw_accel = Some(a);
+                    let mut acc = [0.0f32; 3];
+                    let mut gy = [0.0f32; 3];
+                    for i in 0..3 {
+                        acc[i] = self.imu_accel_lowpass[i].process(self.imu_accel_notch[i].process(a[i]));
+                        gy[i] = self.imu_gyro_notch[i].process(g[i]);
+                    }
+                    let filtered = ImuSample {
+                        accel: [
+                            MeterPerSecondSquared(acc[0]),
+                            MeterPerSecondSquared(acc[1]),
+                            MeterPerSecondSquared(acc[2]),
+                        ],
+                        gyro: [RadianPerSecond(gy[0]), RadianPerSecond(gy[1]), RadianPerSecond(gy[2])],
+                    };
+                    self.last_real_imu = Some(filtered);
+                    filtered
                 }
-                let filtered = ImuSample {
-                    accel: [
-                        MeterPerSecondSquared(acc[0]),
-                        MeterPerSecondSquared(acc[1]),
-                        MeterPerSecondSquared(acc[2]),
-                    ],
-                    gyro: [RadianPerSecond(gy[0]), RadianPerSecond(gy[1]), RadianPerSecond(gy[2])],
-                };
-                self.last_real_imu = Some(filtered);
-                filtered
             }
             None => self
                 .last_real_imu
