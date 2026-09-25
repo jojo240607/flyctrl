@@ -40,6 +40,13 @@ impl AnyEstimator {
         }
     }
     /// 回退/对照用 ✓
+    /// ★§5.132：设置观测噪声（转发；仅 ESKF 变体有该配置）
+    pub fn set_observation_noise(&mut self, r_gps_p: f32, r_gps_v: f32, r_baro: f32) {
+        if let AnyEstimatorKind::Eskf(e) = &mut self.inner {
+            e.set_observation_noise(r_gps_p, r_gps_v, r_baro);
+        }
+    }
+
     pub fn legacy() -> Self {
         AnyEstimator {
             inner: AnyEstimatorKind::Legacy(EkfEstimator::default_quad()),

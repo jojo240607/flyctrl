@@ -7,7 +7,7 @@ use core::ffi::c_void;
 
 use flyctrl_core::controller::{PidController, Setpoint};
 // ★**默认估计器改为 ESKF**（迁移计划步 3 ✓；全表验收 0/10 劣于 Legacy ✓，见 docs/c1-migration-plan.md ✓）
-use flyctrl_core::estimator::select::AnyEstimator;
+use flyctrl_core::estimator::select::{AnyEstimator, AnyEstimatorKind};
 use flyctrl_core::fdir::Health;
 use flyctrl_core::hil::{HilContext, SimImu};
 use flyctrl_core::units::{Meter, MeterPerSecond, MeterPerSecondSquared, Second};
@@ -78,6 +78,10 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         PidController::default_quad(),
         Second(4.0 / 1000.0),
     );
+    // ★§5.132：真传感器路径的观测噪声按【实际传感器噪声】配置（GPS 位置 σ=0.5m、
+    //   GPS 速度 σ=0.1m/s、气压 σ=0.3m）。缺此配置时 R 为 PC 口径（微噪声）⇒ M 场
+    //   残差恒超 3σ 门限 ⇒ 气压/GPS 位置更新全拒 ⇒ 高度冻结 + 爬升失控（实测）。
+    hil.est.set_observation_noise(0.25, 0.01, 0.09);
     // 非 HIL 飞行模式：rate_mode_xy 按模式每拍设置（见循环内 setpoint 构造），
     // 速率模式（STABILIZE/ALT_HOLD）旁路位置外环，位置模式（LOITER/GUIDED/RTL/LAND）
     // 启用位置跟踪。HIL 保持位置模式（setpoint 来自 PC 轨迹）。
@@ -93,6 +97,10 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
     // [联调诊断] 最近一拍执行器指令（静态，测试直读；定位后移除）
     #[used]
     static mut DBG_MOTOR: [f32; 4] = [0.0; 4];
+    // ★§5.131 临时诊断（定位后移除）：ESKF P 对角 + 俯仰-速度交叉，测试直读
+    //   [0..2]=P[θ]diag [3..5]=P[v]diag [6]=P[θy][vx] [7]=P[θy][θy]
+    #[used]
+    static mut ESKF_PDIAG: [f32; 8] = [0.0; 8];
     // PWM 设备（4 路，control 专用）
     let mut pwm_dev: [Option<Device>; 4] = [None, None, None, None];
     let mut pwm_period: [u32; 4] = [0; 4];
@@ -345,6 +353,17 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
             imu, gps, baro_alt, None, None, mag, &setpoint, setpoint_valid, armed_eff, rc.fresh, &mut sim_imu,
         );
         let est = r.est;
+        // ★§5.131 临时诊断：写 P 摘要（hover_demo 事件分析用，定位后移除）
+        unsafe {
+            let AnyEstimatorKind::Eskf(ref esk) = hil.est.inner else {
+                panic!("P 诊断仅支持 ESKF（§5.131 临时探针）");
+            };
+            let p = &esk.filter().p;
+            let d = core::ptr::addr_of_mut!(ESKF_PDIAG);
+            (*d)[0] = p[0][0]; (*d)[1] = p[1][1]; (*d)[2] = p[2][2];
+            (*d)[3] = p[3][3]; (*d)[4] = p[4][4]; (*d)[5] = p[5][5];
+            (*d)[6] = p[1][3]; (*d)[7] = p[1][1];
+        }
         let health = r.health;
         let cmd = r.cmd;
         last_est = Some(est);

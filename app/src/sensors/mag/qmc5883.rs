@@ -14,6 +14,10 @@ pub struct MagQmc5883 {
 
 impl MagQmc5883 {
     const DATA_X_L: u8 = 0x00;
+    /// ★§5.132：raw 计数 → Gauss 的换算（±2G 量程，与虚拟外设模型同约定：
+    /// raw = G×32768/2 ⇒ 16384 LSB/G）。实芯片 ±2G 标称 12000 LSB/G——对方向型
+    /// 融合无影响（只用归一化方向）。检查驱动时**必须确认物理单位**再返回。
+    const LSB_PER_GAUSS: f32 = 16384.0;
 
     pub fn new(bus_name: &str, addr: u16) -> Option<Self> {
         Device::open(bus_name).map(|bus| {
@@ -40,7 +44,15 @@ impl MagQmc5883 {
 impl MagSensor for MagQmc5883 {
     fn read(&mut self) -> [f32; 3] {
         match self.read_raw() {
-            Some(m) => m,
+            // ★§5.132 修复：raw 计数 → 物理单位（Gauss）。
+            //   此前 `read()` 直接把原始 i16 当物理值返回 ✗（遗漏换算）⇒ ESKF 收到
+            //   16384 倍大的磁矢量 ⇒ 绝大样本被 NIS 门拒；少数落到小数值的样本
+            //   通过门控后以【错误方向】污染姿态 ⇒ M 场长悬停偶发 12°/43° 单拍
+            //   姿态跳变 + 真机翻滚（x_hover_demo 根因，逐拍探针实证 mag_m=8191/6553）。
+            //   量程 ±2G（照虚拟外设 qmc5883 模型约定：raw = G×32768/2 ⇒ LSB/G=16384；
+            //   实测 0.2G → 3276 ✓）。真芯片 ±2G 标称 12000 LSB/G——增益差 1.37×
+            //   对【方向型】磁融合无影响（ESKF 只用归一化方向 + 在线估 mag_I ✓）。
+            Some(m) => [m[0] / Self::LSB_PER_GAUSS, m[1] / Self::LSB_PER_GAUSS, m[2] / Self::LSB_PER_GAUSS],
             None => {
                 self.healthy = false;
                 [0.0; 3]

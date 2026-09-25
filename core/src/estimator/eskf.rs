@@ -601,11 +601,16 @@ impl Eskf {
             mag_b: [0.0; 3], // 未知硬铁 ⇒ 0 起步 ✓
             p,
             gate,
-            // ★R 由【残差反推】重新标定（2026-09-21 ✓，非试错 ✓）：
-            //   位置 NIS 8.6e-4 @R=2.0 ⇒ residual ≈ 7 cm ⇒ R ≈ 5e-3 ✓
+            // ★R 由【残差反推】重新标定（2026-09-21 ✓）：PC/SIL 口径（验收表以此为锚 ✓）。
+            //   ⚠️【§5.132】这组值是按 PC 级微噪声（σ_gps=1.7cm/σ_baro=1.2cm）标定的，
+            //   而真传感器路径（M 场 real-sensors：GPS 位置 σ≈0.5m、气压 σ≈0.3m）残差
+            //   常超 3σ 门限 ⇒ 气压/GPS 位置更新每拍被拒 ⇒ 高度/位置无绝对参照
+            //   （x_hover_demo 实证：baro_rej nis=5.2~77、est_vz 恒 0、真值爬升 208m）。
+            //   ⇒ **观测噪声按路径配置**：固件真传感器路径在 init 处调
+            //   `set_observation_noise(0.25, 0.01, 0.09)`（见 app/src/flyctrl/control.rs）。
+            // ★§5.133：R 保持原值（改大实测劣化 A4 协调转弯 56→161 ⇒ 门槛+自适应门控方案）
             r_gps_p: 3e-4,
             r_gps_v: 0.25,  // (0.5 m/s)² ✓
-            // ★气压 R 同样由残差反推：NIS 4.8e-5 @R=15 ⇒ residual ≈ 2.7 cm ⇒ R ≈ 1e-3 ✓
             r_baro: 1.5e-4,
             // ★R 取【数值稳定】量级（2026-09-21 由 NaN 定位 ✓）：
             //   1e-8 过小 ⇒ 增益过大 ⇒ (I − K·h) 变负 ⇒ P 失正定 ⇒ 爆炸到 1e12 ✗✓
@@ -769,17 +774,36 @@ impl Eskf {
     }
 
     /// GPS 速度（H = [0 I 0] ✓）
+    ///
+    /// ★§5.132 修复：**垂直分量不融合**（R_z→∞）。RMC 语句只提供水平 Doppler
+    /// （speed+course），垂直分量驱动器恒填 0——若当有效观测融合（原实现）则把
+    /// 估计垂直速度**死压到 0** ⇒ 真爬升时估计跟不上 ⇒ 气压残差增长 ⇒ 门控
+    /// 死锁 ⇒ 失控爬升（x_hover_demo 实测：est_vz 恒 0、真值爬 245m；H 场 PC SIL
+    /// 注入真实 v_z 故全绿——两场差异的根因 ✓）。垂直速度由气压/GPS 位置观测提供。
     pub fn update_gps_vel(&mut self, meas: [f32; 3]) -> Result<f32, &'static str> {
         let mut h = [[0.0f32; N]; 3];
         for a in 0..3 {
             h[a][I_VEL + a] = 1.0;
         }
         let resid = [meas[0] - self.st.v[0], meas[1] - self.st.v[1], meas[2] - self.st.v[2]];
-        let r = diag3(self.r_gps_v);
+        // ★垂直分量 R=1e6（≈ 无信息；不退方差/不拉状态）——见上行说明 ✓
+        let r = [[self.r_gps_v, 0.0, 0.0], [0.0, self.r_gps_v, 0.0], [0.0, 0.0, 1e6]];
         let e = self.gain_apply(&h, &resid, &r); // 先用更新前的 P ✓
         let nis = update_vec3(&mut self.p, &h, &resid, &r, self.gate)?;
         self.apply(&e);
         Ok(nis)
+    }
+
+    /// ★§5.132：按【实际传感器噪声】配置观测噪声（R）。
+    ///
+    /// 为何必须可配（非常量）：同一份 ESKF 同时服务 PC/SIL（微噪声，验收表口径）与
+    /// 真传感器飞行（GPS 位置 σ≈0.5m、气压 σ≈0.3m、GPS 速度 σ≈0.1m/s）。R 与真实
+    /// 噪声量级失配 ⇒ 残差恒超门限 ⇒ 观测被全拒 ⇒ 位置/高度无绝对参照（实测高度冻结
+    /// + 爬升失控）。R 取实际量级后门控恢复有效（3σ 内放行）。
+    pub fn set_observation_noise(&mut self, r_gps_p: f32, r_gps_v: f32, r_baro: f32) {
+        self.r_gps_p = r_gps_p;
+        self.r_gps_v = r_gps_v;
+        self.r_baro = r_baro;
     }
 
     /// 气压高度（标量 ✓，h = −d ✓ 已数值验证 ✓）

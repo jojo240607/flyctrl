@@ -7,7 +7,7 @@
 //! - **绝不静默 no-op** ✗ —— 无等价实现的通路【显式拒绝】并计数 ✓
 //! - **每条通路都有计数** ✓（"先证明机制确实在运行" ✓）
 
-use crate::estimator::eskf::Eskf;
+use crate::estimator::eskf::{Eskf, ESKF_LAST_REJ};
 use crate::estimator::trait_def::Estimator;
 use crate::units::Second;
 use crate::vehicle::{
@@ -130,6 +130,11 @@ impl EskfEstimator {
     pub fn filter(&self) -> &Eskf {
         &self.f
     }
+
+    /// ★§5.132：设置观测噪声（真传感器路径用；默认值 = PC/SIL 验收表口径）
+    pub fn set_observation_noise(&mut self, r_gps_p: f32, r_gps_v: f32, r_baro: f32) {
+        self.f.set_observation_noise(r_gps_p, r_gps_v, r_baro);
+    }
 }
 
 impl Estimator for EskfEstimator {
@@ -152,13 +157,10 @@ impl Estimator for EskfEstimator {
             // ★用【常量】比较 ✓ —— 不能用 `static = 5`：app 以裸 bin 加载 ⇒ `.data` 初值
             //   可能未生效（实测 `ESKF_DIAG_AT` 实为 0 ⇒ 永不触发 ✗）
             // ★4 个时刻各采一次 ✓（常量 ✓；用于分清"瞬态 vs 稳态偏差" ✓）
-            let slot: usize = match self.n_step {
-                10 => 0,
-                300 => 1,
-                800 => 2,
-                1500 => 3,
-                _ => usize::MAX,
-            };
+            // ★§5.131 临时诊断：逐拍写 slot 3（复用现有静态，零新增局部/静态）；
+            //   测试逐拍读 slot 3 环形缓冲，跳变时回溯固件实际消费的 acc/gyr。
+            //   定位后还原为 10/300/800/1500 四时刻采样。
+            let slot: usize = 3;
             if slot != usize::MAX {
                 unsafe {
                     let d = core::ptr::addr_of_mut!(ESKF_DIAG);
@@ -187,11 +189,16 @@ impl Estimator for EskfEstimator {
 
         // 2) 重力辅助 ✓（★降频：每 aid_period 拍融合一次 ✓）
         self.aid_div = self.aid_div.wrapping_add(1);
+        // ★§5.131 临时诊断：重力用 acc 镜像（slot2[9..12]）
+        unsafe {
+            let d = core::ptr::addr_of_mut!(ESKF_DIAG);
+            for i in 0..3 { (*d)[2 * 16 + 9 + i] = acc[i]; }
+        }
         if self.aid_div % self.aid_period.max(1) == 0 {
         match self.f.update_gravity(acc, self.g_ned) {
             Ok(n) if n > 0 => { self.n_grav_applied = self.n_grav_applied.wrapping_add(1); bump(1); }
             Ok(_) => {}
-            Err(_) => { self.n_grav_gated = self.n_grav_gated.wrapping_add(1); bump(2); } // ★门关闭 ✓
+            Err(_) => { self.n_grav_gated = self.n_grav_gated.wrapping_add(1); bump(2); mirror_rej(2); } // ★门关闭 ✓
         }
         }
 
@@ -208,7 +215,7 @@ impl Estimator for EskfEstimator {
                 bump(5);
             } else {
                 self.n_gps_pos_rejected = self.n_gps_pos_rejected.wrapping_add(1);
-                bump(6);
+                bump(6); mirror_rej(1);
             }
             crate::perf::probe(12); // ESKF: GPS 位置更新后
             if let Some(v) = p.vel {
@@ -218,7 +225,7 @@ impl Estimator for EskfEstimator {
                     bump(7);
                 } else {
                     self.n_gps_vel_rejected = self.n_gps_vel_rejected.wrapping_add(1);
-                    bump(8);
+                    bump(8); mirror_rej(1);
                 }
             }
         }
@@ -240,12 +247,22 @@ impl Estimator for EskfEstimator {
             bump(3);
         } else {
             self.n_baro_rejected = self.n_baro_rejected.wrapping_add(1);
-            bump(4);
+            bump(4); mirror_rej(0);
         }
     }
 
     fn update_mag(&mut self, mag: Option<[f32; 3]>) {
         let Some(m) = mag else { return };
+        // ★§5.131 临时诊断：磁测量 + 预测镜像（定位垃圾样本）
+        unsafe {
+            let d = core::ptr::addr_of_mut!(ESKF_DIAG);
+            let pred = crate::estimator::eskf::predicted_mag_body(
+                self.f.st.q, self.f.mag_i, self.f.mag_b);
+            for i in 0..3 {
+                (*d)[2 * 16 + 3 + i] = m[i];
+                (*d)[2 * 16 + 6 + i] = pred[i];
+            }
+        }
         // ★首个磁样本：代数反解 `mag_B`（需独立 `mag_I` 先验 ✓）—— 照参照 `resetMagStates` ✓
         if !self.mag_first_done {
             self.f.reset_mag_states(m, self.mag_i_prior);
@@ -265,7 +282,7 @@ impl Estimator for EskfEstimator {
         }
         match self.f.update_mag(m) {
             Ok(_) => { self.n_mag = self.n_mag.wrapping_add(1); bump(9); }
-            Err(_) => { self.n_mag_rejected = self.n_mag_rejected.wrapping_add(1); bump(10); }
+            Err(_) => { self.n_mag_rejected = self.n_mag_rejected.wrapping_add(1); bump(10); mirror_rej(1); }
         }
     }
 
@@ -325,5 +342,16 @@ impl Estimator for EskfEstimator {
 
     fn accel_bias(&self) -> [f32; 3] {
         self.f.st.ba
+    }
+}
+
+/// ★§5.131 临时诊断：把最后一次被拒更新的 (resid, nis, count) 镜像到 ESKF_DIAG 空闲 slot
+fn mirror_rej(slot: usize) {
+    unsafe {
+        let r = core::ptr::read_volatile(core::ptr::addr_of!(ESKF_LAST_REJ));
+        let d = core::ptr::addr_of_mut!(ESKF_DIAG);
+        (*d)[slot * 16] = r[0];
+        (*d)[slot * 16 + 1] = r[2];
+        (*d)[slot * 16 + 2] = r[3];
     }
 }
