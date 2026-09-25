@@ -127,6 +127,11 @@ impl EskfEstimator {
     }
 
     /// 内部滤波器（诊断/测试用 ✓）
+    /// ★§5.136 诊断用：内层滤波器可变访问（冻结零偏等实验）
+    pub fn filter_mut(&mut self) -> &mut Eskf {
+        &mut self.f
+    }
+
     pub fn filter(&self) -> &Eskf {
         &self.f
     }

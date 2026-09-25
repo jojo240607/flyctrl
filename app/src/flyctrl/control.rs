@@ -81,7 +81,17 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
     // ★§5.132：真传感器路径的观测噪声按【实际传感器噪声】配置（GPS 位置 σ=0.5m、
     //   GPS 速度 σ=0.1m/s、气压 σ=0.3m）。缺此配置时 R 为 PC 口径（微噪声）⇒ M 场
     //   残差恒超 3σ 门限 ⇒ 气压/GPS 位置更新全拒 ⇒ 高度冻结 + 爬升失控（实测）。
-    hil.est.set_observation_noise(0.25, 0.25, 0.09); // r_gps_v 保持原 0.25（σ=0.5m/s，族基线口径）
+    hil.est.set_observation_noise(0.25, 0.25, 0.09);
+    // ★§5.136 诊断旋钮：G_ESKF_FREEZE_BIAS=1 ⇒ 冻结零偏修正（定位"加计零偏慢漂"假设）
+    //   （裸 bin 的 .data 未初始化 ⇒ 默认读到 0 = 正常 ✓；测试用 poke 置 1）
+    {
+        let k = unsafe {
+            core::ptr::read_volatile(core::ptr::addr_of!(flyctrl_core::estimator::eskf::G_ESKF_FREEZE_BIAS))
+        };
+        if k >= 0.5 {
+            hil.est.set_freeze_bias(true);
+        }
+    } // r_gps_v 保持原 0.25（σ=0.5m/s，族基线口径）
     // 非 HIL 飞行模式：rate_mode_xy 按模式每拍设置（见循环内 setpoint 构造），
     // 速率模式（STABILIZE/ALT_HOLD）旁路位置外环，位置模式（LOITER/GUIDED/RTL/LAND）
     // 启用位置跟踪。HIL 保持位置模式（setpoint 来自 PC 轨迹）。
@@ -97,9 +107,6 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
     // [联调诊断] 最近一拍执行器指令（静态，测试直读；定位后移除）
     #[used]
     static mut DBG_MOTOR: [f32; 4] = [0.0; 4];
-    // ★§5.136 临时诊断：本拍 control 消费的陀螺/加计（[0..3)=gyr [3..6)=acc）
-    #[used]
-    static mut DBG_IMU: [f32; 6] = [0.0; 6];
     // PWM 设备（4 路，control 专用）
     let mut pwm_dev: [Option<Device>; 4] = [None, None, None, None];
     let mut pwm_period: [u32; 4] = [0; 4];
@@ -200,13 +207,6 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
             core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
         }
         // ★§5.136 临时诊断
-        unsafe {
-            let d = core::ptr::addr_of_mut!(DBG_IMU);
-            if let Some(s) = imu.as_ref() {
-                (*d)[0] = s.gyro[0].0; (*d)[1] = s.gyro[1].0; (*d)[2] = s.gyro[2].0;
-                (*d)[3] = s.accel[0].0; (*d)[4] = s.accel[1].0; (*d)[5] = s.accel[2].0;
-            }
-        }
         // 指令解锁：与地面站上行命令做逻辑或（RC 解锁 或 指令解锁 任一为真）。
         let cmd_armed = crate::flyctrl::uplink::G_CMD_ARMED.load(Ordering::Relaxed);
         let armed_eff = armed || cmd_armed;

@@ -74,6 +74,8 @@ pub static mut G_ESKF_MAG_YAW_ON: f32 = 0.0;
 /// ★§5.136 方案 A 旋钮：`2.0` ⇒ 回退"mag_B 自由估计"（legacy A/B）；其余（含裸 bin 的 0）
 /// ⇒ 默认【冻结 mag_B】（消除 mag_I↔mag_B 对倒零空间 ⇒ 无慢漂；保留三轴 roll/pitch 信息）
 pub static mut G_ESKF_MAG_FREEZE_B: f32 = 0.0;
+/// ★§5.136 诊断旋钮：`1.0` ⇒ 冻结零偏修正（定位"加计零偏慢漂"假设；默认 0 = 正常 ✓）
+pub static mut G_ESKF_FREEZE_BIAS: f32 = 0.0;
 /// ★**实验旋钮**：磁量测开关（含 `reset_mag_states` ✓）。默认 1.0 = 开。
 pub static mut G_ESKF_MAG_ON: f32 = 1.0;
 /// ★**消融开关**（诊断用 ✓，默认 1.0 = 开）：GPS 位/速融合 ✓
