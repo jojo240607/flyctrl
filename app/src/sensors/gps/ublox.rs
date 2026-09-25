@@ -70,6 +70,22 @@ impl NmeaLine {
 }
 
 /// 解析一个 NMEA 字段（`$` 之后、`,`/`*` 分隔），返回 f32（解析失败为 0）。
+/// ★§5.136：f64 换算常量与 no_std 余弦（经纬度绝对量必须 f64——f32 ULP 在 31°/121°
+/// 处折算到米为 0.41m/1.45m，实测 M 场 GPS 位置台阶恰为该值）
+const DEG2RAD_F64: f64 = core::f64::consts::PI / 180.0;
+const R_EARTH_F64: f64 = 6_371_000.0;
+
+/// no_std f64 余弦：范围规约 + 六阶级数（|t|≤π ⇒ 误差 ≈1e-9，cm 级足够）
+fn libm_cos(x: f64) -> f64 {
+    let two_pi = 2.0 * core::f64::consts::PI;
+    let mut t = x % two_pi;
+    if t > core::f64::consts::PI { t -= two_pi; }
+    if t < -core::f64::consts::PI { t += two_pi; }
+    let t2 = t * t;
+    1.0 - t2 / 2.0 + t2 * t2 / 24.0 - t2 * t2 * t2 / 720.0
+        + t2 * t2 * t2 * t2 / 40320.0 - t2 * t2 * t2 * t2 * t2 / 3628800.0
+}
+
 fn field_f32(line: &[u8], idx: usize) -> f32 {
     let mut start = 0;
     let mut cur = 0;
@@ -133,6 +149,58 @@ fn parse_float(s: &[u8]) -> f32 {
 }
 
 /// 将 NMEA 的 ddmm.mmmm 度分转为十进制度。
+/// ★§5.136：f64 版字段解析——经纬度绝对量必须 f64（f32 的 ULP 在 31°/121° 处折算
+/// 到米为 0.41m/1.45m，见下 `dm_to_deg64`；实测 M 场 GPS 位置台阶恰为该值 ⇒ 位置环
+/// 反馈被 f32 消去误差钉死）。
+fn parse_float64(s: &[u8]) -> f64 {
+    let mut val: f64 = 0.0;
+    let mut frac: f64 = 0.0;
+    let mut fscale: f64 = 0.1;
+    let mut in_frac = false;
+    for &b in s {
+        if b == b'.' {
+            in_frac = true;
+        } else if b.is_ascii_digit() {
+            let d = (b - b'0') as f64;
+            if in_frac {
+                frac += d * fscale;
+                fscale *= 0.1;
+            } else {
+                val = val * 10.0 + d;
+            }
+        } else {
+            break;
+        }
+    }
+    val + frac
+}
+
+fn field_f64(line: &[u8], idx: usize) -> f64 {
+    let mut start = 0;
+    let mut cur = 0;
+    for i in 0..line.len() {
+        if line[i] == b',' || line[i] == b'*' {
+            if cur == idx {
+                if start >= i {
+                    return 0.0;
+                }
+                return parse_float64(&line[start..i]);
+            }
+            cur += 1;
+            start = i + 1;
+        }
+    }
+    0.0
+}
+
+/// ★§5.136：ddmm.mmmm → 度（f64）。用 f64 保存绝对经纬度，NED 差值在 f64 域完成
+/// 后才降为 f32（差值小 ⇒ f32 精度足够）⇒ 消除灾难性消去（0.41m/1.45m 台阶 → 亚厘米）。
+fn dm_to_deg64(dm: f64) -> f64 {
+    let deg = (dm / 100.0) as i64;
+    let min = dm - (deg as f64) * 100.0;
+    deg as f64 + min / 60.0
+}
+
 fn dm_to_deg(dm: f32) -> f32 {
     let deg = (dm as i32) / 100;
     let min = dm - (deg as f32) * 100.0;
@@ -143,11 +211,11 @@ pub struct GpsUblox {
     dev: Device,
     line: NmeaLine,
     /// NED 原点经纬度（首次定位锁定），None 表示尚未建立原点。
-    ref_lat: Option<f32>,
-    ref_lon: Option<f32>,
-    ref_alt: Option<f32>,
+    ref_lat: Option<f64>,
+    ref_lon: Option<f64>,
+    ref_alt: Option<f64>,
     /// 最近一次 GGA 的海拔（RMC 无 alt 字段，位置 D 复用最近 GGA alt）。
-    last_alt: f32,
+    last_alt: f64,
 }
 
 impl GpsUblox {
@@ -194,14 +262,15 @@ impl GpsUblox {
     /// 尾部 2B 下批到达）。跨批时若下批与下一帧拼接错位，NmeaLine 状态机卡住，
     /// GPS 观测间歇失效（虚拟时钟校准后帧率 20Hz 暴露：gps false 恒、baro 阶跃
     /// 不被吸收、pos 漂移 14m）。256B 一次收整帧，GPS 稳定。
-    fn drain(&mut self) -> Option<(f32, f32, f32, bool, Option<[f32; 3]>)> {
+    // ★§5.136：lat/lon/alt 以 f64 传递（绝对量精度；NED 差值在 read() 内 f64 域计算）
+    fn drain(&mut self) -> Option<(f64, f64, f64, bool, Option<[f32; 3]>)> {
         let mut rb = [0u8; 256];
         let n = self.dev.read(&mut rb);
         if n <= 0 {
             return None;
         }
 
-        let mut last: Option<(f32, f32, f32, bool, Option<[f32; 3]>)> = None;
+        let mut last: Option<(f64, f64, f64, bool, Option<[f32; 3]>)> = None;
         for &b in &rb[..n as usize] {
             if let Some(linelen) = self.line.push(b) {
                 let line = &self.line.buf[..linelen];
@@ -221,11 +290,11 @@ impl GpsUblox {
                         last = None; // 未定位
                         continue;
                     }
-                    let lat = dm_to_deg(field_f32(line, 2));
+                    let lat = dm_to_deg64(field_f64(line, 2));
                     let lat = if field_char(line, 3) == b'S' { -lat } else { lat };
-                    let lon = dm_to_deg(field_f32(line, 4));
+                    let lon = dm_to_deg64(field_f64(line, 4));
                     let lon = if field_char(line, 5) == b'W' { -lon } else { lon };
-                    let alt = field_f32(line, 9);
+                    let alt = field_f64(line, 9);
                     self.last_alt = alt; // 供后续 RMC 复用（RMC 无 alt 字段）
                     last = Some((lat, lon, alt, true, None));
                 } else {
@@ -235,17 +304,17 @@ impl GpsUblox {
                         last = None; // 无效/Void
                         continue;
                     }
-                    let lat = dm_to_deg(field_f32(line, 3));
+                    let lat = dm_to_deg64(field_f64(line, 3));
                     let lat = if field_char(line, 4) == b'S' { -lat } else { lat };
-                    let lon = dm_to_deg(field_f32(line, 5));
+                    let lon = dm_to_deg64(field_f64(line, 5));
                     let lon = if field_char(line, 6) == b'W' { -lon } else { lon };
                     // Doppler 速度：地速(节)×航向(真北顺时针) → NED 北/东分量（下向无观测，置 0）
-                    let speed_ms = field_f32(line, 7) * 0.514_444; // knot → m/s
-                    let course_rad = field_f32(line, 8).to_radians();
-                    let vn = speed_ms * flyctrl_core::math::cos(course_rad);
-                    let ve = speed_ms * flyctrl_core::math::sin(course_rad);
+                    let speed_ms = field_f64(line, 7) * 0.514_444; // knot → m/s
+                    let course_rad = (field_f64(line, 8) as f32).to_radians();
+                    let vn = speed_ms * flyctrl_core::math::cos(course_rad) as f64;
+                    let ve = speed_ms * flyctrl_core::math::sin(course_rad) as f64;
                     // RMC 无 alt：复用最近 GGA 海拔，保证位置 D 与 GGA 一致
-                    last = Some((lat, lon, self.last_alt, true, Some([vn, ve, 0.0])));
+                    last = Some((lat, lon, self.last_alt, true, Some([vn as f32, ve as f32, 0.0])));
                 }
             }
         }
@@ -342,11 +411,14 @@ impl GpsSensor for GpsUblox {
             }
         };
         // WGS84 → 局部 NED（首次定位原点；赤道近似 + 纬度余弦做经线缩放）
-        let d_lat = (lat - ref_lat) * DEG2RAD;
-        let d_lon = (lon - ref_lon) * DEG2RAD;
-        let n = d_lat * R_EARTH;
-        let e = d_lon * R_EARTH * flyctrl_core::math::cos(ref_lat * DEG2RAD);
-        let d = -(alt - ref_alt); // 向下为正
+        // ★§5.136：**f64 域**做减法（f32 在 31°/121° 处 ULP 折算到米为 0.41m/1.45m
+        //   ⇒ 灾难性消去，实测 M 场 GPS 位置台阶恰为该值 ⇒ 位置环反馈粗糙）；
+        //   差值很小 ⇒ 最后降为 f32 精度充足 ✓
+        let d_lat = (lat - ref_lat) * DEG2RAD_F64;
+        let d_lon = (lon - ref_lon) * DEG2RAD_F64;
+        let n = (d_lat * R_EARTH_F64) as f32;
+        let e = (d_lon * R_EARTH_F64 * libm_cos(ref_lat * DEG2RAD_F64)) as f32;
+        let d = (-(alt - ref_alt)) as f32; // 向下为正
         match vel {
             // RMC 附带 Doppler 速度：位置 + 速度观测（EKF update_vel 约束水平速度）
             Some(v) => {
