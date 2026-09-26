@@ -7,7 +7,7 @@ use core::ffi::c_void;
 
 use flyctrl_core::controller::{PidController, Setpoint};
 // ★**默认估计器改为 ESKF**（迁移计划步 3 ✓；全表验收 0/10 劣于 Legacy ✓，见 docs/c1-migration-plan.md ✓）
-use flyctrl_core::estimator::select::AnyEstimator;
+use flyctrl_core::estimator::select::{AnyEstimator, AnyEstimatorKind};
 use flyctrl_core::fdir::Health;
 use flyctrl_core::hil::{HilContext, SimImu};
 use flyctrl_core::units::{Meter, MeterPerSecond, MeterPerSecondSquared, Second};
@@ -107,6 +107,9 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
     // [联调诊断] 最近一拍执行器指令（静态，测试直读；定位后移除）
     #[used]
     static mut DBG_MOTOR: [f32; 4] = [0.0; 4];
+    // ★§5.136 临时诊断：[0..3)=mag_i [3..6)=mag_b [6]=yaw_aligned [7]=disturbed [8]=mag_applied [9]=mag_skipped
+    #[used]
+    static mut DBG_MAGI: [f32; 10] = [0.0; 10];
     // PWM 设备（4 路，control 专用）
     let mut pwm_dev: [Option<Device>; 4] = [None, None, None, None];
     let mut pwm_period: [u32; 4] = [0; 4];
@@ -379,6 +382,17 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
             imu, gps, baro_alt, None, None, mag, &setpoint, setpoint_valid, armed_eff, rc.fresh, &mut sim_imu,
         );
         let est = r.est;
+        unsafe {
+            if let flyctrl_core::estimator::select::AnyEstimatorKind::Eskf(ref esk) = hil.est.inner {
+                let f = esk.filter();
+                let d = core::ptr::addr_of_mut!(DBG_MAGI);
+                (*d)[0] = f.mag_i[0]; (*d)[1] = f.mag_i[1]; (*d)[2] = f.mag_i[2];
+                (*d)[3] = f.mag_b[0]; (*d)[4] = f.mag_b[1]; (*d)[5] = f.mag_b[2];
+                (*d)[6] = if f.yaw_aligned { 1.0 } else { 0.0 };
+                (*d)[7] = if f.mag_field_disturbed { 1.0 } else { 0.0 };
+                (*d)[8] = f.mag_applied as f32; (*d)[9] = f.mag_skipped as f32;
+            }
+        }
         let health = r.health;
         let cmd = r.cmd;
         last_est = Some(est);

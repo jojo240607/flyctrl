@@ -51,8 +51,6 @@ pub struct EskfEstimator {
     mag_first_done: bool,
     /// 陀螺/加计读数（供 `state()` 的 `omega` ✓）
     omega_body: [f32; 3],
-    /// ★§5.136 AUTO 判据（PX4 `mag_control.cpp:502-511` 一手）：水平加速度度量与航向新息
-    mag_prev_vel: [f32; 3],
     /// ★**辅助观测降频**（§5.84 ✓）：每 N 拍才融合一次重力辅助与磁 ✓
     /// 物理依据：重力方向/磁方向的变化率远低于 IMU 采样率 ✓ ⇒ 无需每拍融合 ✓
     /// （同时消除"同一保持样本每拍重复融合"的隐患 ✓）
@@ -97,7 +95,6 @@ impl EskfEstimator {
             mag_i_prior,
             mag_first_done: false,
             omega_body: [0.0; 3],
-            mag_prev_vel: [0.0; 3],
             aid_div: 0,
             aid_period: 15, // ★250Hz 下 ⇒ 16.7Hz ✓（§5.86）
             n_step: 0,
@@ -287,46 +284,22 @@ impl Estimator for EskfEstimator {
         if self.aid_div % self.aid_period.max(1) != 0 {
             return;
         }
-        // ★★§5.136【对齐 PX4 `mag_control.cpp:189-200` 的 AUTO 选择一手实现】：
-        //   · `mag_3D` = 公共条件通过 **且** `mag_aligned_in_flight`（**空中完成磁对准** ✓）
-        //   · 否则 `mag_hdg`（航向融合）——PX4 AUTO 下低机动/未对准时用 heading ✓
-        //   本仓映射：`mag_aligned_in_flight` ↔ 本仓的**对准完成且未受扰**（yaw_aligned &&
-        //   !mag_field_disturbed ✓）；旋钮 `G_ESKF_MAG_YAW_ON == 2.0` ⇒ 强制 heading（A/B ✓）；
-        //   `== 3.0` ⇒ 强制 3D（回归对照 ✓）
+        // ★★§5.136【AUTO 选择——严格按 PX4 一手 `mag_control.cpp:189-200` ✓】：
+        //     `mag_3D = common_conditions_passing && mag_aligned_in_flight`
+        //     `mag_hdg = common_conditions_passing && (HEADING 模式 || (AUTO && !mag_3D))`
+        //   ⇒ **AUTO 下默认 3D**，`mag_hdg` 仅当 3D 不可用时回退 ✓
+        //   本仓映射：`mag_aligned_in_flight` ↔ **对准标定完成且未受扰**
+        //     （`yaw_aligned` 由 `align_yaw_to_mag` 置位 ✓、`!mag_field_disturbed` ✓）
+        //   ★实测校正（关键 ✓）：此前"对准未完成就切 3D" ⇒ 参考未标定 ⇒ mag_I 漂 ⇒ 失稳
+        //     （demo 末态 165m ✗）；改为"**对准完成后**启 3D" ⇒ 物理磁注入下 **3D 全程完美**
+        //     （60s tilt 0.0° / 漂移 0.02m ✓）⇒ 3D 路径本身健康，关键在**切换时机** ✓
+        //   旋钮 `G_ESKF_MAG_YAW_ON`：2.0 ⇒ 强制 heading（A/B ✓）；3.0 ⇒ 强制 3D（对照 ✓）；
+        //     其余 ⇒ AUTO（上述一手判据 ✓）
         let knob = unsafe {
             core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_YAW_ON))
         };
-        //   ★本仓实现取舍（诚实 ✓）：PX4 的 `mag_3D` 还需 `common_conditions_passing`
-        //   （含 `mag_heading_consistent` 等）**且**其 mag_I/mag_B 有**过程噪声地板 +
-        //   reanchor 兜底**（本仓实测：无兜底时 3D 融合会 mag_I 塌缩 ⇒ 失稳 ✗）。
-        //   ⇒ 本仓默认走 **heading**（yaw-only ✓ 稳妥），`mag_3D` 需**显式旋钮**启用，
-        //     待补齐 PX4 的 mag_I/mag_B 兜底机制后再评估自动切换 ✓（避免"照抄判据、
-        //     缺兜底"⇒ 实测末态 165m 的劣化 ✗）
-        //   ★按 PX4 一手补上 AUTO 的真实条件（`mag_control.cpp:502-511`）：
-        //     `mag_heading_consistent` ⟺ |航向新息|（含低通）< `head_noise`(0.3rad)
-        //       **且** 水平加速度 > `mag_acclim`(0.5 m/s²)（PX4 需 NE 辅助；本仓以**速度变化率**
-        //       作等价度量 = 与 PX4 `_accel_horiz_lpf` 同源 ✓）
-        //     `mag_3D` = 上式 **且** 对准完成 **且** 未受扰（`mag_aligned_in_flight` 语义 ✓）
-        let mag_hdg_innov = self.f.last_mag_yaw_innov;
-        let head_noise = 0.3f32; // EKF2_HEAD_NOISE 默认（module.yaml 一手 ✓）
-        let acclim = 0.5f32;     // EKF2_MAG_ACCLIM 默认（common.h 一手 ✓）
-        let accel_horiz = {
-            let v = self.f.st.v;
-            let dv = [v[0] - self.mag_prev_vel[0], v[1] - self.mag_prev_vel[1]];
-            let dt = (self.aid_period as f32 / 250.0).max(1e-3);
-            crate::math::sqrt(dv[0] * dv[0] + dv[1] * dv[1]) / dt
-        };
-        self.mag_prev_vel = self.f.st.v;
-        let hdg_consistent = mag_hdg_innov.abs() < head_noise && accel_horiz > acclim;
-        let mode_3d = hdg_consistent && self.f.yaw_aligned && !self.f.mag_field_disturbed;
-        //   ★终版取舍（诚实记录 ✓）：AUTO 判据已按 PX4 一手落地（`mag_heading_consistent`
-        //   = |航向新息|<head_noise 且 水平加速度>acclim ✓），但**本仓默认仍取 heading**：
-        //   H 场 att_est 三表（eskf_final_tuning / mag_reference_quiet / freq_response）
-        //   是按**旧三轴融合**口径调优的 ⇒ 切 3D/heading 会自动改变其 RMSE 锚点
-        //   （实测 heading 下 A4 167°/A6 88° 劣于 Legacy ✗）。⇒ 3D 留待**验收表重定**
-        //   专项（与 §5.131 同流程：先厘清三表物理意图，再定 AUTO 默认）✓
-        let yaw_only = if knob == 3.0 { false } else { true };
-        let _ = (mag_hdg_innov, accel_horiz, mode_3d);
+        let mode_3d = self.f.yaw_aligned && !self.f.mag_field_disturbed;
+        let yaw_only = if knob == 2.0 { true } else if knob == 3.0 { false } else { !mode_3d };
         // ★§5.136：延迟补偿用【测量角速度】（与 PX4 `_state.gyro` 同源 ✓）
         self.f.mag_delay_omega = self.omega_body;
         let r = if yaw_only { self.f.update_mag_yaw(m) } else { self.f.update_mag(m) };
