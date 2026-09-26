@@ -582,6 +582,10 @@ pub struct Eskf {
     /// ★§5.136 阶段2：对准标定剩余次数（>0 ⇒ 仍允许重对准；用于"姿态收敛前"重复对准，
     /// 避免把未收敛的姿态误差烙进参考 ⇒ 实测 A1 劣化 1.15° 的根因 ✓）
     pub align_remaining: u32,
+    /// ★§5.136【对齐 PX4 `checkMagField()`】磁干扰标志：强度或倾角超差 ⇒ 置位并**拒融合** ✓
+    pub mag_field_disturbed: bool,
+    /// 磁干扰拒绝计数（诊断 ✓）
+    pub mag_disturbed_count: u32,
     /// **冻结零偏修正**（定位用 ✓）：静止场景下零偏本就【不可观测】✗
     /// （无足够量测激励 ✓）⇒ 用于判定"长循环慢性发散是否由零偏块引起" ✓
     pub freeze_bias: bool,
@@ -636,6 +640,8 @@ impl Eskf {
             mag_skipped: 0,
             nan_inject_rejected: 0,
             align_remaining: 0,
+            mag_field_disturbed: false,
+            mag_disturbed_count: 0,
             freeze_bias: false,
         }
     }
@@ -1135,9 +1141,57 @@ impl Eskf {
         self.yaw_aligned = true;
     }
 
+    /// ★§5.136【对齐 PX4 `mag_control.cpp::checkMagField()` 一手实现】磁干扰检测：
+    ///   · **强度**：`|m|` 须匹配期望场强（PX4 无 WMM 时用**平均地磁 0.45 G ± 0.40 G** ✓）
+    ///   · **倾角**：`asin(m_ned_z/|m|)` 与**先验 `mag_I` 的倾角**之差 ≤ `chk_inc`（PX4 默认
+    ///     20° ✓；PX4 用 WMM 倾角，本仓用对准标定后的 `mag_I` 倾角 = 同源先验 ✓）
+    ///   任一超差 ⇒ `mag_field_disturbed = true` 并**拒绝融合** ✓（PX4 同型 ✓）
+    pub fn check_mag_field(&mut self, meas_body: [f32; 3]) -> bool {
+        let m_n = rotate_vec_by_quat(self.st.q, meas_body);
+        let n = crate::math::sqrt(m_n[0] * m_n[0] + m_n[1] * m_n[1] + m_n[2] * m_n[2]);
+        if !(n > 1e-3) || !n.is_finite() {
+            self.mag_field_disturbed = true;
+            self.mag_disturbed_count = self.mag_disturbed_count.wrapping_add(1);
+            return false;
+        }
+        // ① 强度门（照 PX4：平均地磁 0.45 G ± 0.40 G ✓）
+        const AVG_EARTH_MAG_GAUSS: f32 = 0.45;
+        const AVG_EARTH_MAG_GATE: f32 = 0.40;
+        if (n - AVG_EARTH_MAG_GAUSS).abs() > AVG_EARTH_MAG_GATE {
+            self.mag_field_disturbed = true;
+            self.mag_disturbed_count = self.mag_disturbed_count.wrapping_add(1);
+            return false;
+        }
+        // ② 倾角门（照 PX4：与期望倾角之差 ≤ chk_inc，默认 20° ✓）
+        let pi = crate::math::sqrt(
+            self.mag_i[0] * self.mag_i[0] + self.mag_i[1] * self.mag_i[1] + self.mag_i[2] * self.mag_i[2],
+        );
+        if pi > 1e-3 {
+            let inc_meas = crate::math::asin((m_n[2] / n).clamp(-1.0, 1.0));
+            let inc_prior = crate::math::asin((self.mag_i[2] / pi).clamp(-1.0, 1.0));
+            let inc_tol = 20.0f32.to_radians();
+            let mut d = inc_meas - inc_prior;
+            // wrap 到 [-π, π]（照 PX4 wrap_pi ✓）
+            let two_pi = 6.283_185_5f32;
+            while d > 3.141_592_7 { d -= two_pi; }
+            while d < -3.141_592_7 { d += two_pi; }
+            if d.abs() > inc_tol {
+                self.mag_field_disturbed = true;
+                self.mag_disturbed_count = self.mag_disturbed_count.wrapping_add(1);
+                return false;
+            }
+        }
+        self.mag_field_disturbed = false;
+        true
+    }
+
     pub fn update_mag_yaw(&mut self, meas_body: [f32; 3]) -> Result<f32, &'static str> {
         if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_ON)) } == 2.0 {
             return Err("磁量测：对照臂【旋钮关闭】✓（实验用，非静默 ✗）");
+        }
+        // ★§5.136【对齐 PX4】入口先做**磁干扰检测**（强度/倾角）⇒ 不合格拒融合 ✓
+        if !self.check_mag_field(meas_body) {
+            return Err("磁量测：磁场受扰（强度/倾角超差）⇒ 拒融合 ✓（PX4 checkMagField 同型）");
         }
         // ★对准窗口内：**先重复对准**（跟随收敛中的姿态 ⇒ 参考逐步正确 ✓），
         //   然后**继续走正常融合**（不提前返回！——否则窗口结束时 P[θz] 未收敛 ⇒

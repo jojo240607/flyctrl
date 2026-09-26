@@ -93,3 +93,34 @@ fn yaw_only_without_alignment_behaviour_recorded() {
     // 核心回归判据：磁更新**必须真的在动姿态**（修复前恒零退化 ⇒ 完全不动 ✗）
     assert!(moved, "磁更新未使姿态发生变化 ⇒ 疑似新息恒零退化（§5.136 修复项，回归！）");
 }
+
+/// ★§5.136【对齐 PX4 `mag_control.cpp::checkMagField()` 一手实现】磁干扰检测：
+///   · 强度：|m| 须在 平均地磁 0.45G ± 0.40G 内（PX4 无 WMM 时的判据 ✓）
+///   · 倾角：实测倾角与先验 mag_I 倾角之差 ≤ 20°（PX4 `ekf2_mag_chk_inc` 默认 ✓）
+///   超差 ⇒ mag_field_disturbed=true 且**拒融合** ✓（噪声/扰动不得进入姿态估计 ✓）
+#[test]
+fn mag_disturbance_detection_matches_px4_thresholds() {
+    let mut f = Eskf::new(
+        Quaternion::from_axis_angle([0.0, 0.0, 1.0], Radian(0.0)),
+        [0.0; 3], [0.0; 3], 5.0,
+    );
+    f.mag_i = [0.2f32, 0.0, 0.4]; // |m|=0.447G ✓ 倾角 asin(0.4/0.447)=63.4°
+    f.mag_b = [0.0; 3];
+
+    // ① 正常场（= 先验同向）⇒ 通过 ✓
+    assert!(f.check_mag_field([0.2, 0.0, 0.4]), "正常场应通过 ✓");
+    assert!(!f.mag_field_disturbed);
+
+    // ② 强度超差（|m|=2.0G，远超 0.45+0.40）⇒ 拒 ✓
+    assert!(!f.check_mag_field([1.0, 0.0, 1.732]), "强度超差应被拒 ✗");
+    assert!(f.mag_field_disturbed);
+
+    // ③ 强度正常但**倾角超差**（水平场：倾角 0° vs 先验 63.4° ⇒ 差 63.4° > 20°）⇒ 拒 ✓
+    assert!(!f.check_mag_field([0.45, 0.0, 0.0]), "倾角超差应被拒 ✗");
+
+    // ④ 干扰消失 ⇒ 恢复（且计数值记录了前两次拒绝 ✓）
+    assert!(f.check_mag_field([0.2, 0.0, 0.4]), "干扰消失后应恢复 ✓");
+    assert!(!f.mag_field_disturbed);
+    println!("[干扰检测] 拒绝计数 = {}（≥2 ✓）", f.mag_disturbed_count);
+    assert!(f.mag_disturbed_count >= 2, "应记录 ≥2 次干扰拒绝");
+}
