@@ -1146,12 +1146,24 @@ impl Eskf {
             self.align_remaining -= 1;
             self.align_yaw_to_mag(meas_body);
         }
-        // 实测磁场 → 导航系（用当前姿态）
-        let m_n = rotate_vec_by_quat(self.st.q, meas_body);
-        let (mx, my) = (m_n[0], m_n[1]);
-        let (px, py) = (self.mag_i[0], self.mag_i[1]);
-        // 水平分量有符号夹角（正 = 实测相对先验偏 +yaw）
-        let yaw_err = crate::math::atan2(mx * py - my * px, mx * px + my * py);
+        // ★★§5.136【对齐 PX4 一手公式】预测机体场 vs 实测机体场：
+        //   PX4 `mag_fusion.cpp:79`（main 分支原文）：
+        //     innovation[index] = quat_nominal.rotateVectorInverse(mag_I)(index) + mag_B(index) - mag(index)
+        //   即 **pred = R(q_est)ᵀ·mag_I + mag_B**，与**实测机体场**比较 ✓
+        //   ⚠️ 反面（本仓初版错误，已修）：若用【估计姿态】把实测场转回导航系再与固定
+        //      mag_I 比 ⇒ m_n ≡ mag_I 恒等 ⇒ **新息恒 0、磁更新完全失效且不可察觉** ✗✗
+        //      （单测"姿态漂移 5° 未被拉回"当场抓出 ✓ —— 保留该单测作回归防护 ✓）
+        let pred_b = rotate_vec_by_quat_inverse(self.st.q, self.mag_i);
+        let (pred_x, pred_y) = (pred_b[0] + self.mag_b[0], pred_b[1] + self.mag_b[1]);
+        let (mx, my) = (meas_body[0], meas_body[1]);
+        // 机体水平面内"实测相对预测"的有符号夹角 = 航向误差 ✓
+        //   ★符号（一手依据对照，非记忆 ✓）：
+        //     · PX4 `mag_fusion.cpp:79`：`innovation = R(q)ᵀ·mag_I + mag_B − mag`（= **pred − meas**）
+        //     · PX4 `ekf_helper.cpp::fuse()`：姿态注入 `AxisAngle(K·(-1·innovation))` ⇒
+        //       `q ← δq(K·(-ν)) ⊗ q`（带负号、左乘）
+        //     两者相抵 ⇒ 等效于按 **meas − pred** 的方向旋转 ✓（本仓 `apply()` 亦为左乘相加
+        //     注入 ⇒ 语义一致 ✓）⇒ 此处分子取 `mx·pred_y − my·pred_x`（= meas − pred 的叉积）✓
+        let yaw_err = crate::math::atan2(mx * pred_y - my * pred_x, mx * pred_x + my * pred_y);
         if !yaw_err.is_finite() {
             self.mag_skipped = self.mag_skipped.wrapping_add(1);
             return Err("磁量测：航向残差非有限 ⇒ 跳过 ✓");
@@ -1180,12 +1192,40 @@ impl Eskf {
         self.mag_applied = self.mag_applied.wrapping_add(1);
         let mut e = ErrorState::default();
         // 与既有约定一致：dx = K·ν，ν = 实测 − 预测（"真值相对名义"）⇒ 相加注入 ✓
-        let dxz = ph[idx] / s_ * yaw_err;
+        let mut dxz = ph[idx] / s_ * yaw_err;
+        // ★★§5.136【对齐 PX4 一手机制】航向修正**速率限幅**：PX4 `mag_fusion.cpp`
+        //   （main 分支，第 135~144 行原文）：
+        //     // limit total heading change rate to prevent rapid wrong convergence
+        //     // when heading variance is high
+        //     const float delta_heading = Kfusion(quat_nominal.idx+2) * innovation[index];
+        //     if (delta_heading_abs > delta_heading_max) { Kfusion *= delta_heading_max/delta_heading_abs; }
+        //   其中 `delta_heading_max = radians(1°) * dt_heading`（同上文件 63~66 行），
+        //   dt_heading ∈ [1e-4, 0.2] 秒（即**航向修正速率上限 ≈ 1°/s**）。
+        //   动机（本仓实证）：M 场"物理正确的磁输入"下 yaw 修正会踢扰动环路（SIL 稳定），
+        //   而本仓 mag 更新为 16.7Hz 降频、单次修正可能很大 ⇒ 按此限速可根治"高航向
+        //   方差下的快速错误收敛" ✓（dt_heading 按本仓更新周期 60ms 计 ✓）
+        {
+            const DELTA_HEADING_MAX_PER_S: f32 = 0.017_453_293; // 1°/s（弧度制 ✓）
+            let dt_heading = 1.0f32 / 16.7f32; // 本仓磁更新周期 ≈60ms（aid_period=15@250Hz）
+            let delta_heading_max = DELTA_HEADING_MAX_PER_S * dt_heading;
+            if dxz.abs() > delta_heading_max {
+                dxz = if dxz < 0.0 { -delta_heading_max } else { delta_heading_max };
+            }
+        }
         e.dtheta[2] = dxz;
         // P ← (I − K·h)·P：h 只有 idx 列非零 ⇒ (h·P)[b] = P[idx][b]；
         // K[a] = (P·hᵀ)[a]/S = P[a][idx]/S = ph[a]/s_（**所有行**一般非零 ✓）
+        // ★航向限速时按同比缩放 K（与 PX4 `Kfusion *= delta_heading_max/|delta_heading|` 等价 ✓）
+        //   注意：`dxz` 已在上面被 clamp ⇒ 用"clamp 前/后之比"作缩放因子（数值安全：
+        //   分母下限保护 ✓）
+        let dx_raw = ph[idx] / s_ * yaw_err;
+        let k_scale = if dx_raw.abs() > 1e-12 {
+            (dxz / dx_raw).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
         for a in 0..N {
-            let ka = ph[a] / s_;
+            let ka = ph[a] / s_ * k_scale;
             if ka == 0.0 {
                 continue;
             }
@@ -1199,11 +1239,11 @@ impl Eskf {
         //   良态；不会进入 mag_I/mag_B 的"对倒"零空间 ⇒ 无慢漂 ✓）
         {
             let h_meas = crate::math::sqrt(mx * mx + my * my);
-            let h_prior = crate::math::sqrt(px * px + py * py);
+            let h_prior = crate::math::sqrt(self.mag_i[0] * self.mag_i[0] + self.mag_i[1] * self.mag_i[1]);
             if h_meas > 1e-3 && h_prior > 1e-3 {
                 let b = 0.02f32; // 慢学习（≈每拍 2%，16.7Hz ⇒ 时间常数 ~3s ✓）
-                let nx = (1.0 - b) * px + b * mx;
-                let ny = (1.0 - b) * py + b * my;
+                let nx = (1.0 - b) * self.mag_i[0] + b * mx;
+                let ny = (1.0 - b) * self.mag_i[1] + b * my;
                 let nn = crate::math::sqrt(nx * nx + ny * ny);
                 if nn > 1e-6 {
                     // 保持原水平模长 ⇒ 只学方向 ✓
