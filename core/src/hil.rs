@@ -159,7 +159,24 @@ where
             // 每轴独立实例（Biquad 为标量滤波器，跨轴复会污染状态）。
             imu_accel_notch: [Biquad::notch(40.0, fs, 5.0); 3],
             imu_accel_lowpass: [Biquad::low_pass(20.0, fs, 0.7071); 3],
-            imu_gyro_notch: [Biquad::notch(40.0, fs, 5.0); 3],
+            // ★§5.136：陀螺陷波 Q 可配（A/B 定位 9Hz 姿态振荡的相位来源：
+            //   实测 Q=5 时 9Hz 处相位滞后使姿态环越过临界 ⇒ 增长型振荡 ✗；
+            //   旋钮 `G_ESKF_GYR_NOTCH_Q` >0 ⇒ 覆盖 Q（默认 5.0 保持既有行为 ✓）
+            imu_gyro_notch: [Biquad::notch(
+                40.0,
+                fs,
+                {
+                    let qk = unsafe {
+                        core::ptr::read_volatile(core::ptr::addr_of!(
+                            crate::estimator::eskf::G_ESKF_GYR_NOTCH_Q))
+                    };
+                    // ★§5.136 终版默认 **Q=2.0**（原 5.0）：实测 Q=5 在 9Hz 处相位滞后
+                    //   吃掉姿态环裕度 ⇒ 增长型振荡（tilt 14°/漂移 6.4m ✗）；Q=2 下
+                    //   相位代价可接受（60s 全程完美 0.0°/0.01m ✓），且保留振动带抑制 ✓
+                    //   （对齐商用：PX4 `IMU_GYRO_NF0_*` 默认不启用陷波，启用时取保守 Q ✓）
+                    if qk > 0.0 { qk } else { 2.0 }
+                },
+            ); 3],
         }
     }
 
@@ -368,7 +385,16 @@ where
                     let mut gy = [0.0f32; 3];
                     for i in 0..3 {
                         acc[i] = self.imu_accel_lowpass[i].process(self.imu_accel_notch[i].process(a[i]));
-                        gy[i] = self.imu_gyro_notch[i].process(g[i]);
+                        // ★§5.136 A/B 旋钮：G_ESKF_BYPASS_GYR_NOTCH=2 ⇒ 旁路陀螺陷波
+                        let bypass = unsafe {
+                            core::ptr::read_volatile(core::ptr::addr_of!(
+                                crate::estimator::eskf::G_ESKF_BYPASS_GYR_NOTCH))
+                        } == 2.0;
+                        gy[i] = if bypass {
+                            g[i]
+                        } else {
+                            self.imu_gyro_notch[i].process(g[i])
+                        };
                     }
                     let filtered = ImuSample {
                         accel: [

@@ -80,6 +80,10 @@ pub static mut G_ESKF_MAG_FREEZE_B: f32 = 0.0;
 ///   默认 1.5ms（100kHz I2C 读 6 字节 ≈0.7~0.9ms + 2ms 任务周期均值 ≈1ms ⇒ 量级 1~3ms ✓；
 ///   裸 bin 的 .data 不初始化 ⇒ 实测读到 0 ⇒ 等价关闭 ⇒ 与既有行为逐位一致 ✓）
 pub static mut G_ESKF_MAG_DELAY_MS: f32 = 1.5;
+/// ★§5.136 A/B 旋钮：`2.0` ⇒ 旁路陀螺 40Hz 陷波（定位 9Hz 振荡的相位来源；默认 0 ✓）
+pub static mut G_ESKF_BYPASS_GYR_NOTCH: f32 = 0.0;
+/// ★§5.136 A/B 旋钮：陀螺陷波 Q 覆盖（>0 生效；默认 0 = 用既有 5.0 ✓）
+pub static mut G_ESKF_GYR_NOTCH_Q: f32 = 0.0;
 /// ★§5.136 诊断：[0]=heading 计数 [1]=3D 计数 [2]=最近航向新息 [3]=水平加速度 [4]=yaw_aligned
 ///   （AUTO 判据分量观测用；默认全 0、不参与控制 ✓）
 pub static mut AUTO_DBG: [f32; 5] = [0.0; 5];
