@@ -106,6 +106,8 @@ fn mag_disturbance_detection_matches_px4_thresholds() {
     );
     f.mag_i = [0.2f32, 0.0, 0.4]; // |m|=0.447G ✓ 倾角 asin(0.4/0.447)=63.4°
     f.mag_b = [0.0; 3];
+    // ★一手：PX4 `ekf2_mag_check` **默认 0 = 关闭** ✓ ⇒ 测例显式启用（对齐诊断用法 ✓）
+    unsafe { flyctrl_core::estimator::eskf::G_ESKF_MAG_CHECK = 2.0 };
 
     // ① 正常场（= 先验同向）⇒ 通过 ✓
     assert!(f.check_mag_field([0.2, 0.0, 0.4]), "正常场应通过 ✓");
@@ -123,6 +125,7 @@ fn mag_disturbance_detection_matches_px4_thresholds() {
     assert!(!f.mag_field_disturbed);
     println!("[干扰检测] 拒绝计数 = {}（≥2 ✓）", f.mag_disturbed_count);
     assert!(f.mag_disturbed_count >= 2, "应记录 ≥2 次干扰拒绝");
+    unsafe { flyctrl_core::estimator::eskf::G_ESKF_MAG_CHECK = 0.0 }; // 还原默认关 ✓
 }
 
 /// ★§5.136【对齐 PX4 `mag_fusion.cpp::fuseDeclination()` 一手实现】磁偏角融合：

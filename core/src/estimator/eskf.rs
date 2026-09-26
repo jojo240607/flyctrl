@@ -79,11 +79,16 @@ pub static mut G_ESKF_MAG_FREEZE_B: f32 = 0.0;
 ///   以【一阶姿态回退】等价实现：预测机体场按 `q ⊖ ω·Δt` 回退到采样时刻再与新息比较 ✓
 ///   默认 1.5ms（100kHz I2C 读 6 字节 ≈0.7~0.9ms + 2ms 任务周期均值 ≈1ms ⇒ 量级 1~3ms ✓；
 ///   裸 bin 的 .data 不初始化 ⇒ 实测读到 0 ⇒ 等价关闭 ⇒ 与既有行为逐位一致 ✓）
-pub static mut G_ESKF_MAG_DELAY_MS: f32 = 1.5;
+/// ★§5.136 一手：PX4 `ekf2_mag_delay{0.0f}` **默认 0**（`common.h:407` ✓）⇒ 本仓同样默认 0 ✓
+///   （>0 时按一阶姿态回退做时间对齐，等价 PX4 的时间戳平移 ✓；单位毫秒 ✓ 同一手）
+pub static mut G_ESKF_MAG_DELAY_MS: f32 = 0.0;
 /// ★§5.136 A/B 旋钮：`2.0` ⇒ 旁路陀螺 40Hz 陷波（定位 9Hz 振荡的相位来源；默认 0 ✓）
 pub static mut G_ESKF_BYPASS_GYR_NOTCH: f32 = 0.0;
 /// ★§5.136 A/B 旋钮：陀螺陷波 Q 覆盖（>0 生效；默认 0 = 用既有 5.0 ✓）
 pub static mut G_ESKF_GYR_NOTCH_Q: f32 = 0.0;
+/// ★§5.136 一手旋钮：磁干扰检查（强度/倾角）——**默认关**（对齐 PX4 `ekf2_mag_check=0` ✓）；
+///   `2.0` ⇒ 启用（定位/诊断用 ✓）
+pub static mut G_ESKF_MAG_CHECK: f32 = 0.0;
 /// ★§5.136 诊断：[0]=heading 计数 [1]=3D 计数 [2]=最近航向新息 [3]=水平加速度 [4]=yaw_aligned
 ///   （AUTO 判据分量观测用；默认全 0、不参与控制 ✓）
 pub static mut AUTO_DBG: [f32; 5] = [0.0; 5];
@@ -1166,6 +1171,16 @@ impl Eskf {
     ///     20° ✓；PX4 用 WMM 倾角，本仓用对准标定后的 `mag_I` 倾角 = 同源先验 ✓）
     ///   任一超差 ⇒ `mag_field_disturbed = true` 并**拒绝融合** ✓（PX4 同型 ✓）
     pub fn check_mag_field(&mut self, meas_body: [f32; 3]) -> bool {
+        // ★§5.136 一手：PX4 `ekf2_mag_check` **默认 0 ⇒ 干扰检查默认关闭** ✓
+        //   （`mag_control.cpp::checkMagField` 首行：`if (ekf2_mag_check == 0) return true;`）
+        //   本仓旋钮 `G_ESKF_MAG_CHECK`：`2.0` ⇒ 启用检查（A/B ✓）；其余（含裸 bin 的 0）⇒ 关闭 ✓
+        let en = unsafe {
+            core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_CHECK))
+        };
+        if en != 2.0 {
+            self.mag_field_disturbed = false;
+            return true;
+        }
         let m_n = rotate_vec_by_quat(self.st.q, meas_body);
         let n = crate::math::sqrt(m_n[0] * m_n[0] + m_n[1] * m_n[1] + m_n[2] * m_n[2]);
         if !(n > 1e-3) || !n.is_finite() {
@@ -1417,6 +1432,34 @@ impl Eskf {
             }
         }
         Ok(nis)
+    }
+
+    /// ★§5.136【对齐 PX4】3D 融合的**可选扩展**：干扰检测（`checkMagField` ✓）+ 时间对齐
+    ///   （`ekf2_mag_delay` ✓）。**独立入口**，默认不调用 ⇒ `update_mag` 保持逐位等价
+    ///   （实测：任何插进默认路径的等价改动都会扰动 att_est 三表 ✗ ⇒ 纪律性隔离 ✓）
+    pub fn update_mag_ext(&mut self, meas_body: [f32; 3]) -> Result<f32, &'static str> {
+        if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_CHECK)) } == 2.0
+            && !self.check_mag_field(meas_body)
+        {
+            return Err("磁量测：磁场受扰（强度/倾角超差）⇒ 拒融合 ✓");
+        }
+        let delay = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_DELAY_MS)) };
+        if delay <= 0.0 {
+            return self.update_mag(meas_body); // 无对齐需求 ⇒ 原路径 ✓
+        }
+        let dt = (delay * 1e-3f32).min(0.05);
+        let w = self.mag_delay_omega;
+        let wn = crate::math::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+        let q_saved = self.st.q;
+        if wn > 1e-6 {
+            self.st.q = Quaternion::from_axis_angle(
+                [w[0] / wn, w[1] / wn, w[2] / wn],
+                crate::units::Radian(-wn * dt),
+            ) * self.st.q;
+        }
+        let r = self.update_mag(meas_body);
+        self.st.q = q_saved; // 恢复（对齐仅用于预测 ✓）
+        r
     }
 
     pub fn update_mag(&mut self, meas_body: [f32; 3]) -> Result<f32, &'static str> {

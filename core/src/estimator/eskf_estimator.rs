@@ -298,11 +298,19 @@ impl Estimator for EskfEstimator {
         let knob = unsafe {
             core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_YAW_ON))
         };
+        //   ★一手精读（`mag_control.cpp:181-190, 502-511` ✓）：`mag_heading_consistent`
+        //     仅在**存在 NE 外部辅助**（`isNorthEastAidingActive()`）时才参与公共条件
+        //     ⇒ 其判定为 `mag_consistent_or_no_ne_aiding = mag_heading_consistent ||
+        //        !isNorthEastAidingActive()`。**本仓无 NE 辅助**（GPS 位置/速度不提供航向 ✓）
+        //     ⇒ 该分支恒满足 ⇒ `mag_3D` 只需"**对准完成 + 未受扰**" ✓（即下方判据 ✓）
+        //     注：曾尝试把 `|航向新息|<head_noise 且 水平速度>阈` 作为必要条件 ⇒ 悬停
+        //     （速度≈0）会退回 heading ⇒ 与验收表口径冲突（3 项失败 ✗）⇒ 按一手回退 ✓
         let mode_3d = self.f.yaw_aligned && !self.f.mag_field_disturbed;
         let yaw_only = if knob == 2.0 { true } else if knob == 3.0 { false } else { !mode_3d };
         // ★§5.136：延迟补偿用【测量角速度】（与 PX4 `_state.gyro` 同源 ✓）
         self.f.mag_delay_omega = self.omega_body;
-        let r = if yaw_only { self.f.update_mag_yaw(m) } else { self.f.update_mag(m) };
+        // ★§5.136：3D 路径走**扩展入口**（干扰检测 + 延迟对齐，均默认关 ⇒ 与旧行为一致 ✓）
+        let r = if yaw_only { self.f.update_mag_yaw(m) } else { self.f.update_mag_ext(m) };
         match r {
             Ok(_) => { self.n_mag = self.n_mag.wrapping_add(1); bump(9); }
             Err(_) => { self.n_mag_rejected = self.n_mag_rejected.wrapping_add(1); bump(10); }
