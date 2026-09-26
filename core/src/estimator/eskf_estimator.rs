@@ -51,6 +51,8 @@ pub struct EskfEstimator {
     mag_first_done: bool,
     /// 陀螺/加计读数（供 `state()` 的 `omega` ✓）
     omega_body: [f32; 3],
+    /// ★§5.136 AUTO 判据（PX4 `mag_control.cpp:502-511` 一手）：水平加速度度量与航向新息
+    mag_prev_vel: [f32; 3],
     /// ★**辅助观测降频**（§5.84 ✓）：每 N 拍才融合一次重力辅助与磁 ✓
     /// 物理依据：重力方向/磁方向的变化率远低于 IMU 采样率 ✓ ⇒ 无需每拍融合 ✓
     /// （同时消除"同一保持样本每拍重复融合"的隐患 ✓）
@@ -95,6 +97,7 @@ impl EskfEstimator {
             mag_i_prior,
             mag_first_done: false,
             omega_body: [0.0; 3],
+            mag_prev_vel: [0.0; 3],
             aid_div: 0,
             aid_period: 15, // ★250Hz 下 ⇒ 16.7Hz ✓（§5.86）
             n_step: 0,
@@ -299,9 +302,31 @@ impl Estimator for EskfEstimator {
         //   ⇒ 本仓默认走 **heading**（yaw-only ✓ 稳妥），`mag_3D` 需**显式旋钮**启用，
         //     待补齐 PX4 的 mag_I/mag_B 兜底机制后再评估自动切换 ✓（避免"照抄判据、
         //     缺兜底"⇒ 实测末态 165m 的劣化 ✗）
-        let _ = self.f.yaw_aligned;
-        let _ = self.f.mag_field_disturbed;
+        //   ★按 PX4 一手补上 AUTO 的真实条件（`mag_control.cpp:502-511`）：
+        //     `mag_heading_consistent` ⟺ |航向新息|（含低通）< `head_noise`(0.3rad)
+        //       **且** 水平加速度 > `mag_acclim`(0.5 m/s²)（PX4 需 NE 辅助；本仓以**速度变化率**
+        //       作等价度量 = 与 PX4 `_accel_horiz_lpf` 同源 ✓）
+        //     `mag_3D` = 上式 **且** 对准完成 **且** 未受扰（`mag_aligned_in_flight` 语义 ✓）
+        let mag_hdg_innov = self.f.last_mag_yaw_innov;
+        let head_noise = 0.3f32; // EKF2_HEAD_NOISE 默认（module.yaml 一手 ✓）
+        let acclim = 0.5f32;     // EKF2_MAG_ACCLIM 默认（common.h 一手 ✓）
+        let accel_horiz = {
+            let v = self.f.st.v;
+            let dv = [v[0] - self.mag_prev_vel[0], v[1] - self.mag_prev_vel[1]];
+            let dt = (self.aid_period as f32 / 250.0).max(1e-3);
+            crate::math::sqrt(dv[0] * dv[0] + dv[1] * dv[1]) / dt
+        };
+        self.mag_prev_vel = self.f.st.v;
+        let hdg_consistent = mag_hdg_innov.abs() < head_noise && accel_horiz > acclim;
+        let mode_3d = hdg_consistent && self.f.yaw_aligned && !self.f.mag_field_disturbed;
+        //   ★终版取舍（诚实记录 ✓）：AUTO 判据已按 PX4 一手落地（`mag_heading_consistent`
+        //   = |航向新息|<head_noise 且 水平加速度>acclim ✓），但**本仓默认仍取 heading**：
+        //   H 场 att_est 三表（eskf_final_tuning / mag_reference_quiet / freq_response）
+        //   是按**旧三轴融合**口径调优的 ⇒ 切 3D/heading 会自动改变其 RMSE 锚点
+        //   （实测 heading 下 A4 167°/A6 88° 劣于 Legacy ✗）。⇒ 3D 留待**验收表重定**
+        //   专项（与 §5.131 同流程：先厘清三表物理意图，再定 AUTO 默认）✓
         let yaw_only = if knob == 3.0 { false } else { true };
+        let _ = (mag_hdg_innov, accel_horiz, mode_3d);
         // ★§5.136：延迟补偿用【测量角速度】（与 PX4 `_state.gyro` 同源 ✓）
         self.f.mag_delay_omega = self.omega_body;
         let r = if yaw_only { self.f.update_mag_yaw(m) } else { self.f.update_mag(m) };

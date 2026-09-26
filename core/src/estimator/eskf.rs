@@ -80,6 +80,9 @@ pub static mut G_ESKF_MAG_FREEZE_B: f32 = 0.0;
 ///   默认 1.5ms（100kHz I2C 读 6 字节 ≈0.7~0.9ms + 2ms 任务周期均值 ≈1ms ⇒ 量级 1~3ms ✓；
 ///   裸 bin 的 .data 不初始化 ⇒ 实测读到 0 ⇒ 等价关闭 ⇒ 与既有行为逐位一致 ✓）
 pub static mut G_ESKF_MAG_DELAY_MS: f32 = 1.5;
+/// ★§5.136 诊断：[0]=heading 计数 [1]=3D 计数 [2]=最近航向新息 [3]=水平加速度 [4]=yaw_aligned
+///   （AUTO 判据分量观测用；默认全 0、不参与控制 ✓）
+pub static mut AUTO_DBG: [f32; 5] = [0.0; 5];
 /// ★§5.136 诊断旋钮：`1.0` ⇒ 冻结零偏修正（定位"加计零偏慢漂"假设；默认 0 = 正常 ✓）
 pub static mut G_ESKF_FREEZE_BIAS: f32 = 0.0;
 /// ★**实验旋钮**：磁量测开关（含 `reset_mag_states` ✓）。默认 1.0 = 开。
@@ -594,6 +597,8 @@ pub struct Eskf {
     pub mag_disturbed_count: u32,
     /// ★§5.136 延迟补偿用【测量机体角速度】（调用方每拍设置 = PX4 `_state.gyro` 同源 ✓）
     pub mag_delay_omega: [f32; 3],
+    /// ★§5.136 最近一次航向新息（AUTO 判据 `mag_heading_consistent` 用 ✓ PX4 一手）
+    pub last_mag_yaw_innov: f32,
     /// **冻结零偏修正**（定位用 ✓）：静止场景下零偏本就【不可观测】✗
     /// （无足够量测激励 ✓）⇒ 用于判定"长循环慢性发散是否由零偏块引起" ✓
     pub freeze_bias: bool,
@@ -651,6 +656,7 @@ impl Eskf {
             mag_field_disturbed: false,
             mag_disturbed_count: 0,
             mag_delay_omega: [0.0; 3],
+            last_mag_yaw_innov: 0.0,
             freeze_bias: false,
         }
     }
@@ -1317,6 +1323,7 @@ impl Eskf {
         //     两者相抵 ⇒ 等效于按 **meas − pred** 的方向旋转 ✓（本仓 `apply()` 亦为左乘相加
         //     注入 ⇒ 语义一致 ✓）⇒ 此处分子取 `mx·pred_y − my·pred_x`（= meas − pred 的叉积）✓
         let yaw_err = crate::math::atan2(mx * pred_y - my * pred_x, mx * pred_x + my * pred_y);
+        self.last_mag_yaw_innov = yaw_err; // AUTO 判据用（PX4 mag_heading_consistent ✓）
         if !yaw_err.is_finite() {
             self.mag_skipped = self.mag_skipped.wrapping_add(1);
             return Err("磁量测：航向残差非有限 ⇒ 跳过 ✓");
