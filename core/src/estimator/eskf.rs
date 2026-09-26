@@ -103,6 +103,9 @@ pub static mut G_ESKF_MAG_CHECK: f32 = 0.0;
 /// ★§5.136 诊断旋钮：磁两态【冻结】（`2.0` ⇒ Q=0 且拒状态更新，仅保留航向观测）——
 ///   用于确证"M 场 3D 失稳是否来自 mag_I/mag_B 状态更新路径" ✓（默认 0 = 正常 ✓）
 pub static mut G_ESKF_MAG_FREEZE: f32 = 0.0;
+/// ★§5.137 诊断旋钮：速度状态过程噪声倍率（默认 **1.0** ✓ 逐位不变）；
+///   >0 时 `q[I_VEL] = 2.0·dt·k`——用于定位"噪声悬停垂直速度抖动"是否由速度 Q 过大引起 ✓
+pub static mut G_ESKF_Q_VEL_K: f32 = 0.0;
 /// ★§5.136 诊断：[0]=heading 计数 [1]=3D 计数 [2]=最近航向新息 [3]=水平加速度 [4]=yaw_aligned
 ///   （AUTO 判据分量观测用；默认全 0、不参与控制 ✓）
 pub static mut AUTO_DBG: [f32; 5] = [0.0; 5];
@@ -711,7 +714,11 @@ impl Eskf {
             let qa = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_Q_ATT)) }
                 * unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_Q_ATT_BASE)) };
             q[I_ATT + i][I_ATT + i] = qa * dt;
-            q[I_VEL + i][I_VEL + i] = 2.0 * dt;
+            let qvk = unsafe {
+                core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_Q_VEL_K))
+            };
+            let qvk = if qvk > 0.0 { qvk } else { 1.0 };
+            q[I_VEL + i][I_VEL + i] = 2.0 * dt * qvk;
             q[I_POS + i][I_POS + i] = 1e-4 * dt;
             q[I_BG + i][I_BG + i] = 1e-6 * dt;
             q[I_BA + i][I_BA + i] = 1e-4 * dt;
