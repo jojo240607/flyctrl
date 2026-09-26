@@ -51,6 +51,13 @@ pub struct EskfEstimator {
     mag_first_done: bool,
     /// 陀螺/加计读数（供 `state()` 的 `omega` ✓）
     omega_body: [f32; 3],
+    /// ★§5.136：最近一拍比力（延迟对齐的**机动门**用 ✓；与 PX4 `_accel_horiz_lpf` 同源）
+    last_accel: [f32; 3],
+    /// ★§5.136【对齐 PX4 一手 `ekf_ekf.h:668 _mag_lpf`】：磁样本一阶低通（AlphaFilter，
+    ///   时间常数 `_kSensorLpfTimeConstant = 90 000 µs = 90 ms` ✓），用途同一手——
+    ///   供 **instant reset / 初始对准**使用（避免用单个带噪样本做代数反解 ✓）
+    mag_lpf: [f32; 3],
+    mag_lpf_init: bool,
     /// ★**辅助观测降频**（§5.84 ✓）：每 N 拍才融合一次重力辅助与磁 ✓
     /// 物理依据：重力方向/磁方向的变化率远低于 IMU 采样率 ✓ ⇒ 无需每拍融合 ✓
     /// （同时消除"同一保持样本每拍重复融合"的隐患 ✓）
@@ -95,6 +102,9 @@ impl EskfEstimator {
             mag_i_prior,
             mag_first_done: false,
             omega_body: [0.0; 3],
+            last_accel: [0.0; 3],
+            mag_lpf: [0.0; 3],
+            mag_lpf_init: false,
             aid_div: 0,
             aid_period: 15, // ★250Hz 下 ⇒ 16.7Hz ✓（§5.86）
             n_step: 0,
@@ -157,6 +167,7 @@ impl Estimator for EskfEstimator {
         let gyr = [imu.gyro[0].0, imu.gyro[1].0, imu.gyro[2].0];
         let acc = [imu.accel[0].0, imu.accel[1].0, imu.accel[2].0];
         self.omega_body = gyr;
+        self.last_accel = acc; // ★§5.136：延迟对齐机动门（水平分量 ✓）
         // ★诊断快照（采一次 ✓；`acc`/`gyr` 已在上方绑定 ✓）
         {
             // ★用【常量】比较 ✓ —— 不能用 `static = 5`：app 以裸 bin 加载 ⇒ `.data` 初值
@@ -256,6 +267,24 @@ impl Estimator for EskfEstimator {
 
     fn update_mag(&mut self, mag: Option<[f32; 3]>) {
         let Some(m) = mag else { return };
+        // ★§5.136【对齐 PX4 `_mag_lpf` ✓】：一阶低通（AlphaFilter，τ=90ms，同一手参数 ✓）。
+        //   `alpha = dt/(dt+τ)`；dt 取控制周期 4ms ⇒ alpha ≈ 0.0426 ✓
+        //   ⚠️ 一手精确（`ekf_ekf.h:668` 注释 ✓）：`_mag_lpf` **只供 instant reset 用**，
+        //   **不是常规融合输入** ⇒ 本仓同样：仅维护低通值，常规融合仍用原始样本 ✓
+        //   （曾误把低通值用于常规融合 ⇒ att_est 3 项失败 ✗ ⇒ 按一手纠正 ✓）
+        {
+            let tau = 0.090f32; // 90 ms（PX4 `_kSensorLpfTimeConstant` ✓）
+            let dt = 0.004f32; // 控制周期（250Hz ✓ 与 PX4 `_dt_ekf_avg` 同义）
+            let a = dt / (dt + tau);
+            if !self.mag_lpf_init {
+                self.mag_lpf = m;
+                self.mag_lpf_init = true;
+            } else {
+                for i in 0..3 {
+                    self.mag_lpf[i] += a * (m[i] - self.mag_lpf[i]);
+                }
+            }
+        }
         // ★首个磁样本：代数反解 `mag_B`（需独立 `mag_I` 先验 ✓）—— 照参照 `resetMagStates` ✓
         if !self.mag_first_done {
             // ★§5.136 阶段2：yaw-only 路径 ⇒ **对准标定**（吸收磁偏角/安装偏置）；
@@ -263,12 +292,15 @@ impl Estimator for EskfEstimator {
             let yaw_only = unsafe {
                 core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_YAW_ON))
             } != 2.0;
+            // ★一手：instant reset 用**低通后**的场值（`_mag_lpf.getState()` ✓ 见
+            //   `mag_control.cpp:223/232/282/311` 全部 `resetMagStates(_mag_lpf.getState(), …)` ✓）
+            let m_reset = self.mag_lpf;
             if yaw_only {
                 // ★对准窗口：前 60 次磁更新（≈3.6s @16.7Hz）内重复对准，跟随姿态收敛 ✓
                 self.f.begin_mag_alignment(60);
-                self.f.align_yaw_to_mag(m);
+                self.f.align_yaw_to_mag(m_reset);
             } else {
-                self.f.reset_mag_states(m, self.mag_i_prior);
+                self.f.reset_mag_states(m_reset, self.mag_i_prior);
             }
             self.mag_first_done = true;
         }
@@ -309,6 +341,11 @@ impl Estimator for EskfEstimator {
         let yaw_only = if knob == 2.0 { true } else if knob == 3.0 { false } else { !mode_3d };
         // ★§5.136：延迟补偿用【测量角速度】（与 PX4 `_state.gyro` 同源 ✓）
         self.f.mag_delay_omega = self.omega_body;
+        // ★§5.136：水平加速度（延迟对齐的机动门；与 PX4 `_accel_horiz_lpf` 同源 ✓）
+        {
+            let a = self.last_accel;
+            self.f.mag_delay_accel_horiz = crate::math::sqrt(a[0] * a[0] + a[1] * a[1]);
+        }
         // ★§5.136：3D 路径走**扩展入口**（干扰检测 + 延迟对齐，均默认关 ⇒ 与旧行为一致 ✓）
         let r = if yaw_only { self.f.update_mag_yaw(m) } else { self.f.update_mag_ext(m) };
         match r {

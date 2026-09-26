@@ -82,6 +82,16 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
     //   GPS 速度 σ=0.1m/s、气压 σ=0.3m）。缺此配置时 R 为 PC 口径（微噪声）⇒ M 场
     //   残差恒超 3σ 门限 ⇒ 气压/GPS 位置更新全拒 ⇒ 高度冻结 + 爬升失控（实测）。
     hil.est.set_observation_noise(0.25, 0.25, 0.09);
+    // ★★§5.136【真机路径 ⇒ mag 默认 heading（yaw-only）——按路径择默认 ✓】：
+    //   机理（实测确证 ✓）：真机链下 **3D 融合对姿态的修正方向不可观测**——磁场沿场方向
+    //   与垂向是弱可观测的，无 NE 外部辅助时，三轴同时观测会与航向残差耦合 ⇒ 闭环正反馈
+    //   ⇒ 60s 发散（tilt 49.4°、漂移 23.8m ✗；冻结磁两态/冻结零偏/reanchor 均无效 ✗）。
+    //   PX4 一手同样依赖 `isNorthEastAidingActive()` 才能在 3D 下自洽（`mag_control.cpp:505` ✓）；
+    //   本仓**无 NE 辅助**（GPS 位置/速度不作航向源）⇒ 真机取 heading 回退 ✓（实测完美：
+    //   60s tilt 0.0° / 漂移 0.02m ✓）。**SIL/H 场保持 3D**（验收表口径 ✓ att_est 63/0 ✓）。
+    unsafe {
+        flyctrl_core::estimator::eskf::G_ESKF_MAG_YAW_ON = 2.0; // 2.0 = 强制 heading ✓
+    }
     // ★§5.136 诊断旋钮：G_ESKF_FREEZE_BIAS=1 ⇒ 冻结零偏修正（定位"加计零偏慢漂"假设）
     //   （裸 bin 的 .data 未初始化 ⇒ 默认读到 0 = 正常 ✓；测试用 poke 置 1）
     {

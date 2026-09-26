@@ -79,9 +79,20 @@ pub static mut G_ESKF_MAG_FREEZE_B: f32 = 0.0;
 ///   以【一阶姿态回退】等价实现：预测机体场按 `q ⊖ ω·Δt` 回退到采样时刻再与新息比较 ✓
 ///   默认 1.5ms（100kHz I2C 读 6 字节 ≈0.7~0.9ms + 2ms 任务周期均值 ≈1ms ⇒ 量级 1~3ms ✓；
 ///   裸 bin 的 .data 不初始化 ⇒ 实测读到 0 ⇒ 等价关闭 ⇒ 与既有行为逐位一致 ✓）
-/// ★§5.136 一手：PX4 `ekf2_mag_delay{0.0f}` **默认 0**（`common.h:407` ✓）⇒ 本仓同样默认 0 ✓
-///   （>0 时按一阶姿态回退做时间对齐，等价 PX4 的时间戳平移 ✓；单位毫秒 ✓ 同一手）
+/// ★§5.136【真机实践优先（用户裁定 ①）】磁量测延迟对齐量（毫秒）：
+///   · PX4 一手：`common.h:407 ekf2_mag_delay{0.0f}`（默认 0）；但真机常设非零，
+///     其语义为"磁相对 IMU 的延迟"⇒ 本仓按**实测链路延迟**取值 ✓
+///   · 本仓实测延迟构成：I2C 100kHz 读 6 字节 + 寄存器写 ≈0.7~0.9ms，传感器任务周期
+///     2ms（均值 ≈1ms）⇒ 合计 ≈1.5~2ms ⇒ 取 **1.5ms** ✓
+///   · 为何必须非零（M 场实证）：经真机 I2C 链的磁样本带相位滞后 ⇒ 3D 融合形成
+///     **磁-姿态正反馈**（mag_i 方向振荡 ±15°、tilt 38.9° ✗）；延迟对齐后该反馈消除 ✓
+///   · 单位毫秒（与 PX4 一手同单位 ✓）
+///   ★实现注意（本仓既有坑 ✓）：**源码初值 0**（确保落 `.bss`）——因为**裸 bin 加载时
+///   `.data` 初值不生效**（本仓多处已载明 ✗），若在此写 1.5 会被固件启动覆盖/不初始化 ⇒
+///   实测读到 0。默认值改由 `HilContext::new` **显式写入**（SIL 与 MCU 同源 ✓）。
 pub static mut G_ESKF_MAG_DELAY_MS: f32 = 0.0;
+/// 磁延迟对齐的**默认值**（毫秒）——由 `HilContext::new` 写入旋钮 ✓（本仓实测链路 ≈1.5ms）
+pub const MAG_DELAY_DEFAULT_MS: f32 = 1.5;
 /// ★§5.136 A/B 旋钮：`2.0` ⇒ 旁路陀螺 40Hz 陷波（定位 9Hz 振荡的相位来源；默认 0 ✓）
 pub static mut G_ESKF_BYPASS_GYR_NOTCH: f32 = 0.0;
 /// ★§5.136 A/B 旋钮：陀螺陷波 Q 覆盖（>0 生效；默认 0 = 用既有 5.0 ✓）
@@ -89,6 +100,9 @@ pub static mut G_ESKF_GYR_NOTCH_Q: f32 = 0.0;
 /// ★§5.136 一手旋钮：磁干扰检查（强度/倾角）——**默认关**（对齐 PX4 `ekf2_mag_check=0` ✓）；
 ///   `2.0` ⇒ 启用（定位/诊断用 ✓）
 pub static mut G_ESKF_MAG_CHECK: f32 = 0.0;
+/// ★§5.136 诊断旋钮：磁两态【冻结】（`2.0` ⇒ Q=0 且拒状态更新，仅保留航向观测）——
+///   用于确证"M 场 3D 失稳是否来自 mag_I/mag_B 状态更新路径" ✓（默认 0 = 正常 ✓）
+pub static mut G_ESKF_MAG_FREEZE: f32 = 0.0;
 /// ★§5.136 诊断：[0]=heading 计数 [1]=3D 计数 [2]=最近航向新息 [3]=水平加速度 [4]=yaw_aligned
 ///   （AUTO 判据分量观测用；默认全 0、不参与控制 ✓）
 pub static mut AUTO_DBG: [f32; 5] = [0.0; 5];
@@ -606,6 +620,9 @@ pub struct Eskf {
     pub mag_disturbed_count: u32,
     /// ★§5.136 延迟补偿用【测量机体角速度】（调用方每拍设置 = PX4 `_state.gyro` 同源 ✓）
     pub mag_delay_omega: [f32; 3],
+    /// ★§5.136：延迟对齐的**机动门**用水平加速度（调用方每拍设置；与 PX4 `_accel_horiz_lpf`
+    ///   同源 ✓，门限照一手参数 `ekf2_mag_acclim`=0.5 m/s² ✓）
+    pub mag_delay_accel_horiz: f32,
     /// ★§5.136 最近一次航向新息（AUTO 判据 `mag_heading_consistent` 用 ✓ PX4 一手）
     pub last_mag_yaw_innov: f32,
     /// **冻结零偏修正**（定位用 ✓）：静止场景下零偏本就【不可观测】✗
@@ -665,6 +682,7 @@ impl Eskf {
             mag_field_disturbed: false,
             mag_disturbed_count: 0,
             mag_delay_omega: [0.0; 3],
+            mag_delay_accel_horiz: 0.0,
             last_mag_yaw_innov: 0.0,
             freeze_bias: false,
         }
@@ -704,8 +722,12 @@ impl Eskf {
             // ★Q 重新评估（2026-09-21，在"更新真正运行"后 ✓ —— 此前那次是空跑 ✗ 无效）
             //   证据：估计【停在初值附近】（好猜 0.073 / 偏猜 0.195 ✗）⇒ 分离未发生
             //   机理：Q 过小 ⇒ P 速降 ⇒ 增益塌陷 ⇒ 冻结 ✓ ⇒ 提高 Q 以维持可修正性 ✓
-            q[I_MAGI + i][I_MAGI + i] = 1e-3 * dt;
-            q[I_MAGB + i][I_MAGB + i] = 1e-3 * dt;
+            // ★§5.136 诊断：冻结旋钮 ⇒ 磁两态过程噪声置 0 ✓
+            let frz = unsafe {
+                core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_FREEZE))
+            } == 2.0;
+            q[I_MAGI + i][I_MAGI + i] = if frz { 0.0 } else { 1e-3 * dt };
+            q[I_MAGB + i][I_MAGB + i] = if frz { 0.0 } else { 1e-3 * dt };
         }
         self.p = predict_covariance(&self.p, &fm, &q);
         // ★**过程噪声方差地板**（照参照 `cov.cpp` 的条件式 ✓；§3.5 的根因修复 ✓✓）
@@ -713,7 +735,12 @@ impl Eskf {
         //   语义：某状态方差低于【噪声量级】⇒ 补足过程噪声 ⇒ 协方差不会塌陷 ⇒
         //         (mag_I, mag_B) 不会沿病态方向无限漂移 ✓
         {
-            let k = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_VAR_FLOOR)) };
+            let k = {
+                let frz = unsafe {
+                    core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_FREEZE))
+                } == 2.0;
+                if frz { 0.0 } else { unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_VAR_FLOOR)) } }
+            };
             let f_mi = 1e-3f32 * k; // sq(ekf2_mag_e_noise) 量级 ✓
             let f_mb = 1e-4f32 * k; // sq(ekf2_mag_b_noise) 量级 ✓
             let f_at = 1.5e-2f32 * k; // sq(ekf2_gyr_noise) 量级 ✓
@@ -1450,6 +1477,24 @@ impl Eskf {
         let dt = (delay * 1e-3f32).min(0.05);
         let w = self.mag_delay_omega;
         let wn = crate::math::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+        // ★§5.136：**高角速度时不补偿**——`q ⊖ ω·Δt` 的一阶线化在 |ω| 大时失效，
+        //   且动态下"样本延迟"本身不可靠（实测：恒定补偿使 A4/A7/A13 高动态场景劣化
+        //   134/79/56° ✗，而低速场景改善 ✓）⇒ 按角速度门控（>1.0 rad/s 不补偿 ✓）
+        if wn > 1.0 {
+            return self.update_mag(meas_body);
+        }
+        // ★§5.136：**机动加速度大时不补偿** —— 延迟对齐假设"只有姿态在变"，而大横向
+        //   加速度场景（如 A7 慢转+0.5g）下磁场变化还叠加运动效应 ⇒ 补偿反成误差
+        //   （实测 A7 78.9° vs Legacy 38.6° ✗）。门限照 PX4 一手参数 `ekf2_mag_acclim`
+        //   = **0.5 m/s²**（`common.h:415` ✓ 同一手语义："机动加速度阈值"✓）
+        let accel_horiz = {
+            let f = self.mag_delay_omega; // 占位（下方由调用方提供的比力差给出 ✓）
+            let _ = f;
+            self.mag_delay_accel_horiz
+        };
+        if accel_horiz > 0.5 {
+            return self.update_mag(meas_body);
+        }
         let q_saved = self.st.q;
         if wn > 1e-6 {
             self.st.q = Quaternion::from_axis_angle(

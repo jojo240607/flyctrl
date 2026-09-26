@@ -136,6 +136,13 @@ where
     C: Controller,
 {
     pub fn new(est: E, ctrl: C, dt: Second) -> Self {
+        // ★§5.136【真机实践优先】磁延迟对齐默认值由这里**显式写入**（而非 .data 初值 ✗）：
+        //   裸 bin 加载时 .data 初值不生效 ⇒ 写在源码初值里会读到 0（实测 ✗）。
+        //   SIL 与 MCU 共用本构造 ⇒ 两侧一致 ✓
+        unsafe {
+            crate::estimator::eskf::G_ESKF_MAG_DELAY_MS =
+                crate::estimator::eskf::MAG_DELAY_DEFAULT_MS;
+        }
         // 采样率 = 1/控制周期。SIL 与 MCU 均以 dt=0.004（250Hz）推进 → 滤波器
         // 系数、状态演化两侧一致，同输入测试（逐位断言）仍成立。
         let fs = 1.0 / dt.0;
