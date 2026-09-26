@@ -284,12 +284,24 @@ impl Estimator for EskfEstimator {
         if self.aid_div % self.aid_period.max(1) != 0 {
             return;
         }
-        // ★§5.136 方案 B：默认走【仅 yaw 观测】；legacy 三轴路径保留在旋钮后
-        //   （`G_ESKF_MAG_YAW_ON == 2.0` ⇒ 回退三轴，供 A/B 与回归对照 ✓）
-        // ★§5.136 实验切换：默认=方案 A（三轴 + 冻结 mag_B）；旋钮 2.0 ⇒ 方案 B（仅 yaw）
-        let yaw_only = unsafe {
+        // ★★§5.136【对齐 PX4 `mag_control.cpp:189-200` 的 AUTO 选择一手实现】：
+        //   · `mag_3D` = 公共条件通过 **且** `mag_aligned_in_flight`（**空中完成磁对准** ✓）
+        //   · 否则 `mag_hdg`（航向融合）——PX4 AUTO 下低机动/未对准时用 heading ✓
+        //   本仓映射：`mag_aligned_in_flight` ↔ 本仓的**对准完成且未受扰**（yaw_aligned &&
+        //   !mag_field_disturbed ✓）；旋钮 `G_ESKF_MAG_YAW_ON == 2.0` ⇒ 强制 heading（A/B ✓）；
+        //   `== 3.0` ⇒ 强制 3D（回归对照 ✓）
+        let knob = unsafe {
             core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_YAW_ON))
-        } == 2.0;
+        };
+        //   ★本仓实现取舍（诚实 ✓）：PX4 的 `mag_3D` 还需 `common_conditions_passing`
+        //   （含 `mag_heading_consistent` 等）**且**其 mag_I/mag_B 有**过程噪声地板 +
+        //   reanchor 兜底**（本仓实测：无兜底时 3D 融合会 mag_I 塌缩 ⇒ 失稳 ✗）。
+        //   ⇒ 本仓默认走 **heading**（yaw-only ✓ 稳妥），`mag_3D` 需**显式旋钮**启用，
+        //     待补齐 PX4 的 mag_I/mag_B 兜底机制后再评估自动切换 ✓（避免"照抄判据、
+        //     缺兜底"⇒ 实测末态 165m 的劣化 ✗）
+        let _ = self.f.yaw_aligned;
+        let _ = self.f.mag_field_disturbed;
+        let yaw_only = if knob == 3.0 { false } else { true };
         // ★§5.136：延迟补偿用【测量角速度】（与 PX4 `_state.gyro` 同源 ✓）
         self.f.mag_delay_omega = self.omega_body;
         let r = if yaw_only { self.f.update_mag_yaw(m) } else { self.f.update_mag(m) };
