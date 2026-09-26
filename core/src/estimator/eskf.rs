@@ -74,6 +74,12 @@ pub static mut G_ESKF_MAG_YAW_ON: f32 = 0.0;
 /// ★§5.136 方案 A 旋钮：`2.0` ⇒ 回退"mag_B 自由估计"（legacy A/B）；其余（含裸 bin 的 0）
 /// ⇒ 默认【冻结 mag_B】（消除 mag_I↔mag_B 对倒零空间 ⇒ 无慢漂；保留三轴 roll/pitch 信息）
 pub static mut G_ESKF_MAG_FREEZE_B: f32 = 0.0;
+/// ★§5.136【对齐 PX4 `ekf2_mag_delay`】磁量测相对 IMU 的延迟（**毫秒** ✓ 同一手单位）。
+///   PX4 用它对磁样本做**时间戳平移**；本仓帧 ABI 不可改（§5.39 教训 ✗）⇒ 在估计器侧
+///   以【一阶姿态回退】等价实现：预测机体场按 `q ⊖ ω·Δt` 回退到采样时刻再与新息比较 ✓
+///   默认 1.5ms（100kHz I2C 读 6 字节 ≈0.7~0.9ms + 2ms 任务周期均值 ≈1ms ⇒ 量级 1~3ms ✓；
+///   裸 bin 的 .data 不初始化 ⇒ 实测读到 0 ⇒ 等价关闭 ⇒ 与既有行为逐位一致 ✓）
+pub static mut G_ESKF_MAG_DELAY_MS: f32 = 1.5;
 /// ★§5.136 诊断旋钮：`1.0` ⇒ 冻结零偏修正（定位"加计零偏慢漂"假设；默认 0 = 正常 ✓）
 pub static mut G_ESKF_FREEZE_BIAS: f32 = 0.0;
 /// ★**实验旋钮**：磁量测开关（含 `reset_mag_states` ✓）。默认 1.0 = 开。
@@ -586,6 +592,8 @@ pub struct Eskf {
     pub mag_field_disturbed: bool,
     /// 磁干扰拒绝计数（诊断 ✓）
     pub mag_disturbed_count: u32,
+    /// ★§5.136 延迟补偿用【测量机体角速度】（调用方每拍设置 = PX4 `_state.gyro` 同源 ✓）
+    pub mag_delay_omega: [f32; 3],
     /// **冻结零偏修正**（定位用 ✓）：静止场景下零偏本就【不可观测】✗
     /// （无足够量测激励 ✓）⇒ 用于判定"长循环慢性发散是否由零偏块引起" ✓
     pub freeze_bias: bool,
@@ -642,6 +650,7 @@ impl Eskf {
             align_remaining: 0,
             mag_field_disturbed: false,
             mag_disturbed_count: 0,
+            mag_delay_omega: [0.0; 3],
             freeze_bias: false,
         }
     }
@@ -1185,6 +1194,75 @@ impl Eskf {
         true
     }
 
+    /// ★§5.136【对齐 PX4 `mag_fusion.cpp::fuseDeclination()` 一手实现】
+    ///   磁偏角作为**观测量**融合（PX4：3D 融合且无外部 NE 辅助时**必须**融入，防长期航向漂移 ✓）
+    ///
+    ///   一手要点（照源码 ✓，非记忆）：
+    ///    · 观测量 `decl_meas` = 已知磁偏角（PX4 用 WMM/geo 库；本仓由对齐标定的 `mag_I`
+    ///      推出同源先验 ⇒ 也可由调用方注入 GPS 航向等外部 NE 辅助 ✓）
+    ///    · 预测 `decl_pred` = atan2(mag_I_e, mag_I_n)（世界场水平分量的方位角 ✓）
+    ///    · 新息 `wrap_pi(decl_pred − decl_meas)`；`S = P[magi][magi] 相关项 + R`；NIS 门 ✓
+    ///    · **只更新 mag_I/mag_B，不更新姿态/速度**（PX4 `update_all_states=false` 分支 ✓）
+    pub fn fuse_declination(&mut self, decl_meas_rad: f32, r_decl: f32) -> Result<f32, &'static str> {
+        if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_ON)) } == 2.0 {
+            return Err("磁偏角：对照臂【旋钮关闭】✓");
+        }
+        let h = crate::math::atan2(self.mag_i[1], self.mag_i[0]); // decl_pred ✓
+        let mut innov = h - decl_meas_rad;
+        // wrap_pi（照 PX4 ✓）
+        let two_pi = 6.283_185_5f32;
+        while innov > 3.141_592_7 { innov -= two_pi; }
+        while innov < -3.141_592_7 { innov += two_pi; }
+        if !innov.is_finite() {
+            return Err("磁偏角：新息非有限 ⇒ 跳过 ✓");
+        }
+        // ∂decl_pred/∂mag_I = [-mi_e/(n²+h²), mi_n/(n²+h²), 0]（atan2 偏导 ✓）
+        let (mi_e, mi_n) = (self.mag_i[1], self.mag_i[0]);
+        let den = (mi_n * mi_n + mi_e * mi_e).max(1e-9);
+        let mut hh = [0.0f32; N];
+        hh[I_MAGI] = -mi_e / den;      // ∂/∂mag_I_n
+        hh[I_MAGI + 1] = mi_n / den;   // ∂/∂mag_I_e
+        let mut ph = [0.0f32; N];
+        for k in 0..N {
+            let mut acc = 0.0f32;
+            for m in 0..N {
+                acc += self.p[k][m] * hh[m];
+            }
+            ph[k] = acc;
+        }
+        let mut s_ = r_decl;
+        for k in 0..N {
+            s_ += hh[k] * ph[k];
+        }
+        if !(s_ > 0.0) {
+            return Err("磁偏角：S 非正/NaN ⇒ 跳过 ✓");
+        }
+        let nis = innov.abs() / crate::math::sqrt(s_);
+        if nis > self.gate {
+            return Err("磁偏角：新息超门 ⇒ 拒 ✓");
+        }
+        // ★只更新 mag 两态（照 PX4 `update_all_states=false` 分支 ✓）
+        //   ★符号配对（一手依据 ✓）：PX4 `mag_fusion.cpp` 取 `innovation = pred − meas`，
+        //   而 `ekf_helper.cpp::fuse()` 的更新为 `x ← x − K·innovation`（带负号 ✓）
+        //   ⇒ 本函数既已用 `innov = decl_pred − decl_meas`，注入必须取 **负号** ✓
+        //   （此前写成 `+ph/s·innov` ⇒ 反向发散，单测实测 mag_I 方位角跑到 −173.65° ✗）
+        for i in 0..3 {
+            let idx = I_MAGI + i;
+            let dx = -(ph[idx] / s_ * innov);
+            self.mag_i[i] += dx;
+        }
+        for a in 0..N {
+            let ka = ph[a] / s_;
+            if ka == 0.0 {
+                continue;
+            }
+            for b in 0..N {
+                self.p[a][b] -= ka * ph[b];
+            }
+        }
+        Ok(nis)
+    }
+
     pub fn update_mag_yaw(&mut self, meas_body: [f32; 3]) -> Result<f32, &'static str> {
         if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_ON)) } == 2.0 {
             return Err("磁量测：对照臂【旋钮关闭】✓（实验用，非静默 ✗）");
@@ -1207,7 +1285,28 @@ impl Eskf {
         //   ⚠️ 反面（本仓初版错误，已修）：若用【估计姿态】把实测场转回导航系再与固定
         //      mag_I 比 ⇒ m_n ≡ mag_I 恒等 ⇒ **新息恒 0、磁更新完全失效且不可察觉** ✗✗
         //      （单测"姿态漂移 5° 未被拉回"当场抓出 ✓ —— 保留该单测作回归防护 ✓）
-        let pred_b = rotate_vec_by_quat_inverse(self.st.q, self.mag_i);
+        // ★§5.136 延迟补偿（对齐 PX4 `ekf2_mag_delay` 的时间戳平移语义 ✓，本仓以一阶
+        //   姿态回退等价实现）：把预测机体场从【当前时刻】回退到【采样时刻】——
+        //   q_sample ≈ q_now ⊖ ω·Δt（Δt = 延迟 ms）⇒ pred_b = R(q_sample)ᵀ·mag_I ✓
+        let delay_ms = unsafe {
+            core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_DELAY_MS))
+        };
+        let q_used = if delay_ms > 0.0 {
+            let dt = (delay_ms * 1e-3f32).min(0.05); // 上限 50ms 防呆 ✓
+            // ★用【测量机体角速度】(调用方每拍传入 = 与 PX4 `_state.gyro` 同源 ✓)，
+            //   把姿态回退到采样时刻：q_sample ≈ q_now ⊖ ω·Δt ✓
+            let w = self.mag_delay_omega;
+            let wn = crate::math::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+            if wn > 1e-6 {
+                let dq = Quaternion::from_axis_angle([w[0] / wn, w[1] / wn, w[2] / wn], crate::units::Radian(-wn * dt));
+                dq * self.st.q
+            } else {
+                self.st.q
+            }
+        } else {
+            self.st.q
+        };
+        let pred_b = rotate_vec_by_quat_inverse(q_used, self.mag_i);
         let (pred_x, pred_y) = (pred_b[0] + self.mag_b[0], pred_b[1] + self.mag_b[1]);
         let (mx, my) = (meas_body[0], meas_body[1]);
         // 机体水平面内"实测相对预测"的有符号夹角 = 航向误差 ✓

@@ -290,6 +290,8 @@ impl Estimator for EskfEstimator {
         let yaw_only = unsafe {
             core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_YAW_ON))
         } == 2.0;
+        // ★§5.136：延迟补偿用【测量角速度】（与 PX4 `_state.gyro` 同源 ✓）
+        self.f.mag_delay_omega = self.omega_body;
         let r = if yaw_only { self.f.update_mag_yaw(m) } else { self.f.update_mag(m) };
         match r {
             Ok(_) => { self.n_mag = self.n_mag.wrapping_add(1); bump(9); }

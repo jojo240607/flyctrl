@@ -124,3 +124,34 @@ fn mag_disturbance_detection_matches_px4_thresholds() {
     println!("[干扰检测] 拒绝计数 = {}（≥2 ✓）", f.mag_disturbed_count);
     assert!(f.mag_disturbed_count >= 2, "应记录 ≥2 次干扰拒绝");
 }
+
+/// ★§5.136【对齐 PX4 `mag_fusion.cpp::fuseDeclination()` 一手实现】磁偏角融合：
+///   · 观测 = 已知磁偏角（本仓由对准标定的 mag_I 同源先验/外部 NE 辅助提供 ✓）
+///   · 预测 = atan2(mag_I_e, mag_I_n)；新息 wrap_pi；NIS 门 ✓
+///   · **只更新 mag_I/mag_B，不更新姿态**（PX4 `update_all_states=false` 分支 ✓）
+#[test]
+fn fuse_declination_updates_mag_i_not_attitude() {
+    let mut f = Eskf::new(
+        Quaternion::from_axis_angle([0.0, 0.0, 1.0], Radian(0.0)),
+        [0.0; 3], [0.0; 3], 5.0,
+    );
+    f.mag_i = [0.2f32, 0.0, 0.4]; // 方位角 0°
+    f.mag_b = [0.0; 3];
+    let att0 = f.st.q;
+
+    // 观测：磁偏角 +8°（应把 mag_I 的方位角拉向 +8° ✓）
+    let decl = 8.0f32.to_radians();
+    let mut last = Ok(0.0);
+    for _ in 0..400 {
+        last = f.fuse_declination(decl, 1e-2);
+    }
+    let decl_now = f.mag_i[1].atan2(f.mag_i[0]).to_degrees();
+    let yaw = f.st.q.yaw().to_degrees();
+    println!(
+        "[磁偏角融合] 观测 {:+.1}° ⇒ mag_I 方位角 {:+.2}°（应趋近 ✓）姿态 yaw={:+.3}°（应不变 ✓）last={:?}",
+        8.0, decl_now, yaw, last
+    );
+    assert!(decl_now > 4.0, "mag_I 方位角未朝观测收敛：{decl_now:.2}°");
+    assert!(yaw.abs() < 0.5, "★磁偏角融合不应改变姿态（PX4 只更新 mag 两态 ✓）：yaw={yaw:.3}°");
+    assert!((f.st.q.w - att0.w).abs() < 1e-3, "四元数不应被磁偏角融合改动");
+}
