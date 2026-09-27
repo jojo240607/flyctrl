@@ -191,13 +191,23 @@ const FENCE_MAX: usize = 64;
 // ── RC 通道覆盖全局 ──────────────────────────────────────────────────
 /// 地面站经 RC_CHANNELS_OVERRIDE 下发的 8 通道 PWM（微秒，1000-2000）。
 /// `valid != 0` 表示 override 生效（control 任务据此优先于 sim RC）。
+///
+/// ★§5.144：`#[no_mangle] + #[used]` **导出符号**，供测试/PY 化后端直接注入摇杆
+/// （PHY 化迁移摇杆场景需 MAVLink RC override ✓；真 MAVLink 编解码成本高且与本目标无关 ✓）。
+/// 语义不变（仍是同一变量 ✓），仅使其在 ELF 符号表中可见 ✓
 #[link_section = ".rust_bss"]
-static mut G_RC_OVERRIDE: [u16; 8] = [0; 8];
+#[no_mangle]
+#[used]
+pub static mut G_RC_OVERRIDE: [u16; 8] = [0; 8];
 #[link_section = ".rust_bss"]
-static mut G_RC_OVERRIDE_VALID: u8 = 0;
+#[no_mangle]
+#[used]
+pub static mut G_RC_OVERRIDE_VALID: u8 = 0;
 /// override 新鲜度时间戳（App 单调 ticks，单位 10ms）；control 任务据此判断超时（>200 即 2s 失效）。
 #[link_section = ".rust_bss"]
-static mut G_RC_OVERRIDE_TICK: u32 = 0;
+#[no_mangle]
+#[used]
+pub static mut G_RC_OVERRIDE_TICK: u32 = 0;
 /// 全局 App 单调 tick（每 10ms 由 uplink 主循环 +1）；供 RC_OVERRIDE 超时判断。
 #[link_section = ".rust_bss"]
 static mut G_APP_TICKS: u32 = 0;
