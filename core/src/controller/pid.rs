@@ -91,6 +91,10 @@ pub static mut G_KV_XY: f32 = -1.0;
 /// 0 是有效取值（= 关闭低通，即既有行为），故哨兵取 <0。
 #[used]
 pub static mut G_VEL_LPF_H_TAU: f32 = -1.0;
+/// ★§5.139 诊断旋钮：姿态-速率环增益覆盖（**-1 = 不覆盖** ⇒ 默认逐位不变 ✓）
+///   用于判定"真机 3D 自激（≈4Hz 俯仰）是否即该环的环路特性" ✓
+pub static mut G_ATT_KP: f32 = -1.0;
+pub static mut G_ATT_KD: f32 = -1.0;
 
 pub struct PidController {
     // 位置外环 P：位置误差 -> 期望速度（世界系）
@@ -424,6 +428,13 @@ impl Controller for PidController {
         let pre_iy = self.kp_xy * ey + sp.vel[1].0;
         let mut ix_final = clampf(self.i_xy[0] + self.ki_xy * ex * dt, -i_xy_max, i_xy_max);
         let mut iy_final = clampf(self.i_xy[1] + self.ki_xy * ey * dt, -i_xy_max, i_xy_max);
+        // ★§5.139 诊断旋钮覆盖（默认 -1 ⇒ 不覆盖 ✓）
+        unsafe {
+            let kp = core::ptr::read_volatile(core::ptr::addr_of!(G_ATT_KP));
+            let kd = core::ptr::read_volatile(core::ptr::addr_of!(G_ATT_KD));
+            if kp > 0.0 { self.att_kp = kp; }
+            if kd > 0.0 { self.att_kd = kd; }
+        }
         if !self.rate_mode_xy {
             let dx = pre_ix + ix_final;
             if dx > vmax_xy_eff {

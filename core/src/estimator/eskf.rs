@@ -123,6 +123,14 @@ pub static mut G_ESKF_R_MAG_K: f32 = 0.0;
 /// ★§5.139 诊断旋钮：磁更新降频率（磁更新每 N 个控制拍一次）；**0 = 用默认 aid_period=15** ✓
 ///   用于判别"4Hz 自激是否与磁观测时序/频率有关" ✓
 pub static mut G_ESKF_MAG_PERIOD: f32 = 0.0;
+/// ★§5.139 诊断旋钮：新息门限覆盖（默认 0 ⇒ 用 `self.gate`=5.0 ✓ 逐位不变）；
+///   PX4 一手 `ekf2_mag_gate = 3.0`（`common.h:412` ✓）⇒ 用于验证"收紧门限是否抑制
+///   3D 大残差经正反馈灌入" ✓
+pub static mut G_ESKF_GATE: f32 = 0.0;
+/// ★§5.139 诊断旋钮：3D 融合前对磁样本做一阶低通（τ ms）；**0 = 关**（默认逐位不变 ✓）
+///   思想 = 时间尺度分离（磁观测带宽 << 姿态环带宽 ✓）
+pub static mut G_ESKF_MAG_PRE_LPF_MS: f32 = 0.0;
+pub static mut G_ESKF_MAG_PRE_LPF_ST: f32 = 0.0;
 pub static mut G_ESKF_MAG_I_PRIOR_X: f32 = 0.0;
 pub static mut G_ESKF_MAG_I_PRIOR_Y: f32 = 0.0;
 pub static mut G_ESKF_MAG_I_PRIOR_Z: f32 = 0.0;
@@ -651,6 +659,8 @@ pub struct Eskf {
     /// ★§5.139【对齐 PX4 一手 `mag_control.cpp:495 _mag_heading_innov_lpf` ✓】：
     ///   航向新息**低通**（AlphaFilter，时间常数同 `_kSensorLpfTimeConstant`=90ms ✓）
     pub mag_hdg_innov_lpf: f32,
+    /// ★§5.139：融合前低通状态（诊断 ✓）
+    pub mag_pre_lpf: [f32; 3],
     /// ★§5.139【对齐 PX4 一手 `ekf_ekf.h:553 _accel_horiz_lpf` ✓】：NE 系水平加速度低通
     ///   （时间常数 `_kAccelHorizLpfTimeConstant`=**1s** ✓），用于判定"机动使航向可观测" ✓
     pub accel_horiz_lpf: f32,
@@ -714,6 +724,7 @@ impl Eskf {
             mag_delay_accel_horiz: 0.0,
             last_mag_yaw_innov: 0.0,
             mag_hdg_innov_lpf: 0.0,
+            mag_pre_lpf: [0.0; 3],
             accel_horiz_lpf: 0.0,
             freeze_bias: false,
         }
@@ -1585,6 +1596,33 @@ impl Eskf {
     }
 
     pub fn update_mag(&mut self, meas_body: [f32; 3]) -> Result<f32, &'static str> {
+        // ★§5.139 诊断：融合前低通（默认 0 ⇒ 关 ✓ 逐位不变）
+        let _meas_body = {
+            let tau_ms = unsafe {
+                core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_PRE_LPF_MS))
+            };
+            if tau_ms > 0.0 {
+                let tau = tau_ms * 1e-3f32;
+                let dt = 0.004f32;
+                let a = dt / (dt + tau);
+                let init = unsafe {
+                    core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_PRE_LPF_ST))
+                };
+                let mut out = [0.0f32; 3];
+                for k in 0..3 {
+                    let prev = if init > 0.5 { self.mag_pre_lpf[k] } else { meas_body[k] };
+                    self.mag_pre_lpf[k] = prev + a * (meas_body[k] - prev);
+                    out[k] = self.mag_pre_lpf[k];
+                }
+                unsafe {
+                    core::ptr::write_volatile(core::ptr::addr_of_mut!(G_ESKF_MAG_PRE_LPF_ST), 1.0);
+                }
+                out
+            } else {
+                meas_body
+            }
+        };
+        let meas_body = _meas_body;
         if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_ON)) } == 2.0 {
             return Err("磁量测：对照臂【旋钮关闭】✓（实验用，非静默 ✗）");
         }
@@ -1619,7 +1657,11 @@ impl Eskf {
                 continue;
             }
             let nis = resid.abs() / crate::math::sqrt(s_);
-            if nis > self.gate {
+            let gate_eff = {
+                let g = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_GATE)) };
+                if g > 0.0 { g } else { self.gate }
+            };
+            if nis > gate_eff {
                 self.mag_skipped += 1;
                 continue; // 该分量被拒 ⇒ 跳过（不影响其他分量 ✓）
             }
