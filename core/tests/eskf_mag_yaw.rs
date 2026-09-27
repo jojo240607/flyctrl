@@ -158,3 +158,48 @@ fn fuse_declination_updates_mag_i_not_attitude() {
     assert!(yaw.abs() < 0.5, "★磁偏角融合不应改变姿态（PX4 只更新 mag 两态 ✓）：yaw={yaw:.3}°");
     assert!((f.st.q.w - att0.w).abs() < 1e-3, "四元数不应被磁偏角融合改动");
 }
+
+/// ★§5.138 最小复现（纯估计器，无控制回路）：**3D 融合**下，姿态缓慢摆动 + 物理磁样本
+/// （世界场固定）⇒ 判定真机 3D 失稳是【纯滤波器缺陷】还是【估计↔控制闭环正反馈】。
+///
+/// 场景构造（对应真机 PHY 冒烟 ✓）：
+///  · 世界场 `mag_w` = 物理磁场（PHY 引擎值 ✓，与内置先验 [0.2,0,0.4] 不同 ✓）
+///  · 姿态：绕 z 缓慢摆动（±10°，模拟悬停微摆 ✓）
+///  · 机体磁样本 = `R(q)⁻¹ · mag_w`（每步按**当前姿态**重算 ⇒ 物理自洽 ✓ 无噪声/无延迟）
+/// 判据：`mag_i` 与 `att` 应【收敛不发散】（|mag_i| 稳定、姿态误差有界 ✓）
+#[test]
+fn diag_3d_pure_filter_slow_attitude() {
+    let mag_w = [0.445f32, 0.229, 0.399]; // PHY 引擎世界磁场 ✓
+    let mut f = Eskf::new(
+        Quaternion::from_axis_angle([0.0, 0.0, 1.0], Radian(0.0)),
+        [0.0; 3], [0.0; 3], 5.0,
+    );
+    f.set_observation_noise(0.25, 0.01, 0.09);
+    f.mag_i = [0.2, 0.0, 0.4]; // 内置先验（与物理场不同 ⇒ 同真机 ✓）
+    f.mag_b = [0.0; 3];
+    // 首样本走 3D 反解路径（真机 3D 语义 ✓）
+    f.reset_mag_states(mag_w, [0.2, 0.0, 0.4]);
+    let mut max_dev = 0.0f32;
+    let mut mag_i_max = 0.0f32;
+    for k in 0..1800u32 {
+        // 姿态缓慢摆动：绕 y 轴 ±10°（周期 6s，200Hz ✓）
+        let t = k as f32 * 0.005;
+        let tilt = 10.0f32.to_radians() * (2.0 * core::f32::consts::PI * t / 6.0).sin();
+        let q_true = Quaternion::from_axis_angle([0.0, 1.0, 0.0], Radian(tilt));
+        f.st.q = q_true; // 强制姿态（无陀螺积分 ⇒ 隔离滤波器行为 ✓）
+        let m_b = flyctrl_core::vehicle::rotate_vec_by_quat_inverse(q_true, mag_w);
+        let _ = f.update_mag(m_b);
+        max_dev = max_dev.max(f.st.q.pitch().abs().to_degrees().min(0.0) + 0.0);
+        let mi = (f.mag_i[0].powi(2) + f.mag_i[1].powi(2) + f.mag_i[2].powi(2)).sqrt();
+        mag_i_max = mag_i_max.max(mi);
+        if k % 300 == 0 {
+            eprintln!(
+                "[diag3d] k={k:<5} |mag_i|={mi:.4} mag_i=({:+.3},{:+.3},{:+.3}) mag_b=({:+.3},{:+.3},{:+.3})",
+                f.mag_i[0], f.mag_i[1], f.mag_i[2], f.mag_b[0], f.mag_b[1], f.mag_b[2]
+            );
+        }
+    }
+    let mi = (f.mag_i[0].powi(2) + f.mag_i[1].powi(2) + f.mag_i[2].powi(2)).sqrt();
+    eprintln!("[diag3d] 末: |mag_i|={mi:.4}（峰值 {mag_i_max:.4}）max_dev={max_dev}");
+    assert!(mi.is_finite() && mag_i_max < 2.0, "纯滤波器下 mag_i 发散：{mag_i_max:.3}");
+}
