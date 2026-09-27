@@ -142,6 +142,10 @@ flyctrl_core::estimator::eskf::G_ESKF_MAG_YAW_ON = 0.0; // 0.0 = AUTO（一手�
     // ★§5.136 临时诊断：[0..3)=mag_i [3..6)=mag_b [6]=yaw_aligned [7]=disturbed [8]=mag_applied [9]=mag_skipped
     #[used]
     static mut DBG_MAGI: [f32; 16] = [0.0; 16];
+    // ★§5.145 诊断：[0]=armed [1]=fresh [2]=mode档 [3]=throttle [4]=pitch [5]=roll
+    //            [6]=cmd_mode [7]=des_vx [8]=des_vy [9]=use_rc_vel
+    #[used]
+    pub static mut DBG_RC: [f32; 10] = [0.0; 10];
     // PWM 设备（4 路，control 专用）
     let mut pwm_dev: [Option<Device>; 4] = [None, None, None, None];
     let mut pwm_period: [u32; 4] = [0; 4];
@@ -262,7 +266,13 @@ flyctrl_core::estimator::eskf::G_ESKF_MAG_YAW_ON = 0.0; // 0.0 = AUTO（一手�
                 roll: norm(rc_ov[0]),
                 pitch: norm(rc_ov[1]),
                 yaw: norm(rc_ov[3]),
-                armed: rc_ov[0] > 1500, // 暂以 ch1 高位作为地面站解锁指示（占位，主解锁仍靠 COMMAND_LONG）
+                // ★§5.145 修复（机械性 ✓）：override **只应覆盖摇杆 4 通道**（MAVLink
+                //   `RC_CHANNELS_OVERRIDE` 语义 ✓），**不应改解锁/模式**——它们仍是 RC 链路
+                //   的职责 ✓。此前用 `rc_ov[0] > 1500` 作解锁指示 ⇒ 前推摇杆(roll=1500)
+                //   会**误判为失锁** ✗（实测：override 下北向速度恒 0，因未解锁 ⇒ 位置环
+                //   不工作 ✗）。改为**继承 RC 链路的 armed/mode** ✓（与 `fresh: true` 只表示
+                //   "摇杆数据新鲜" 一致 ✓）
+                armed: rc.armed,
                 mode: rc.mode,
                 fresh: true,
             }
@@ -332,6 +342,16 @@ flyctrl_core::estimator::eskf::G_ESKF_MAG_YAW_ON = 0.0; // 0.0 = AUTO（一手�
                 let rate_mode = matches!(cmd_mode, COPTER_MODE_STABILIZE | COPTER_MODE_ALT_HOLD);
                 hil.ctrl.set_rate_mode_xy(rate_mode);
                 let thr_off = (rc.throttle - 0.5) * 2.0;
+                unsafe {
+                    let d = core::ptr::addr_of_mut!(DBG_RC);
+                    (*d)[0] = if armed_eff { 1.0 } else { 0.0 };
+                    (*d)[1] = if rc.fresh { 1.0 } else { 0.0 };
+                    (*d)[2] = rc.mode as f32;
+                    (*d)[3] = rc.throttle;
+                    (*d)[4] = rc.pitch;
+                    (*d)[5] = rc.roll;
+                    (*d)[6] = cmd_mode as f32;
+                }
                 // 当前估计位置（NED；无估计时回退 hold_alt 基准）。
                 let cur = last_est
                     .map(|e| (e.pos[0].0, e.pos[1].0, e.pos[2].0))
@@ -357,7 +377,16 @@ flyctrl_core::estimator::eskf::G_ESKF_MAG_YAW_ON = 0.0; // 0.0 = AUTO（一手�
                     // 定点：原点定高；LOITER 允许 RC 摇杆叠加水平微调速度
                     // （GUIDED 无目标通道时原点保持，后续接入 SET_POSITION_TARGET）。
                     COPTER_MODE_LOITER | COPTER_MODE_GUIDED => (
-                        0.0, 0.0, hold_alt.0,
+                        // ★§5.145 诊断：记录 LOITER 期望速度
+                        {
+                            unsafe {
+                                let d = core::ptr::addr_of_mut!(DBG_RC);
+                                (*d)[7] = rc.pitch * LOITER_NUDGE_GAIN;
+                                (*d)[8] = -rc.roll * LOITER_NUDGE_GAIN;
+                                (*d)[9] = 1.0;
+                            }
+                            0.0
+                        }, 0.0, hold_alt.0,
                         rc.pitch * LOITER_NUDGE_GAIN,
                         -rc.roll * LOITER_NUDGE_GAIN,
                         false,
