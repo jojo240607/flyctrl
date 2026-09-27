@@ -102,12 +102,17 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         //   加入一手 `mag_heading_consistent`（|航向新息低通|<0.3rad ∧ |瞬时新息|<0.3rad ✓
         //   `mag_control.cpp:502-511`）后 ⇒ 悬停 60s **完美**（tilt 0.0°/漂移 0.01m ✓✓）。
         //   ⇒ 不再需要"真机强制 heading"的回退（此前为绕开失稳而设 ✗）⇒ 回归一手 AUTO ✓
-        // ★§5.139【结论：真机**暂用 heading**（回到可行解 ✓）】：
-        //   本轮已证 3D 在真机链**隔离闭环下仍发散**（`PHY_STATIC` 实测：真值姿态已倾、
-        //   估计姿态仍≈0 ⇒ 观测链与姿态链存在不一致 ✗），故 3D 不可用于真机 ✓。
-        //   `mag_heading_consistent` 门控（一手 ✓）已实现但**悬停时航向新息恒小** ⇒
-        //   不构成有效抑制 ✗ ⇒ 一并保持关闭（待 3D 根因查清后再启用 ✓）
-        flyctrl_core::estimator::eskf::G_ESKF_MAG_YAW_ON = 2.0; // 2.0 = 强制 heading（真机可用 ✓）
+        // ★★§5.141【真机恢复 **AUTO** + 一手"航向一致性"门控（严格对齐 PX4 ✓✓）】：
+        //   一手精读更正（关键）：`isNorthEastAidingActive()` = `gnss_pos || gnss_vel || ...`
+        //   （`estimator_interface.cpp` ✓）⇒ **本仓有 GPS ⇒ 该条件为 TRUE**（此前误判为"无
+        //   NE 辅助"✗）。故一手语义下：
+        //     `mag_3D` 需要 `mag_heading_consistent` = (航向新息一致) ∧ **NE 辅助 ∧ 水平
+        //     加速度低通 > mag_acclim(0.5 m/s²)** ✓
+        //   ⇒ **悬停时水平加速度≈0 ⇒ 不满足 ⇒ 自动回退 heading** ✓✓（这正是 PX4 的行为 ✓，
+        //     也解释了"悬停 3D 自激"：本仓此前违背一手、在不该用 3D 时用了 3D ✗）
+        //   ⇒ 真机回归 AUTO：机动时用 3D（航向可观测 ✓）、悬停/低速时用 heading ✓
+        flyctrl_core::estimator::eskf::G_ESKF_MAG_HDG_GATE = 2.0;
+flyctrl_core::estimator::eskf::G_ESKF_MAG_YAW_ON = 0.0; // 0.0 = AUTO（一手默认 ✓）
     }
     // ★§5.136 诊断旋钮：G_ESKF_FREEZE_BIAS=1 ⇒ 冻结零偏修正（定位"加计零偏慢漂"假设）
     //   （裸 bin 的 .data 未初始化 ⇒ 默认读到 0 = 正常 ✓；测试用 poke 置 1）

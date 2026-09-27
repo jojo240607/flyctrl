@@ -397,9 +397,19 @@ impl Estimator for EskfEstimator {
         //     ★重锚/重置后 PX4 会 `_mag_heading_innov_lpf.reset(0)` 且 consistent=true ✓
         //       （`mag_control.cpp:613-614`）⇒ 本仓在对准时同步清零低通 ✓
         let head_noise = 0.3f32; // ekf2_head_noise 一手默认（rad ✓）
+        //   ★★§5.141【一手精读更正（关键 ✓✓）】：`isNorthEastAidingActive()` 的一手定义
+        //   （`estimator_interface.cpp` ✓）= `gnss_pos || gnss_vel || aux_gpos || ev_pos(NED) || ev_vel(NED)`
+        //   ⇒ **本仓有 GPS 位置/速度融合 ⇒ 该条件为 TRUE** ✓（此前误判为"无 NE 辅助"✗）。
+        //   故按一手语义，`mag_heading_consistent` 必须满足：
+        //     `(|航向新息低通| < head_noise) ∧ (|瞬时新息| < head_noise)`
+        //     ∧ **`isNorthEastAidingActive() && _accel_horiz_lpf > mag_acclim(0.5 m/s²)`** ✓
+        //   ⇒ **悬停时水平加速度≈0 ⇒ consistent=false ⇒ PX4 也不用 3D** ✓✓
+        //     （本仓此前在悬停启用 3D ⇒ 违背一手 ⇒ 在不该用 3D 时用了 3D ⇒ 自激 ✓）
+        let accel_ok = self.f.accel_horiz_lpf > 0.5; // ekf2_mag_acclim 一手默认 ✓
         let hdg_consistent = if hdg_gate_on {
             self.f.mag_hdg_innov_lpf.abs() < head_noise
                 && self.f.last_mag_yaw_innov.abs() < head_noise
+                && accel_ok
         } else {
             true // 门控未启用 ⇒ 不参与（默认路径行为不变 ✓）
         };
