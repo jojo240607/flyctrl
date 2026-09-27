@@ -106,6 +106,19 @@ pub static mut G_ESKF_MAG_FREEZE: f32 = 0.0;
 /// ★§5.137 诊断旋钮：速度状态过程噪声倍率（默认 **1.0** ✓ 逐位不变）；
 ///   >0 时 `q[I_VEL] = 2.0·dt·k`——用于定位"噪声悬停垂直速度抖动"是否由速度 Q 过大引起 ✓
 pub static mut G_ESKF_Q_VEL_K: f32 = 0.0;
+/// ★§5.138【对齐 PX4 一手 `mag_control.cpp:178/203/230/279` ✓】周期性磁状态重锚：
+///   `no_ne_aiding_or_not_moving = !isNorthEastAidingActive() || vehicle_at_rest` 为真时，
+///   PX4 会 **`resetMagStates(_mag_lpf.getState(), …)`**（硬重初始化 mag_I/mag_B + 协方差）
+///   ——尤其"融合失败"与"WMM 更新"两条路径 ✓。本仓无 NE 辅助 ⇒ 该条件恒真 ✓。
+///   语义：每 `N` 次磁更新重锚一次（`N = 磁更新率 × 秒`）；**0 = 关**（默认，行为逐位不变 ✓）
+///   单位：磁更新次数（`aid_period=15` ⇒ 16.7Hz ⇒ N=167 ≈ 10s ✓）
+pub static mut G_ESKF_MAG_RESET_PERIOD: f32 = 0.0;
+/// ★§5.138 诊断旋钮：`mag_i` **先验覆盖**（Gauss）。任一非零 ⇒ 覆盖默认先验
+///   `[0.2, 0, 0.4]`——用于验证"先验磁场与实际不符是否即真机 3D 失稳之因" ✓
+///   （默认全 0 ⇒ 用内置先验，行为逐位不变 ✓）
+pub static mut G_ESKF_MAG_I_PRIOR_X: f32 = 0.0;
+pub static mut G_ESKF_MAG_I_PRIOR_Y: f32 = 0.0;
+pub static mut G_ESKF_MAG_I_PRIOR_Z: f32 = 0.0;
 /// ★§5.136 诊断：[0]=heading 计数 [1]=3D 计数 [2]=最近航向新息 [3]=水平加速度 [4]=yaw_aligned
 ///   （AUTO 判据分量观测用；默认全 0、不参与控制 ✓）
 pub static mut AUTO_DBG: [f32; 5] = [0.0; 5];
@@ -1058,6 +1071,15 @@ impl Eskf {
     ///  · **`mag_B = meas − Rᵀ·mag_I`（代数反解 ✓✓ —— 一次解出，不靠渐近分离 ✓）**
     ///  · 重置协方差到 R 量级 + **去相关** ✓（`resetMagEarthCov`/`resetMagBiasCov` ✓）
     ///  · **闩锁 `yaw_aligned = true`** ✓（此后才允许反解 ✓ —— 参照 424 行的门控 ✓）
+    /// ★§5.138【对齐 PX4 `resetMagStates` 的周期性重锚用法 ✓】：与 `reset_mag_states`
+    ///   同语义（`mag_i = 先验`、`mag_b` 代数反解、协方差重置），但**不改 `yaw_aligned`**
+    ///   ——用于飞行中的周期性重锚（PX4 的 `reset_heading` 参数在"有 NE 辅助"时为 false ✓）
+    pub fn reset_mag_states_no_yaw(&mut self, meas: [f32; 3], mag_i_prior: [f32; 3]) {
+        let keep = self.yaw_aligned;
+        self.reset_mag_states(meas, mag_i_prior);
+        self.yaw_aligned = keep;
+    }
+
     pub fn reset_mag_states(&mut self, meas: [f32; 3], mag_i_prior: [f32; 3]) {
         if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_ON)) } < 0.5 {
             return;

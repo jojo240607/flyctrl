@@ -58,6 +58,8 @@ pub struct EskfEstimator {
     ///   供 **instant reset / 初始对准**使用（避免用单个带噪样本做代数反解 ✓）
     mag_lpf: [f32; 3],
     mag_lpf_init: bool,
+    /// ★§5.138：周期性磁状态重锚的计数器（见 `G_ESKF_MAG_RESET_PERIOD` ✓）
+    mag_reset_div: u32,
     /// ★**辅助观测降频**（§5.84 ✓）：每 N 拍才融合一次重力辅助与磁 ✓
     /// 物理依据：重力方向/磁方向的变化率远低于 IMU 采样率 ✓ ⇒ 无需每拍融合 ✓
     /// （同时消除"同一保持样本每拍重复融合"的隐患 ✓）
@@ -105,6 +107,7 @@ impl EskfEstimator {
             last_accel: [0.0; 3],
             mag_lpf: [0.0; 3],
             mag_lpf_init: false,
+            mag_reset_div: 0,
             aid_div: 0,
             aid_period: 15, // ★250Hz 下 ⇒ 16.7Hz ✓（§5.86）
             n_step: 0,
@@ -267,6 +270,18 @@ impl Estimator for EskfEstimator {
 
     fn update_mag(&mut self, mag: Option<[f32; 3]>) {
         let Some(m) = mag else { return };
+        // ★§5.138 诊断：先验磁场覆盖（默认全 0 ⇒ 不覆盖 ⇒ 行为逐位不变 ✓）
+        {
+            let p = unsafe {
+                let x = core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_I_PRIOR_X));
+                let y = core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_I_PRIOR_Y));
+                let z = core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_I_PRIOR_Z));
+                [x, y, z]
+            };
+            if p[0] != 0.0 || p[1] != 0.0 || p[2] != 0.0 {
+                self.mag_i_prior = p;
+            }
+        }
         // ★§5.136【对齐 PX4 `_mag_lpf` ✓】：一阶低通（AlphaFilter，τ=90ms，同一手参数 ✓）。
         //   `alpha = dt/(dt+τ)`；dt 取控制周期 4ms ⇒ alpha ≈ 0.0426 ✓
         //   ⚠️ 一手精确（`ekf_ekf.h:668` 注释 ✓）：`_mag_lpf` **只供 instant reset 用**，
@@ -315,6 +330,25 @@ impl Estimator for EskfEstimator {
         // ★磁同样降频 ✓（磁方向变化更慢 ✓）
         if self.aid_div % self.aid_period.max(1) != 0 {
             return;
+        }
+        // ★§5.138【对齐 PX4 一手：周期性磁状态重锚 ✓】（`mag_control.cpp:178/203/230/279`）：
+        //   条件 `no_ne_aiding_or_not_moving = !isNorthEastAidingActive() || vehicle_at_rest`
+        //   ——本仓无 NE 辅助 ⇒ **恒为真** ✓ ⇒ 周期性 `resetMagStates`（硬重初始化）✓
+        //   机理（补遗 29 诊断 ✓）：真机链下 mag_I/mag_B 在弱可观测方向上漂移积累 ⇒
+        //   3D 失稳发散；周期性重锚把该漂移**清零**（而非软拉回 ✗ 实测 reanchor 有害 ✓）
+        {
+            let period = unsafe {
+                core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_RESET_PERIOD))
+            };
+            if period >= 1.0 {
+                self.mag_reset_div = self.mag_reset_div.wrapping_add(1);
+                if (self.mag_reset_div as f32) >= period {
+                    self.mag_reset_div = 0;
+                    let m_now = self.mag_lpf;
+                    self.f.reset_mag_states_no_yaw(m_now, self.mag_i_prior);
+                    self.n_mag_reanchored = self.n_mag_reanchored.wrapping_add(1);
+                }
+            }
         }
         // ★★§5.136【AUTO 选择——严格按 PX4 一手 `mag_control.cpp:189-200` ✓】：
         //     `mag_3D = common_conditions_passing && mag_aligned_in_flight`
