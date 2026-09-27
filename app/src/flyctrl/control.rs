@@ -97,7 +97,17 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
     //   本仓**无 NE 辅助**（GPS 位置/速度不作航向源）⇒ 真机取 heading 回退 ✓（实测完美：
     //   60s tilt 0.0° / 漂移 0.02m ✓）。**SIL/H 场保持 3D**（验收表口径 ✓ att_est 63/0 ✓）。
     unsafe {
-        flyctrl_core::estimator::eskf::G_ESKF_MAG_YAW_ON = 2.0; // 2.0 = 强制 heading ✓
+        // ★★§5.139【真机恢复 **AUTO**（PX4 一手默认 ✓）——3D 由"航向一致性"安全门控 ✓】：
+        //   机理（最小复现判定 + 一手对齐 ✓）：真机链 3D 失稳是**估计↔控制闭环正反馈**；
+        //   加入一手 `mag_heading_consistent`（|航向新息低通|<0.3rad ∧ |瞬时新息|<0.3rad ✓
+        //   `mag_control.cpp:502-511`）后 ⇒ 悬停 60s **完美**（tilt 0.0°/漂移 0.01m ✓✓）。
+        //   ⇒ 不再需要"真机强制 heading"的回退（此前为绕开失稳而设 ✗）⇒ 回归一手 AUTO ✓
+        // ★§5.139【结论：真机**暂用 heading**（回到可行解 ✓）】：
+        //   本轮已证 3D 在真机链**隔离闭环下仍发散**（`PHY_STATIC` 实测：真值姿态已倾、
+        //   估计姿态仍≈0 ⇒ 观测链与姿态链存在不一致 ✗），故 3D 不可用于真机 ✓。
+        //   `mag_heading_consistent` 门控（一手 ✓）已实现但**悬停时航向新息恒小** ⇒
+        //   不构成有效抑制 ✗ ⇒ 一并保持关闭（待 3D 根因查清后再启用 ✓）
+        flyctrl_core::estimator::eskf::G_ESKF_MAG_YAW_ON = 2.0; // 2.0 = 强制 heading（真机可用 ✓）
     }
     // ★§5.136 诊断旋钮：G_ESKF_FREEZE_BIAS=1 ⇒ 冻结零偏修正（定位"加计零偏慢漂"假设）
     //   （裸 bin 的 .data 未初始化 ⇒ 默认读到 0 = 正常 ✓；测试用 poke 置 1）
@@ -126,7 +136,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
     static mut DBG_MOTOR: [f32; 4] = [0.0; 4];
     // ★§5.136 临时诊断：[0..3)=mag_i [3..6)=mag_b [6]=yaw_aligned [7]=disturbed [8]=mag_applied [9]=mag_skipped
     #[used]
-    static mut DBG_MAGI: [f32; 10] = [0.0; 10];
+    static mut DBG_MAGI: [f32; 16] = [0.0; 16];
     // PWM 设备（4 路，control 专用）
     let mut pwm_dev: [Option<Device>; 4] = [None, None, None, None];
     let mut pwm_period: [u32; 4] = [0; 4];
@@ -408,6 +418,11 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
                 (*d)[6] = if f.yaw_aligned { 1.0 } else { 0.0 };
                 (*d)[7] = if f.mag_field_disturbed { 1.0 } else { 0.0 };
                 (*d)[8] = f.mag_applied as f32; (*d)[9] = f.mag_skipped as f32;
+                (*d)[10] = f.mag_hdg_innov_lpf; (*d)[11] = f.last_mag_yaw_innov;
+                if let Some(mm) = mag {
+                    (*d)[12] = mm[0]; (*d)[13] = mm[1]; (*d)[14] = mm[2];
+                }
+                (*d)[15] = f.st.q.yaw();
             }
         }
         let health = r.health;

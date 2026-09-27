@@ -116,6 +116,7 @@ pub static mut G_ESKF_MAG_RESET_PERIOD: f32 = 0.0;
 /// ★§5.138 诊断旋钮：`mag_i` **先验覆盖**（Gauss）。任一非零 ⇒ 覆盖默认先验
 ///   `[0.2, 0, 0.4]`——用于验证"先验磁场与实际不符是否即真机 3D 失稳之因" ✓
 ///   （默认全 0 ⇒ 用内置先验，行为逐位不变 ✓）
+pub static mut G_ESKF_MAG_HDG_GATE: f32 = 0.0;
 pub static mut G_ESKF_MAG_I_PRIOR_X: f32 = 0.0;
 pub static mut G_ESKF_MAG_I_PRIOR_Y: f32 = 0.0;
 pub static mut G_ESKF_MAG_I_PRIOR_Z: f32 = 0.0;
@@ -641,6 +642,12 @@ pub struct Eskf {
     pub mag_delay_accel_horiz: f32,
     /// ★§5.136 最近一次航向新息（AUTO 判据 `mag_heading_consistent` 用 ✓ PX4 一手）
     pub last_mag_yaw_innov: f32,
+    /// ★§5.139【对齐 PX4 一手 `mag_control.cpp:495 _mag_heading_innov_lpf` ✓】：
+    ///   航向新息**低通**（AlphaFilter，时间常数同 `_kSensorLpfTimeConstant`=90ms ✓）
+    pub mag_hdg_innov_lpf: f32,
+    /// ★§5.139【对齐 PX4 一手 `ekf_ekf.h:553 _accel_horiz_lpf` ✓】：NE 系水平加速度低通
+    ///   （时间常数 `_kAccelHorizLpfTimeConstant`=**1s** ✓），用于判定"机动使航向可观测" ✓
+    pub accel_horiz_lpf: f32,
     /// **冻结零偏修正**（定位用 ✓）：静止场景下零偏本就【不可观测】✗
     /// （无足够量测激励 ✓）⇒ 用于判定"长循环慢性发散是否由零偏块引起" ✓
     pub freeze_bias: bool,
@@ -700,6 +707,8 @@ impl Eskf {
             mag_delay_omega: [0.0; 3],
             mag_delay_accel_horiz: 0.0,
             last_mag_yaw_innov: 0.0,
+            mag_hdg_innov_lpf: 0.0,
+            accel_horiz_lpf: 0.0,
             freeze_bias: false,
         }
     }
@@ -1344,6 +1353,32 @@ impl Eskf {
         Ok(nis)
     }
 
+    /// ★§5.139【对齐 PX4 一手 `mag_control.cpp:488-500` ✓】：**独立于融合模式**地计算
+    ///   航向新息并更新低通——PX4 在 `fuseMag` 之外**每拍**算 `innovation` 与
+    ///   `_mag_heading_innov_lpf`（`mag_heading_consistent` 的判据输入 ✓）。
+    ///   本仓原先只在 heading 路径更新 ⇒ 3D 路径下低通恒 0 ⇒ 判据恒真 ⇒ 门控失效 ✗
+    pub fn mag_heading_innov(&mut self, meas_body: [f32; 3]) -> f32 {
+        let mag_i = self.mag_i;
+        let mi_norm = crate::math::sqrt(mag_i[0] * mag_i[0] + mag_i[1] * mag_i[1]);
+        if mi_norm <= 1e-9 {
+            return 0.0;
+        }
+        let pred = rotate_vec_by_quat_inverse(self.st.q, mag_i);
+        let px = pred[0];
+        let py = pred[1];
+        let mx = meas_body[0];
+        let my = meas_body[1];
+        let innov = crate::math::atan2(mx * py - my * px, mx * px + my * py);
+        let innov = if innov.is_finite() { innov } else { 0.0 };
+        self.last_mag_yaw_innov = innov;
+        // 一阶低通（90ms，一手 `_kSensorLpfTimeConstant` ✓）
+        let tau = 0.090f32;
+        let dt = 0.004f32;
+        let a = dt / (dt + tau);
+        self.mag_hdg_innov_lpf += a * (innov - self.mag_hdg_innov_lpf);
+        innov
+    }
+
     pub fn update_mag_yaw(&mut self, meas_body: [f32; 3]) -> Result<f32, &'static str> {
         if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_ON)) } == 2.0 {
             return Err("磁量测：对照臂【旋钮关闭】✓（实验用，非静默 ✗）");
@@ -1399,6 +1434,13 @@ impl Eskf {
         //     注入 ⇒ 语义一致 ✓）⇒ 此处分子取 `mx·pred_y − my·pred_x`（= meas − pred 的叉积）✓
         let yaw_err = crate::math::atan2(mx * pred_y - my * pred_x, mx * pred_x + my * pred_y);
         self.last_mag_yaw_innov = yaw_err; // AUTO 判据用（PX4 mag_heading_consistent ✓）
+        // ★§5.139【一手 `_mag_heading_innov_lpf.update(innovation)` ✓】：90ms 一阶低通
+        {
+            let tau = 0.090f32; // `_kSensorLpfTimeConstant`=90ms ✓
+            let dt = 0.004f32; // 控制周期（与 `_dt_ekf_avg` 同义 ✓）
+            let a = dt / (dt + tau);
+            self.mag_hdg_innov_lpf += a * (yaw_err - self.mag_hdg_innov_lpf);
+        }
         if !yaw_err.is_finite() {
             self.mag_skipped = self.mag_skipped.wrapping_add(1);
             return Err("磁量测：航向残差非有限 ⇒ 跳过 ✓");

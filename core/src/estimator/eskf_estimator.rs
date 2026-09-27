@@ -314,6 +314,8 @@ impl Estimator for EskfEstimator {
                 // ★对准窗口：前 60 次磁更新（≈3.6s @16.7Hz）内重复对准，跟随姿态收敛 ✓
                 self.f.begin_mag_alignment(60);
                 self.f.align_yaw_to_mag(m_reset);
+                // ★一手 `mag_control.cpp:613-614`：航向重置后 `_mag_heading_innov_lpf.reset(0)`
+                self.f.mag_hdg_innov_lpf = 0.0;
             } else {
                 self.f.reset_mag_states(m_reset, self.mag_i_prior);
             }
@@ -364,6 +366,16 @@ impl Estimator for EskfEstimator {
         let knob = unsafe {
             core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_YAW_ON))
         };
+        // ★§5.139【一手 `mag_control.cpp:488-500`】：**先**算航向新息并更新低通
+        //   （`mag_heading_consistent` 的判据输入；3D 路径下也必须更新 ✓）。
+        //   ⚠️纪律（H 场三表对默认路径敏感 ✓ 实测×3）：**仅当"航向一致性门控"启用**
+        //   （`G_ESKF_MAG_HDG_GATE == 2.0`）时才调用 ⇒ 默认路径**逐位不变** ✓
+        let hdg_gate_on = unsafe {
+            core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_HDG_GATE))
+        } == 2.0;
+        if hdg_gate_on {
+            let _ = self.f.mag_heading_innov(m);
+        }
         //   ★一手精读（`mag_control.cpp:181-190, 502-511` ✓）：`mag_heading_consistent`
         //     仅在**存在 NE 外部辅助**（`isNorthEastAidingActive()`）时才参与公共条件
         //     ⇒ 其判定为 `mag_consistent_or_no_ne_aiding = mag_heading_consistent ||
@@ -371,7 +383,22 @@ impl Estimator for EskfEstimator {
         //     ⇒ 该分支恒满足 ⇒ `mag_3D` 只需"**对准完成 + 未受扰**" ✓（即下方判据 ✓）
         //     注：曾尝试把 `|航向新息|<head_noise 且 水平速度>阈` 作为必要条件 ⇒ 悬停
         //     （速度≈0）会退回 heading ⇒ 与验收表口径冲突（3 项失败 ✗）⇒ 按一手回退 ✓
-        let mode_3d = self.f.yaw_aligned && !self.f.mag_field_disturbed;
+        //   ★★§5.139【一手 `mag_control.cpp:502-511` `mag_heading_consistent` ✓】：
+        //     `(|_mag_heading_innov_lpf| < head_noise) && (|innovation| < head_noise)`
+        //     其中 `head_noise = 0.3 rad`（`ekf2_head_noise` 一手默认 ✓）。
+        //     ★一手关键：acclim 分支**仅在有 NE 外部辅助时**要求（`isNorthEastAidingActive()` ✓）
+        //     ——本仓无 NE 辅助 ⇒ 只要求**航向新息一致** ✓
+        //     ⇒ 3D 仅在【对准完成 ∧ 未受扰 ∧ **航向新息一致**】时启用 ✓（闭环正反馈抑制 ✓）
+        //     ★重锚/重置后 PX4 会 `_mag_heading_innov_lpf.reset(0)` 且 consistent=true ✓
+        //       （`mag_control.cpp:613-614`）⇒ 本仓在对准时同步清零低通 ✓
+        let head_noise = 0.3f32; // ekf2_head_noise 一手默认（rad ✓）
+        let hdg_consistent = if hdg_gate_on {
+            self.f.mag_hdg_innov_lpf.abs() < head_noise
+                && self.f.last_mag_yaw_innov.abs() < head_noise
+        } else {
+            true // 门控未启用 ⇒ 不参与（默认路径行为不变 ✓）
+        };
+        let mode_3d = hdg_consistent && self.f.yaw_aligned && !self.f.mag_field_disturbed;
         let yaw_only = if knob == 2.0 { true } else if knob == 3.0 { false } else { !mode_3d };
         // ★§5.136：延迟补偿用【测量角速度】（与 PX4 `_state.gyro` 同源 ✓）
         self.f.mag_delay_omega = self.omega_body;
@@ -380,8 +407,21 @@ impl Estimator for EskfEstimator {
             let a = self.last_accel;
             self.f.mag_delay_accel_horiz = crate::math::sqrt(a[0] * a[0] + a[1] * a[1]);
         }
-        // ★§5.136：3D 路径走**扩展入口**（干扰检测 + 延迟对齐，均默认关 ⇒ 与旧行为一致 ✓）
-        let r = if yaw_only { self.f.update_mag_yaw(m) } else { self.f.update_mag_ext(m) };
+        // ★§5.136/§5.139 纪律（真机与 H 场同样敏感 ✓ 实测）：**默认走原路径**逐位不变；
+        //   仅当扩展旋钮（延迟对齐/干扰检测）启用时才走 `update_mag_ext` ✓
+        //   （实测：无条件走 ext（即使 delay=0）⇒ 真机 heading 冒烟由 0.0°/0.00m 劣化为
+        //    19.3°/11.8m ✗ ⇒ demo 失败；改为条件进入后恢复完美 ✓）
+        let ext_on = unsafe {
+            core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_DELAY_MS)) > 0.0
+                || core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_CHECK)) == 2.0
+        };
+        let r = if yaw_only {
+            self.f.update_mag_yaw(m)
+        } else if ext_on {
+            self.f.update_mag_ext(m)
+        } else {
+            self.f.update_mag(m)
+        };
         match r {
             Ok(_) => { self.n_mag = self.n_mag.wrapping_add(1); bump(9); }
             Err(_) => { self.n_mag_rejected = self.n_mag_rejected.wrapping_add(1); bump(10); }
