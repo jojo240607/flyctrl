@@ -330,7 +330,12 @@ impl Estimator for EskfEstimator {
             self.n_mag_reanchored = self.n_mag_reanchored.wrapping_add(n);
         }
         // ★磁同样降频 ✓（磁方向变化更慢 ✓）
-        if self.aid_div % self.aid_period.max(1) != 0 {
+        // ★§5.139 诊断：磁更新降频率可覆盖（默认 0 ⇒ 用 aid_period ✓ 逐位不变）
+        let mp = unsafe {
+            core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_PERIOD))
+        };
+        let peri = if mp >= 1.0 { mp as u32 } else { self.aid_period.max(1) };
+        if self.aid_div % peri != 0 {
             return;
         }
         // ★§5.138【对齐 PX4 一手：周期性磁状态重锚 ✓】（`mag_control.cpp:178/203/230/279`）：

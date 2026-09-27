@@ -117,6 +117,12 @@ pub static mut G_ESKF_MAG_RESET_PERIOD: f32 = 0.0;
 ///   `[0.2, 0, 0.4]`——用于验证"先验磁场与实际不符是否即真机 3D 失稳之因" ✓
 ///   （默认全 0 ⇒ 用内置先验，行为逐位不变 ✓）
 pub static mut G_ESKF_MAG_HDG_GATE: f32 = 0.0;
+/// ★§5.139 诊断旋钮：3D 磁观测噪声倍率（默认 **1.0** ✓）；>0 时 `r_mag *= k`
+///   ——用于验证"降低 3D 观测增益可抑制闭环正反馈" ✓
+pub static mut G_ESKF_R_MAG_K: f32 = 0.0;
+/// ★§5.139 诊断旋钮：磁更新降频率（磁更新每 N 个控制拍一次）；**0 = 用默认 aid_period=15** ✓
+///   用于判别"4Hz 自激是否与磁观测时序/频率有关" ✓
+pub static mut G_ESKF_MAG_PERIOD: f32 = 0.0;
 pub static mut G_ESKF_MAG_I_PRIOR_X: f32 = 0.0;
 pub static mut G_ESKF_MAG_I_PRIOR_Y: f32 = 0.0;
 pub static mut G_ESKF_MAG_I_PRIOR_Z: f32 = 0.0;
@@ -1599,6 +1605,9 @@ impl Eskf {
                 *v = acc;
             }
             let mut s_ = self.r_mag;
+            // ★§5.139 诊断倍率（默认 0 ⇒ 不生效 ⇒ 逐位不变 ✓）——3D 融合路径 ✓
+            let rk3 = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_R_MAG_K)) };
+            if rk3 > 0.0 { s_ *= rk3; }
             for k in 0..N {
                 s_ += h[k] * ph[k];
             }
