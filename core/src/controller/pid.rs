@@ -93,6 +93,11 @@ pub static mut G_KV_XY: f32 = -1.0;
 pub static mut G_VEL_LPF_H_TAU: f32 = -1.0;
 /// ★§5.139 诊断旋钮：姿态-速率环增益覆盖（**-1 = 不覆盖** ⇒ 默认逐位不变 ✓）
 ///   用于判定"真机 3D 自激（≈4Hz 俯仰）是否即该环的环路特性" ✓
+/// ★§5.155 诊断探针（导出 ✓）：[0..3)=position error (ex,ey,ez)
+///   [3..6)=desired velocity (des_vx,des_vy,des_vz) [6]=rate_mode_xy
+#[no_mangle]
+#[used]
+pub static mut G_CTRL_DBG: [f32; 8] = [0.0; 8];
 pub static mut G_ATT_KP: f32 = -1.0;
 pub static mut G_ATT_KD: f32 = -1.0;
 
@@ -391,6 +396,11 @@ impl Controller for PidController {
         let ex = sp.pos[0].0 - est_n;
         let ey = sp.pos[1].0 - est_e;
         let ez = sp.pos[2].0 - est_d;
+        unsafe {
+            let d = core::ptr::addr_of_mut!(G_CTRL_DBG);
+            (*d)[0] = ex; (*d)[1] = ey; (*d)[2] = ez;
+            (*d)[6] = if self.rate_mode_xy { 1.0 } else { 0.0 };
+        }
         // 垂向位置积分（抗稳态下沉）：iz 累积位置误差，作为期望速度的积分分量。
         // 标准 PI 配条件积分（clamping 抗 windup，PLAN 阶段 11-A）：
         // 用回算（back-calculation）抗积分饱和：当 des_vz 将饱和时，把 iz 直接置为
@@ -456,6 +466,10 @@ impl Controller for PidController {
         } else {
             clampf(pre_ix + ix_final, -vmax_xy_eff, vmax_xy_eff)
         };
+        unsafe {
+            let d = core::ptr::addr_of_mut!(G_CTRL_DBG);
+            (*d)[3] = des_vx;
+        }
         let des_vy = if self.rate_mode_xy {
             clampf(sp.vel[1].0, -vmax_xy_eff, vmax_xy_eff)
         } else {

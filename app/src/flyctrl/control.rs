@@ -401,7 +401,7 @@ flyctrl_core::estimator::eskf::G_ESKF_MAG_YAW_ON = 0.0; // 0.0 = AUTO（一手�
                         }, 0.0, hold_alt.0,
                         rc.pitch * LOITER_NUDGE_GAIN,
                         -rc.roll * LOITER_NUDGE_GAIN,
-                        false,
+                        true,
                     ),
                     // STABILIZE / ALT_HOLD / 默认：速率模式（摇杆 → 期望速度）+ 定高，
                     // 大疆手感（推杆飞、松杆停）；pos 用速度外推预测位置补偿 EKF 延迟。
@@ -413,17 +413,14 @@ flyctrl_core::estimator::eskf::G_ESKF_MAG_YAW_ON = 0.0; // 0.0 = AUTO（一手�
                     ),
                 };
                 // 速率模式：速度外推的预测位置（补偿 EKF 位置估计延迟）；位置模式：绝对目标。
-                let pos = if use_rc_vel {
-                    let pred = last_est.map(|e| {
-                        [
-                            Meter(e.pos[0].0 + e.vel[0].0 * VEL_PRED_HORIZON),
-                            Meter(e.pos[1].0 + e.vel[1].0 * VEL_PRED_HORIZON),
-                            Meter(tz),
-                        ]
-                    }).unwrap_or([Meter(0.0); 3]);
-                    [pred[0], pred[1], Meter(tz)]
-                } else {
-                    [Meter(tx), Meter(ty), Meter(tz)]
+                let pos = match (use_rc_vel, last_est) {
+                    (true, Some(e)) => [
+                        Meter(e.pos[0].0 + e.vel[0].0 * VEL_PRED_HORIZON),
+                        Meter(e.pos[1].0 + e.vel[1].0 * VEL_PRED_HORIZON),
+                        Meter(tz),
+                    ],
+                    (true, None) => [Meter(tx), Meter(ty), Meter(tz)],
+                    (false, _) => [Meter(tx), Meter(ty), Meter(tz)],
                 };
                 (
                     Setpoint {
