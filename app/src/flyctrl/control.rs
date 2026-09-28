@@ -261,11 +261,23 @@ flyctrl_core::estimator::eskf::G_ESKF_MAG_YAW_ON = 0.0; // 0.0 = AUTO（一手�
                 let v = (pwm as f32 - 1000.0) / 1000.0;
                 v.clamp(0.0, 1.0)
             };
+            // ★§5.152【中位归零（机械性 ✓）】：`RcInput` 的 roll/pitch/yaw 是**有符号**
+            //   摇杆量（"右移/后拉为正" ✓，零=中位 ✓ 见 `vehicle.rs:351-363`），而 PWM 归一
+            //   是 0..1（中位 **0.5** ✗）。此前直接传 `norm()` ⇒ ① 中位时残留 +0.5 的恒定
+            //   指令 ✗ ② 前推 0.1 被当 0.6 用（放大 6× ✗）。实测：LOITER 前推摇杆时北向
+            //   速度远超指令量级且方向不符（§5.145 台账项 ✓）。
+            //   ⇒ 三轴按【中位 0 点 + 满舵 ±1】归一 ✓：`(norm − 0.5) × 2` ✓
+            //   ⚠️ 油门保持 0..1（其语义本就是 0..1 ✓，中位 0.5 = 悬停油门 ✓ 见
+            //     `vehicle.rs:358` ✓）
+            // 内联（不用闭包 ✓ 减少一层间接 ⇒ 排除布局/优化相关疑点 ✓）
+            let roll_s = (norm(rc_ov[0]) - 0.5) * 2.0;
+            let pitch_s = (norm(rc_ov[1]) - 0.5) * 2.0;
+            let yaw_s = (norm(rc_ov[3]) - 0.5) * 2.0;
             RcInput {
                 throttle: norm(rc_ov[2]),
-                roll: norm(rc_ov[0]),
-                pitch: norm(rc_ov[1]),
-                yaw: norm(rc_ov[3]),
+                roll: roll_s,
+                pitch: pitch_s,
+                yaw: yaw_s,
                 // ★§5.145 修复（机械性 ✓）：override **只应覆盖摇杆 4 通道**（MAVLink
                 //   `RC_CHANNELS_OVERRIDE` 语义 ✓），**不应改解锁/模式**——它们仍是 RC 链路
                 //   的职责 ✓。此前用 `rc_ov[0] > 1500` 作解锁指示 ⇒ 前推摇杆(roll=1500)
