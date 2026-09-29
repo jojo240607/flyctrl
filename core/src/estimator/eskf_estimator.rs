@@ -180,6 +180,10 @@ impl Estimator for EskfEstimator {
         let gyr = [imu.gyro[0].0, imu.gyro[1].0, imu.gyro[2].0];
         let acc = [imu.accel[0].0, imu.accel[1].0, imu.accel[2].0];
         self.omega_body = gyr;
+        // ★§5.186：当前机体角速率也供【重力辅助的比力低通延迟补偿】用（`update_gravity`
+        //   在 `update_mag` **之前**调用 ⇒ 原先 `mag_delay_omega` 在重力步里是**上一拍**的值）；
+        //   与 `update_mag` 里的写入等价但更早 ✓（同名共享，语义更新为"当前机体角速率" ✓）
+        self.f.mag_delay_omega = gyr;
         self.last_accel = acc; // ★§5.136：延迟对齐机动门（水平分量 ✓）
         // ★§5.168：世界系加速度（NED ✓）= R(q)·f_b + g（重力向下为正 ✓），一阶低通 ✓
         {

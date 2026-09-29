@@ -97,6 +97,15 @@ pub const MAG_DELAY_DEFAULT_MS: f32 = 1.5;
 pub static mut G_ESKF_BYPASS_GYR_NOTCH: f32 = 0.0;
 /// ★§5.136 A/B 旋钮：陀螺陷波 Q 覆盖（>0 生效；默认 0 = 用既有 5.0 ✓）
 pub static mut G_ESKF_GYR_NOTCH_Q: f32 = 0.0;
+/// ★★§5.186【加速度低通相位滞后的姿态回退补偿量（毫秒） ✓】
+///
+/// 背景（本轮实测 ✓）：`step_hil` 对比力做 20Hz 二阶 Butterworth 低通（抑振/降噪 ✓），
+/// 其**群延迟** ≈ 8ms ⇒ 本拍比力实际对应姿态 `q(t−τ)`。重力辅助若直接用 `q(t)` 比 ⇒
+/// **快速旋转下产生系统性误差 ≈ |ω|·τ**（A13 1500°/s 实测：τ≈8ms ⇒ ~12° ✓）。
+/// 修法：按已知 τ **把预测姿态回退一阶**（与已落地的 `mag_delay` 补偿**同构** ✓）。
+/// 默认 `0` ⇒ 用内置 **8ms**（裸 bin 的 `.data` 未初始化读 0 也走此分支 ✓）；
+/// `<0` ⇒ 关闭补偿（A/B 对照臂 ✓）；`>0` ⇒ 覆盖 τ（毫秒，整定用 ✓）。
+pub static mut G_ESKF_ACC_LAG_MS: f32 = 0.0;
 /// ★§5.136 一手旋钮：磁干扰检查（强度/倾角）——**默认关**（对齐 PX4 `ekf2_mag_check=0` ✓）；
 ///   `2.0` ⇒ 启用（定位/诊断用 ✓）
 pub static mut G_ESKF_MAG_CHECK: f32 = 0.0;
@@ -232,10 +241,8 @@ pub fn transition_matrix(
     for i in 0..3 {
         f[I_POS + i][I_VEL + i] += dt;
     }
-    // 速度×姿态：∂δv/∂δθ = 【+[a_world ×]·dt】（§12.8 ✓ 参照 derivation.py 169–182 行定形 ✓）
-    //   ⚠️★§5.184【开放问题】：有限差分（与 `inject_error` 同约定）给出 **−[a_world×]·dt**，
-    //   与本行相反；但把本行改为 − 后 A13（陀螺饱和边）明显变差 ✗（补偿性符号错假设）
-    //   ⇒ 保持 + 号（H 场绿）并把矛盾登记在 `f_vel_att_sign_vs_finite_difference`（#[ignore]）✓。
+    // 速度×姿态：∂δv/∂δθ = **−[a_world ×]·dt**
+    //   ★§5.186【已修 ✓】：改为 `−[a_world×]·dt`（FD + 物理双证 ✓，见循环内注释 ✓）。
     //   叉乘必须在【世界系】做（用 a_world = R·f ✓）——
     //   写成 R·[f×] 是【结构性错误】✗（少一个 Rᵀ 的相似变换，怎么调符号都不对 ✓）
     let a_world = rotate_vec_by_quat(q, f_body);
@@ -248,14 +255,14 @@ pub fn transition_matrix(
             _ => [ay, -ax, 0.0],
         };
         for i in 0..3 {
-            // ★§5.184【开放问题 ✗（重要）】：本行符号 **与有限差分相悖** ——
-            //   FD（与 `inject_error` 同约定：左乘 `q←exp(δθ)⊗q`）定形为 **−[a_world×]·dt** ✓；
-            //   而实测把符号改成 − 后 `mag_reference_quiet_scenario_regression::A13（陀螺饱和边）`
-            //   RMSE 5.27°→15.6° **变差 3×** ✗ ⇒ 说明**别处有补偿性符号错**，单独改此处会破平衡 ✗。
-            //   故此处暂**保持 + 号**（H 场绿 ✓），并把矛盾登记为 `#[ignore]`d 测试
-            //   `f_vel_att_sign_vs_finite_difference`（下轮专项审计：逐块 FD 核 H/F/injection 的
-            //   误差约定是否自洽 ✓）。F 符号本身**非本轮修复项** ✓。
-            f[I_VEL + i][I_ATT + j] += col[i] * dt;
+            // ★★§5.186【符号修正 ✓✓】：`∂δv/∂δθ = **−[a_world×]·dt**`。
+            //   本仓误差为【左乘】`q ← exp(δθ)⊗q` ⇒ `R_true ≈ (I+[δθ]×)R`
+            //   ⇒ `δv̇ = [δθ]×(R f) = −[R f]× δθ` ⇒ **负号** ✓。
+            //   双证（§5.184/§5.185 ✓）：① 前向差分（与 `inject_error` 同约定）
+            //   ② 物理直推（悬停 +δ 滚转 ⇒ 机体内上轴向东倾 ⇒ 加速度 = +9.81δ **东** ✓
+            //      ⇒ 必须是 −[a×]，`+[a×]` 会给反方向 ✗）。
+            //   守卫：`f_vel_att_sign_vs_finite_difference` + `f_state_transition_blocks_match_finite_difference` ✓
+            f[I_VEL + i][I_ATT + j] += -col[i] * dt;
         }
     }
     Ok(f)
@@ -1024,10 +1031,43 @@ impl Eskf {
         }
         let meas = [accel_body[0] / an, accel_body[1] / an, accel_body[2] / an];
         let mut applied = 0u32;
+        // ★★§5.186【比力低通群延迟补偿 ✓】：本拍 `accel_body` 是 20Hz 低通输出 ⇒
+        //   带群延迟 τ ≈ 8ms ⇒ 它对应的是 **q(t−τ)** 而非 q(t)。
+        //   不补偿 ⇒ 快速旋转下重力辅助系统性把姿态拉向滞后方向（误差 ≈ |ω|·τ ✓）。
+        //   与 `mag_delay` **同构**：用当前机体角速率把姿态一阶回退 `exp(−ω·τ)⊗q` ✓。
+        //   旋钮 `G_ESKF_ACC_LAG_MS`：默认 0 ⇒ 内置 8ms；<0 ⇒ 关（A/B）；>0 ⇒ 覆盖 ✓。
+        let tau_s = {
+            let ov = unsafe {
+                core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_ACC_LAG_MS))
+            };
+            if ov < 0.0 {
+                0.0
+            } else if ov > 0.0 {
+                ov * 1e-3
+            } else {
+                8e-3
+            }
+        };
+        let q_meas = if tau_s > 0.0 {
+            let w = self.mag_delay_omega; // 当前机体角速率 ✓（`eskf_estimator` 每拍写入 ✓）
+            let wn = crate::math::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
+            if wn > 1e-6 {
+                let dq = Quaternion::from_axis_angle(
+                    [w[0] / wn, w[1] / wn, w[2] / wn],
+                    Radian(-wn * tau_s),
+                );
+                (dq * self.st.q).normalize()
+            } else {
+                self.st.q
+            }
+        } else {
+            self.st.q
+        };
         // ★把 H 与预测【提到分量循环外】算一次 ✓（原在循环内被重建 3 次 ✗，
         //   每次含 3 次四元数旋转 ⇒ 白做 2/3 ✓；与 N³/H·P 两轮同类的"重复构造"缺陷 ✓）
-        let pred_all = predicted_gravity_body(self.st.q, g_ned);
-        let h_all = gravity_h(self.st.q, g_ned);
+        //   ★§5.186：均用回退后的 `q_meas`（与量测同刻 ✓）
+        let pred_all = predicted_gravity_body(q_meas, g_ned);
+        let h_all = gravity_h(q_meas, g_ned);
         for i in 0..3 {
             let pred = pred_all;
             let resid = meas[i] - pred[i];
@@ -1998,8 +2038,7 @@ mod tests {
         assert!(dq_bg < 1e-3, "F[att,bg] 与 FD 不符（{dq_bg:.2e}）");
         assert!(dv_ba < 1e-3, "F[vel,ba] 与 FD 不符（{dv_ba:.2e}）");
         assert!(dv_pv < 1e-3, "F[pos,vel] 与 FD 不符（{dv_pv:.2e}）");
-        // ★§5.184：唯一异常块 = F[vel,att]（偏差 ≈ 2×|a|·dt ≈ 2e-2 ✓，符号相反）
-        assert!(dv_att > 1e-2, "预期 F[vel,att] 与 FD 相悖（若此处失败 ⇒ 异常已修 ⇒ 去 #[ignore] ✓）");
+        assert!(dv_att < 1e-3, "F[vel,att] 与 FD 不符（{dv_att:.2e}）⇒ §5.186 修后应一致 ✓");
     }
 
     /// ★§5.184【FD 回归】：用**有限差分**（而非实现自证）校验重力 H 的符号/结构 ✓。
@@ -2054,15 +2093,11 @@ mod tests {
         assert!(maxdev < 1e-3, "磁 H 与有限差分不符（偏差 {maxdev:.2e}）⇒ 符号/结构错 ✗");
     }
 
-    /// ★§5.184【开放问题（已知 ✗）】：`F[vel,att]`（`∂δv/∂δθ`）符号与有限差分相悖。
+    /// ★§5.186【已修守卫 ✓】：`F[vel,att]`（`∂δv/∂δθ`）必须 = 有限差分 = **−[a_world×]·dt**。
     ///
-    /// FD（与 `inject_error` 同约定：左乘 `q ← exp(δθ)⊗q`）定形为 **−[a_world×]·dt**；
-    /// 而实现用 **+[a_world×]·dt**（见 `transition_matrix`）。**把实现改成 −** 后：
-    ///   `mag_reference_quiet_scenario_regression::A13（陀螺饱和边）` RMSE 5.27°→15.6°（3× 变差 ✗）
-    /// ⇒ 不能单改一处 ⇒ **疑别处有补偿性符号错**（下轮逐块 FD 审计 F/H/injection 约定自洽性 ✓）。
-    /// 本测试用 `#[ignore]` **登记矛盾**（不阻塞 H 场 ✓），修好补偿错后去掉 ignore 即可作为守卫 ✓。
+    /// （§5.184/§5.185 时此测试为 `#[ignore]`——登记"符号与 FD 相悖"的矛盾；
+    ///  §5.186 把实现改为负号后**去 ignore** 作为永久守卫 ✓。）
     #[test]
-    #[ignore = "§5.184 开放问题：F[vel,att] 符号与 FD 相悖，疑补偿性符号错，待专项审计"]
     fn f_vel_att_sign_vs_finite_difference() {
         let g = [0.0f32, 0.0, 9.81];
         let dt = 1e-3f32;
@@ -2115,13 +2150,12 @@ mod tests {
             + (s2.v[1] - g[1] * dt).powi(2)
             + (s2.v[2] - g[2] * dt).powi(2);
         assert!(dev2 < 1e-12, "自由落体应以 g 加速（偏差² = {dev2:.2e}）✗");
-        // ③ δv/δθ 块：当前实现为 +[a_world×]·dt（⚠️★§5.184：FD 定形为 −[a_world×]·dt，
-        //    见 `f_vel_att_sign_vs_finite_difference`（#[ignore]）—— 本断言仅锁当前行为 ✓）
+        // ③ δv/δθ 块：应为 **−[a_world×]·dt**（本仓左乘误差 ⇒ 负号 ✓；§5.186 FD+物理双证 ✓）
         let r = [[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
         let f_body = [0.3f32, -0.2, -9.7];
         let fm = transition_matrix(q, [0.0, 0.0, 0.0], dt, &r, f_body).expect("F 应可构造 ✓");
         let aw = rotate_vec_by_quat(q, f_body);
-        // 逐元素核对 [a_world×]·dt 的第 j 列 = dt·(a_world × e_j)
+        // 逐元素核对 −[a_world×]·dt 的第 j 列 = −dt·(a_world × e_j)
         let cross = |a: [f32; 3], e: [f32; 3]| -> [f32; 3] {
             [a[1] * e[2] - a[2] * e[1], a[2] * e[0] - a[0] * e[2], a[0] * e[1] - a[1] * e[0]]
         };
@@ -2130,10 +2164,10 @@ mod tests {
         for j in 0..3 {
             let want = cross(aw, basis[j]);
             for i in 0..3 {
-                maxdev = maxdev.max((fm[I_VEL + i][I_ATT + j] - want[i] * dt).abs());
+                maxdev = maxdev.max((fm[I_VEL + i][I_ATT + j] - (-want[i]) * dt).abs());
             }
         }
-        assert!(maxdev < 1e-6, "δv/δθ 块应为 +[a_world×]·dt（偏差 {maxdev:.2e}）✗");
+        assert!(maxdev < 1e-6, "δv/δθ 块应为 −[a_world×]·dt（偏差 {maxdev:.2e}）✗");
         // ④ 协方差预测的不变量自检（先守不变量，再谈精度 ✓）
         let mut p0 = [[0.0f32; N]; N];
         for (i, row) in p0.iter_mut().enumerate() {
