@@ -5,7 +5,7 @@
 
 use core::ffi::c_void;
 
-use flyctrl_core::controller::{PidController, Setpoint};
+use flyctrl_core::controller::{Controller, PidController, Setpoint};
 // ★**默认估计器改为 ESKF**（迁移计划步 3 ✓；全表验收 0/10 劣于 Legacy ✓，见 docs/c1-migration-plan.md ✓）
 use flyctrl_core::estimator::select::{AnyEstimator, AnyEstimatorKind};
 use flyctrl_core::fdir::Health;
@@ -135,7 +135,16 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
     //   `x_hover_demo` **仍发散**（末态 (−61, −72)m ✗；但**显著优于**未启用时的 164°/131m ✓）
     //   ⇒ 两级手段**方向正确但不足以**让 demo 通过 ⇒ **暂不启用**（保持既有可用行为 ✓），
     //     待整定完成后启用 ✓（旋钮保留 ✓ 可用环境变量 A/B ✓）
-    let _ = ();
+    // ★§5.176【整定成果（双满足点 ✓ 来自 10s 复现器两臂验证 ✓）】：
+    //   `KVD=0.8`（速度环 D 项 ✓）+ `SLEW=2.0`（速率整形 ✓）+ **`vel_lpf_h_tau=0.1`**（水平速度低通 ✓）
+    //   复现器实测：无风 −0.54 ✓ / 风 5.4m/s −7.90 ✓（两臂均**有界接近收敛** ✓✓）
+    //   + `init_runtime_knobs()`（§5.156 `.data` 坑修复 ✓ 使设计增益真正生效 ✓）
+    unsafe {
+        flyctrl_core::controller::pid::G_KV_D = 0.8;
+        flyctrl_core::controller::pid::G_VEL_SLEW = 2.0;
+        flyctrl_core::controller::pid::G_VEL_LPF_TAU_K = 0.1;
+    }
+    flyctrl_core::controller::pid::init_runtime_knobs();
     // ★§5.158/§5.160 排查中（见台账）：恢复设计增益后 demo 发散；探针排查中发现
     //   **`PidController` 的 `control_attitude` 路径在 demo 场景下未被观测到执行**
     //   （`G_PID_ATT_DBG` 恒 0，而 `m_permille` 却出现极端值 ✗）⇒ 需先确认**实际生效的
@@ -327,6 +336,22 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         // `last_est`（EKF 位置 4ms 内变化远小于 1mm，与"本拍估计后构造"等价）。
         // ★分段探针：读帧【已完成】、设定点构造开始 ✓（把 0→1 一分为二 ✓，§5.88）
         unsafe { crate::flyctrl::CTRL_PHASE = 5; }
+        // ★§5.183：把 ESKF 估计的世界系加速度注入 **D 项专用通道**（`set_world_accel` ✓）。
+        //   与 `Setpoint.acc`（轨迹前馈）**分离** ✓：此前把它塞进 `Setpoint.acc` ⇒ 同一信号
+        //   既当**轨迹前馈**又当 **D 项输入**（PX4 `_vel_dot` vs `_acc_sp` 是两个量 ✗）
+        //   ⇒ 测得加速度被当**前馈正反馈**注入控制律（悬停时 world_accel≈0 故未暴露，
+        //   但姿态估计偏差时它会直接进入倾角指令 ✗）。
+        {
+            let wa = match hil.est.inner {
+                flyctrl_core::estimator::select::AnyEstimatorKind::Eskf(ref e) => e.world_accel(),
+                _ => [0.0; 3],
+            };
+            hil.ctrl.set_world_accel([
+                MeterPerSecondSquared(wa[0]),
+                MeterPerSecondSquared(wa[1]),
+                MeterPerSecondSquared(wa[2]),
+            ]);
+        }
         let (setpoint, setpoint_valid) = {
             #[cfg(feature = "hil")]
             {
@@ -350,18 +375,9 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
                             pos: [Meter(0.0), Meter(0.0), Meter(hold_z)],
                             yaw: Radian(0.0),
                             vel: [MeterPerSecond(0.0); 3],
-                            // ★§5.168：世界系加速度（PX4 `states.acceleration` 同源 ✓）供速度环 D 项
-                        acc: {
-                            let wa = match hil.est.inner {
-                                flyctrl_core::estimator::select::AnyEstimatorKind::Eskf(ref e) => e.world_accel(),
-                                _ => [0.0; 3],
-                            };
-                            [
-                                MeterPerSecondSquared(wa[0]),
-                                MeterPerSecondSquared(wa[1]),
-                                MeterPerSecondSquared(wa[2]),
-                            ]
-                        },
+                            // ★§5.183：`Setpoint.acc` 归位为**轨迹前馈**（此处无轨迹 ⇒ 0 ✓）；
+                            //   世界系加速度改走上方的 D 项专用通道（`set_world_accel` ✓）。
+                            acc: [MeterPerSecondSquared(0.0); 3],
                         },
                         false,
                     )

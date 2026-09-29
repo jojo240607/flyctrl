@@ -479,9 +479,20 @@ where
         // 2.5m → 位置环加推 → 物理爬升 → 发散）。
         if let Some(alt) = baro_alt {
             // GPS 首次有效定位时锁定气压基准（与 GPS NED 原点对齐，见字段注释）。
-            if gps.is_some() && !self.baro_locked {
-                self.baro_ref = alt;
-                self.baro_locked = true;
+            // ★★§5.183【根因修复 ✓】：正确的基准确为 `baro_ref = alt + gps_z` ——
+            //   因 `update_baro` 的观测模型为 `alt_obs == −p[2]`（上为正、与 p 同原点 ✓），
+            //   要让它与 GPS 位置观测一致：`alt − baro_ref == −gps_z` ⇒ `baro_ref = alt + gps_z` ✓。
+            //   原实现 `baro_ref = alt` 隐含假设【fix 时无人机在地面（gps_z≈0）】✓；
+            //   若 fix 发生在**起飞后**（GPS 冷启动/慢 fix、测试飞机已在空中）⇒ 注入一个
+            //   “= fix 高度”的**常量垂直偏置** ✗ —— 实测复现器：fix 在 5.2m 高处 ⇒ baro 观测
+            //   整体偏 5.2m、与 GPS z 直接冲突 ⇒ ESKF 被两条观测拉扯 ⇒ 垂直估计先反向后跑飞
+            //   （est_d +2.7 而真值 −7.8）⇒ 高度环满推 ⇒ 剧烈爬升 ⇒ 姿态翻滚发散的**根因链起点** ✓。
+            //   修正后与 fix 发生的时刻/高度**无关** ⇒ 两种 ABI 约定都对 ✓。
+            if let Some(g) = gps {
+                if !self.baro_locked {
+                    self.baro_ref = alt + g.pos[2].0;
+                    self.baro_locked = true;
+                }
             }
             crate::perf::probe(16); // step_hil: 气压更新前
             self.est.update_alt(alt - self.baro_ref);

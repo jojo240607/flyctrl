@@ -39,6 +39,15 @@ pub trait Controller {
     /// 零改动。每个控制周期由宿主在调用 `control` 之前写入。
     fn set_measured_airspeed_vec(&mut self, _v: [f32; 2]) {}
 
+    /// ★§5.183：注入【测量/估计的世界系加速度】（NED，m/s²），供速度环 **D 项**。
+    ///
+    /// 与轨迹前馈 `Setpoint.acc` **语义分离**（PX4 `_vel_dot = states.acceleration` vs
+    /// `_acc_sp = setpoint.acceleration` ✓）：原实现把估计的世界系加速度塞进 `Setpoint.acc`
+    /// ✗ ⇒ 同一信号既当**轨迹前馈**又当 **D 项输入** ⇒ 语义冲突（有真前馈时 D 项拿到的是
+    /// 轨迹加速度而非测量加速度；且测得的加速度被当作前馈**正反馈**注入控制律）。
+    /// 默认空实现——不需要该通道的控制器（LQR/INDI/MPC）零改动。宿主在 `control` 前写入。
+    fn set_world_accel(&mut self, _a: [MeterPerSecondSquared; 3]) {}
+
     /// 复位内环积分器等状态。
     fn reset(&mut self);
 }
