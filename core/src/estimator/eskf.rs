@@ -1922,6 +1922,86 @@ pub fn extract_error(q_old: Quaternion, st: &EskfState) -> ErrorState {
 mod tests {
     use super::*;
 
+    /// ★§5.184【FD 块级审计（永久 ✓）】：把 `transition_matrix` **除了 [vel,att] 之外的每个块**
+    /// 都做有限差分核对 ⇒ 确认"F 里只此一块异常"（[vel,att] 见下面的 #[ignore] 测试 ✓）。
+    ///
+    /// 方法：与 `inject_error` **同约定**（左乘 `q ← exp(δθ)⊗q`）扰动对应状态块，调**真** `predict`，
+    /// 把输出差 / eps 与 F 对应块逐元素比。
+    #[test]
+    fn f_state_transition_blocks_match_finite_difference() {
+        let g = [0.0f32, 0.0, 9.81];
+        let dt = 1e-3f32;
+        let q = Quaternion::from_axis_angle([0.2, 0.3, 0.5], Radian(0.4)).normalize();
+        let w_body = [0.1f32, -0.05, 0.2];
+        let f_body = [0.3f32, -0.2, -9.7];
+        let da = [w_body[0] * dt, w_body[1] * dt, w_body[2] * dt];
+        let dv = [f_body[0] * dt, f_body[1] * dt, f_body[2] * dt];
+        let eps = 1e-4f32;
+        let mk = |q, v, p, bg, ba| EskfState { q, v, p, bg, ba };
+        let pred = |s: &mut EskfState| s.predict(ImuDelta { delta_ang: da, delta_vel: dv }, g, dt);
+        let mut s0 = mk(q, [0.0; 3], [0.0; 3], [0.0; 3], [0.0; 3]);
+        pred(&mut s0);
+        let r = rot_of(q);
+        let fm = transition_matrix(q, w_body, dt, &r, f_body).expect("F");
+        let basis = [[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let rot_eps = |e: [f32; 3]| {
+            let n = (e[0] * e[0] + e[1] * e[1] + e[2] * e[2]).sqrt();
+            Quaternion::from_axis_angle([e[0] / n, e[1] / n, e[2] / n], Radian(n))
+        };
+        let maxdev = |fd: [f32; 3], fcol: [f32; 3]| -> f32 {
+            (0..3).map(|i| (fd[i] - fcol[i]).abs()).fold(0.0f32, f32::max)
+        };
+        let mut dv_att = 0.0f32;
+        let mut dv_ba = 0.0f32;
+        let mut dv_pv = 0.0f32;
+        let mut dq_att = 0.0f32;
+        let mut dq_bg = 0.0f32;
+        for j in 0..3 {
+            // (1) F[att,att]：扰 q（左乘）⇒ 看预测后 q 的误差
+            let mut e = [0.0f32; 3];
+            e[j] = eps;
+            let mut st = mk((rot_eps(e) * q).normalize(), [0.0; 3], [0.0; 3], [0.0; 3], [0.0; 3]);
+            pred(&mut st);
+            let fd = extract_error(s0.q, &st).dtheta;
+            let fcol = [fm[I_ATT][I_ATT + j], fm[I_ATT + 1][I_ATT + j], fm[I_ATT + 2][I_ATT + j]];
+            dq_att = dq_att.max(maxdev([fd[0] / eps, fd[1] / eps, fd[2] / eps], fcol));
+            // (2) F[vel,att]：扰 q（左乘）⇒ 看 v（★异常块，仅记录不在此断言）
+            let fd_v = [(st.v[0] - s0.v[0]) / eps, (st.v[1] - s0.v[1]) / eps, (st.v[2] - s0.v[2]) / eps];
+            let fcol_v = [fm[I_VEL][I_ATT + j], fm[I_VEL + 1][I_ATT + j], fm[I_VEL + 2][I_ATT + j]];
+            dv_att = dv_att.max(maxdev(fd_v, fcol_v));
+            // (3) F[att,bg]：扰 bg ⇒ 看 q
+            let mut bg = [0.0f32; 3];
+            bg[j] = eps;
+            let mut st = mk(q, [0.0; 3], [0.0; 3], bg, [0.0; 3]);
+            pred(&mut st);
+            let fd = extract_error(s0.q, &st).dtheta;
+            let fcol = [fm[I_ATT][I_BG + j], fm[I_ATT + 1][I_BG + j], fm[I_ATT + 2][I_BG + j]];
+            dq_bg = dq_bg.max(maxdev([fd[0] / eps, fd[1] / eps, fd[2] / eps], fcol));
+            // (4) F[vel,ba]：扰 ba ⇒ 看 v
+            let mut ba = [0.0f32; 3];
+            ba[j] = eps;
+            let mut st = mk(q, [0.0; 3], [0.0; 3], [0.0; 3], ba);
+            pred(&mut st);
+            let fd = [(st.v[0] - s0.v[0]) / eps, (st.v[1] - s0.v[1]) / eps, (st.v[2] - s0.v[2]) / eps];
+            let fcol = [fm[I_VEL][I_BA + j], fm[I_VEL + 1][I_BA + j], fm[I_VEL + 2][I_BA + j]];
+            dv_ba = dv_ba.max(maxdev(fd, fcol));
+            // (5) F[pos,vel]：扰 v ⇒ 看 p
+            let mut v = [0.0f32; 3];
+            v[j] = eps;
+            let mut st = mk(q, v, [0.0; 3], [0.0; 3], [0.0; 3]);
+            pred(&mut st);
+            let fd = [(st.p[0] - s0.p[0]) / eps, (st.p[1] - s0.p[1]) / eps, (st.p[2] - s0.p[2]) / eps];
+            let fcol = [fm[I_POS][I_VEL + j], fm[I_POS + 1][I_VEL + j], fm[I_POS + 2][I_VEL + j]];
+            dv_pv = dv_pv.max(maxdev(fd, fcol));
+        }
+        assert!(dq_att < 1e-3, "F[att,att] 与 FD 不符（{dq_att:.2e}）");
+        assert!(dq_bg < 1e-3, "F[att,bg] 与 FD 不符（{dq_bg:.2e}）");
+        assert!(dv_ba < 1e-3, "F[vel,ba] 与 FD 不符（{dv_ba:.2e}）");
+        assert!(dv_pv < 1e-3, "F[pos,vel] 与 FD 不符（{dv_pv:.2e}）");
+        // ★§5.184：唯一异常块 = F[vel,att]（偏差 ≈ 2×|a|·dt ≈ 2e-2 ✓，符号相反）
+        assert!(dv_att > 1e-2, "预期 F[vel,att] 与 FD 相悖（若此处失败 ⇒ 异常已修 ⇒ 去 #[ignore] ✓）");
+    }
+
     /// ★§5.184【FD 回归】：用**有限差分**（而非实现自证）校验重力 H 的符号/结构 ✓。
     ///
     /// 动机（本仓纪律 ✓）：`c1_extreme_cases` ③ 原先只断言"实现 = 实现"✗ ⇒ 一个**符号错**
