@@ -128,6 +128,13 @@ pub static mut G_ATT_LEGACY: f32 = 0.0;
 #[no_mangle]
 #[used]
 pub static mut G_ACC_FLIP: f32 = 0.0;
+/// ★§5.159 探针：[0..3)=姿态误差(机体系) [3..6)=rates(p,q,r) [6]=des_thrust
+///   ⚠️§5.159 修：原名 `G_ATT_DBG` 与 `estimator/ekf.rs` 的**同名 `#[no_mangle]` 符号冲突** ✗
+///   （实测 ELF 里两个符号都叫 `G_ATT_DBG` ⇒ linker 只保留一个 ⇒ 探针读到 0 ✗）
+///   ⇒ 改名 `G_PID_ATT_DBG`（唯一 ✓）
+#[no_mangle]
+#[used]
+pub static mut G_PID_ATT_DBG: [f32; 7] = [0.0; 7];
 pub static mut G_ATT_KP: f32 = -1.0;
 pub static mut G_ATT_KD: f32 = -1.0;
 
@@ -831,6 +838,15 @@ impl PidController {
         }
         self.dbg_err = att_out.err;
         self.dbg_pqr = att_out.rates;
+        unsafe {
+            // ★§5.159 探针：[0..3)=err（机体轴） [3..6)=rates(p,q,r) [6]=des_thrust
+            let d = core::ptr::addr_of_mut!(G_PID_ATT_DBG);
+            for k in 0..3 {
+                (*d)[k] = att_out.err[k];
+                (*d)[3 + k] = att_out.rates[k];
+            }
+            (*d)[6] = des_thrust;
+        }
         self.dbg_omega = [est.omega[0].0, est.omega[1].0, est.omega[2].0];
 
         // --- 混控：X 型四旋翼（0=前右 1=后左 2=前左 3=后右） ---
