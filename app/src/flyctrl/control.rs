@@ -127,6 +127,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
     //   但**恢复设计值 0.8 会使 `x_hover_demo` 发散**（roll 19.5° ✗，滚转界 5° ✓）
     //   —— 且 `kv` 降到 0.03 仍 ~19° ✗ ⇒ 属**姿态环/外环响应**的真实缺陷（另有原因 ✓）。
     //   ⇒ 在整定完成前**不启用**该初始化（保持既有可用行为 ✓，避免引入回归 ✗）✓
+    // ★§5.158 排查中（见台账）：恢复设计增益后 demo 发散 ⇒ 暂不启用（保持既有可用行为 ✓）
     // flyctrl_core::controller::pid::init_runtime_knobs();
     // ★§5.136 诊断旋钮：G_ESKF_FREEZE_BIAS=1 ⇒ 冻结零偏修正（定位"加计零偏慢漂"假设）
     //   （裸 bin 的 .data 未初始化 ⇒ 默认读到 0 = 正常 ✓；测试用 poke 置 1）

@@ -119,6 +119,15 @@ pub extern "C" fn init_runtime_knobs() {
     }
 }
 
+/// ★§5.158 A/B 旋钮：`2.0` ⇒ 用 **legacy** 期望姿态构造（`from_euler(+tilt_e, -tilt_n, yaw)` ✓）；
+///   其余 ⇒ 用推力矢量版 `thrust_to_attitude`（当前默认 ✓）
+#[no_mangle]
+#[used]
+pub static mut G_ATT_LEGACY: f32 = 0.0;
+/// ★§5.158 A/B 旋钮：`2.0` ⇒ 水平加速度符号翻转（排查"外环→姿态"符号约定 ✓）
+#[no_mangle]
+#[used]
+pub static mut G_ACC_FLIP: f32 = 0.0;
 pub static mut G_ATT_KP: f32 = -1.0;
 pub static mut G_ATT_KD: f32 = -1.0;
 
@@ -619,6 +628,11 @@ impl Controller for PidController {
         // 对照本仓既有约定：`az_w = a_world[2] + g` 是"加速度"；比力 = 加速度 − g_vec，
         // 而 g_vec = (0,0,+g)（NED 向下为正）⇒ 比力 z = (acc_d + g) − g = acc_d …
         // 更直接地：悬停 acc_d=0 时必须得 (0,0,-g) ⇒ 取 `acc_d - g`。
+        // ★§5.158 A/B：水平符号翻转（排查"外环→姿态"符号约定 ✓）
+        let flip = unsafe {
+            core::ptr::read_volatile(core::ptr::addr_of!(G_ACC_FLIP))
+        } == 2.0;
+        let (acc_n, acc_e) = if flip { (-acc_n, -acc_e) } else { (acc_n, acc_e) };
         let f_w = [acc_n, acc_e, acc_d - g];
         let q_des_thrust = crate::vehicle::thrust_to_attitude(f_w, sp.yaw);
         // 旧路径（保留为对照：`G_MAG3D_ALPHA` 式旋钮可切换 —— 此处直接返回推力矢量版）
@@ -678,8 +692,12 @@ impl Controller for PidController {
         //   即**本仓机体系不是标准 FRD**，故"标准"三轴构造不匹配 ✗。
         // ⇒ 回退。下一步须**先从 mixer/plant 反解出本仓的真实机体轴约定**，
         //   再据此改写构造（而不是照搬教科书 FRD）。
-        let _ = q_des_legacy;
-        let q_des = q_des_thrust; // 符号修正后启用
+        // ★§5.158 A/B：切到 legacy（注释记载：thrust 版 8× 劣化 ✗；legacy 版实测 1.305m ✓）
+        let q_des = if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ATT_LEGACY)) } == 2.0 {
+            q_des_legacy
+        } else {
+            q_des_thrust
+        };
 
         self.sp_yaw = sp.yaw.0; // 供内环做偏航速率前馈（见 prev_yaw 的说明）
         self.control_attitude(_dt, q_des, des_thrust, est)
