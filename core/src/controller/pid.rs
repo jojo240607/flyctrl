@@ -98,6 +98,27 @@ pub static mut G_VEL_LPF_H_TAU: f32 = -1.0;
 #[no_mangle]
 #[used]
 pub static mut G_CTRL_DBG: [f32; 8] = [0.0; 8];
+
+/// ★§5.156【关键 ✓✓】把全部"负哨兵"标定旋钮**显式初始化**为 `-1.0`（= 用编译期默认 ✓）。
+///
+/// 为何必须（本仓既有坑 ✓ §5.136 同族）：这些旋钮的初值在 **`.data`** 段，而**裸 bin
+/// 加载时 `.data` 初值不生效** ✗（实测符号表：`G_KV_XY`/`G_KI_XY`/… 全在 `D/d` 段 ✓）
+/// ⇒ 实际读到 **0** ⇒ 而判据多为 `if v >= 0.0 { v }` ⇒ 0 被当作**有效值** ✗✓
+/// 实测后果：`G_KV_XY=0` ⇒ **水平速度环增益 = 0** ⇒ `acc_n = kv·(des_v − v) = 0` ⇒
+///   速度指令进不了姿态环 ⇒ **机体不动**（LOITER 摇杆微调"位移恒 0"的真根因 ✓✓）
+///
+/// 调用点：真机 `control_entry` 启动时 ✓（SIL 走 `.data` 正常加载 ⇒ 无此问题 ✓，
+///   但调用无害 ✓ 幂等 ✓）
+#[inline(never)]
+#[no_mangle]
+pub extern "C" fn init_runtime_knobs() {
+    unsafe {
+        // ★§5.157 逐项排查（只初始化 `G_KV_XY` ✓；其余保持"读到 0"的既有行为以免
+        //   混淆变量 ✓——排查完成后再决定是否全部初始化 ✓）
+        core::ptr::write_volatile(core::ptr::addr_of_mut!(G_KV_XY), -1.0);
+    }
+}
+
 pub static mut G_ATT_KP: f32 = -1.0;
 pub static mut G_ATT_KD: f32 = -1.0;
 
@@ -500,6 +521,12 @@ impl Controller for PidController {
             if g >= 0.0 { g } else { self.kv_xy }
         };
         let acc_n = kv * (des_vx - est_vn) + sp.acc[0].0 + self.i_v_xy[0]; // 北向
+        unsafe {
+            // §5.155 扩展：[4]=acc_n [7]=kv
+            let d = core::ptr::addr_of_mut!(G_CTRL_DBG);
+            (*d)[4] = acc_n;
+            (*d)[7] = kv;
+        }
         let acc_e = kv * (des_vy - est_ve) + sp.acc[1].0 + self.i_v_xy[1]; // 东向
         let acc_d = self.kv_z * (des_vz - est_vd) + sp.acc[2].0; // 下垂方向（NED），用滤波后垂直速度
 

@@ -112,8 +112,22 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         //     也解释了"悬停 3D 自激"：本仓此前违背一手、在不该用 3D 时用了 3D ✗）
         //   ⇒ 真机回归 AUTO：机动时用 3D（航向可观测 ✓）、悬停/低速时用 heading ✓
         flyctrl_core::estimator::eskf::G_ESKF_MAG_HDG_GATE = 2.0;
-flyctrl_core::estimator::eskf::G_ESKF_MAG_YAW_ON = 0.0; // 0.0 = AUTO（一手默认 ✓）
+        flyctrl_core::estimator::eskf::G_ESKF_MAG_YAW_ON = 0.0; // 0.0 = AUTO（一手默认 ✓）
     }
+    // ★★§5.156【真机启动显式初始化控制器标定旋钮（关键 ✓✓）】：
+    //   旋钮用**负哨兵**（`-1.0` = "用编译期默认" ✓；`0` 是有效取值 ⇒ 不能当哨兵 ✓
+    //   见 `pid.rs:36-39` ✓）。⚠️**裸 bin 加载时 `.data` 初值不生效**（本仓既有坑 ✓
+    //   §5.136 同族）⇒ 实际读到 **0** ⇒ `if v >= 0.0 { v }` 把 0 当有效值 ✗✓
+    //   实测后果（本轮 ✓）：`G_KV_XY` 读 0 ⇒ **水平速度环增益 = 0** ⇒
+    //   `acc_n = kv·(des_v − v) = 0` ⇒ 速度指令进不了姿态环（`des_vx=0.3` 却 `acc_n=0` ✗）
+    //   ⇒ **机体不动** —— 这正是 LOITER 摇杆微调"位移恒 0"的**真根因** ✓✓
+    //   ⇒ 修法 ✓（与 `G_ESKF_MAG_DELAY_MS` 同法）：启动时**显式写入哨兵** ✓
+    // ★§5.157 排查结论 ✓（重要 ✓）：`G_KV_XY` 等旋钮在 `.data` ⇒ 裸 bin 读到 **0** ✗
+    //   ⇒ `kv_xy` 实际为 **0**（速度环增益=0）⇒ 速度指令进不了姿态环（§5.156 ✓）。
+    //   但**恢复设计值 0.8 会使 `x_hover_demo` 发散**（roll 19.5° ✗，滚转界 5° ✓）
+    //   —— 且 `kv` 降到 0.03 仍 ~19° ✗ ⇒ 属**姿态环/外环响应**的真实缺陷（另有原因 ✓）。
+    //   ⇒ 在整定完成前**不启用**该初始化（保持既有可用行为 ✓，避免引入回归 ✗）✓
+    // flyctrl_core::controller::pid::init_runtime_knobs();
     // ★§5.136 诊断旋钮：G_ESKF_FREEZE_BIAS=1 ⇒ 冻结零偏修正（定位"加计零偏慢漂"假设）
     //   （裸 bin 的 .data 未初始化 ⇒ 默认读到 0 = 正常 ✓；测试用 poke 置 1）
     {
@@ -401,7 +415,7 @@ flyctrl_core::estimator::eskf::G_ESKF_MAG_YAW_ON = 0.0; // 0.0 = AUTO（一手�
                         }, 0.0, hold_alt.0,
                         rc.pitch * LOITER_NUDGE_GAIN,
                         -rc.roll * LOITER_NUDGE_GAIN,
-                        true,
+                        false, // §5.157 排查：暂回 false（保留 ① 首拍修复 ✓）
                     ),
                     // STABILIZE / ALT_HOLD / 默认：速率模式（摇杆 → 期望速度）+ 定高，
                     // 大疆手感（推杆飞、松杆停）；pos 用速度外推预测位置补偿 EKF 延迟。
