@@ -166,6 +166,11 @@ impl EskfEstimator {
 }
 
 impl Estimator for EskfEstimator {
+    /// ★§5.187：比力低通群延迟 τ（秒）——由 `HilContext` 从实际滤波器自动标定后写入。
+    fn set_accel_lag_s(&mut self, tau_s: f32) {
+        self.f.accel_lag_s = tau_s;
+    }
+
     fn step(
         &mut self,
         dt: Second,

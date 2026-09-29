@@ -99,6 +99,37 @@ impl Biquad {
         self.y1 = y;
         y
     }
+
+    /// 该滤波器在 `freq_hz` 处的**群延迟**（秒）——用于自动标定“滤波器引入的等价时延”。
+    ///
+    /// 定义：`τ(ω) = −dφ/dω`（离散角频率 ω = 2π f/fs，rad/sample）⇒ 秒：`τ_s = τ/fs` ✓。
+    /// 用途（§5.187）：比力低通引入的相位滞后补偿量（`update_gravity` 的姿态回退 τ）——
+    ///   由**实际系数**导出 ⇒ 一旦低通/陷波参数改变，τ 自动跟随 ✓（不再硬编码 ✗）。
+    /// 实现：对相位`φ(ω)=arg H(e^{jω})`做**中心差分**（含 ±2π 分支归一），对任意双二阶通用 ✓。
+    pub fn group_delay_s(&self, freq_hz: f32, fs: f32) -> f32 {
+        let w = 2.0 * PI * freq_hz / fs;
+        let dw = 1e-4f32;
+        let phase = |w: f32| -> f32 {
+            let (c1, s1) = (math::cos(w), math::sin(w));
+            let (c2, s2) = (math::cos(2.0 * w), math::sin(2.0 * w));
+            // H(z) = (b0 + b1 z⁻¹ + b2 z⁻²)/(1 + a1 z⁻¹ + a2 z⁻²)，z = e^{jω}
+            let nr = self.b0 + self.b1 * c1 + self.b2 * c2;
+            let ni = -(self.b1 * s1 + self.b2 * s2);
+            let dr = 1.0 + self.a1 * c1 + self.a2 * c2;
+            let di = -(self.a1 * s1 + self.a2 * s2);
+            math::atan2(ni, nr) - math::atan2(di, dr)
+        };
+        let mut p1 = phase(w - dw);
+        let mut p2 = phase(w + dw);
+        while p2 - p1 > PI {
+            p2 -= 2.0 * PI;
+        }
+        while p1 - p2 > PI {
+            p1 -= 2.0 * PI;
+        }
+        let dphi_dw = (p2 - p1) / (2.0 * dw);
+        -dphi_dw / fs
+    }
 }
 
 #[cfg(test)]
@@ -193,5 +224,36 @@ mod tests {
         }
         eprintln!("DIAG noise max|y| = {:.3}", max_abs);
         assert!(max_abs <= 2.0, "滤波输出应有界，max|y|={max_abs:.3}");
+    }
+
+    /// ★§5.187：群延迟估计（比力低通延迟 τ 自动标定的基础 ✓）。
+    ///
+    /// 判据：20Hz Butterworth 低通在飞行频段（≈DC~5Hz）的群延迟应≈解析值
+    /// `1/(2π f0 q)` = 1/(2π·20·0.7071) ≈ **11.26ms**（容差 1.5ms）。
+    /// 同时验证：40Hz 陷波在低频贡献≈0（不污染低通主导的 τ ✓）。
+    #[test]
+    fn group_delay_matches_analytic_lowpass() {
+        let lp = Biquad::low_pass(20.0, FS, 0.7071);
+        let analytic = 1.0 / (2.0 * PI * 20.0 * 0.7071);
+        eprintln!("DIAG analytic τ = {:.3}ms", analytic * 1e3);
+        for f in [0.5f32, 1.0, 2.0, 4.0] {
+            let t = lp.group_delay_s(f, FS);
+            eprintln!("DIAG lowpass τ({f}Hz) = {:.3}ms", t * 1e3);
+            assert!(
+                (t - analytic).abs() < 1.5e-3,
+                "20Hz 低通 τ({f}Hz)={:.3}ms 应≈解析 {:.3}ms",
+                t * 1e3,
+                analytic * 1e3
+            );
+        }
+        // 陷波在低频的群延迟应较小（<2.5ms）——但**非零**（~1.8ms ⇒ 必须计入总 τ ✓）
+        let nf = Biquad::notch(40.0, FS, 2.0);
+        for f in [0.5f32, 1.0, 4.0] {
+            let t = nf.group_delay_s(f, FS).abs();
+            eprintln!("DIAG notch τ({f}Hz) = {:.3}ms", t * 1e3);
+            assert!(t < 2.5e-3, "40Hz 陷波低频群延迟应 <2.5ms，实测 {:.3}ms", t * 1e3);
+        }
+        // 恒等滤波器群延迟 = 0
+        assert_eq!(Biquad::passthrough().group_delay_s(2.0, FS), 0.0);
     }
 }

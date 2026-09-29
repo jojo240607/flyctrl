@@ -143,6 +143,13 @@ impl Estimator for AnyEstimator {
             AnyEstimatorKind::Legacy(e) => e.set_initial_position(ned),
         }
     }
+    /// ★§5.187：转发比力低通延迟 τ 到具体估计器（**必须转发**，否则默认 no-op 会吞掉 ✓）
+    fn set_accel_lag_s(&mut self, tau_s: f32) {
+        match &mut self.inner {
+            AnyEstimatorKind::Eskf(e) => e.set_accel_lag_s(tau_s),
+            AnyEstimatorKind::Legacy(e) => e.set_accel_lag_s(tau_s),
+        }
+    }
     fn update_alt(&mut self, alt: f32) {
         match &mut self.inner {
             AnyEstimatorKind::Eskf(e) => e.update_alt(alt),

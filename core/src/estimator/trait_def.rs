@@ -51,9 +51,14 @@ pub trait Estimator {
     /// 默认 no-op（无磁力计/无航向融合的估计器不受影响）。
     fn update_mag(&mut self, _mag: Option<[f32; 3]>) {}
 
+    /// ★§5.187：注入【比力低通群延迟 τ（秒）】——供 ESKF 重力辅助的相位滞后补偿。
+    ///
+    /// 由宿主（`HilContext`）从**实际滤波器系数**自动标定并写入（不再硬编码 ✓）；
+    /// 默认 no-op（不融合重力/无需补偿的估计器不受影响）。
+    fn set_accel_lag_s(&mut self, _tau_s: f32) {}
+
     /// 当前估计状态（不推进），供诊断读取（已含所有已融合观测）。
     fn state(&self) -> VehicleState;
-
     /// 当前估计的加计零偏（机体系，m/s²）。默认实现返回零，
     /// 仅 EKF 等显式估计零偏的估计器会返回真实值。
     fn accel_bias(&self) -> [f32; 3] {

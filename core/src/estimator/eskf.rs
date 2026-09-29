@@ -103,7 +103,7 @@ pub static mut G_ESKF_GYR_NOTCH_Q: f32 = 0.0;
 /// 其**群延迟** ≈ 8ms ⇒ 本拍比力实际对应姿态 `q(t−τ)`。重力辅助若直接用 `q(t)` 比 ⇒
 /// **快速旋转下产生系统性误差 ≈ |ω|·τ**（A13 1500°/s 实测：τ≈8ms ⇒ ~12° ✓）。
 /// 修法：按已知 τ **把预测姿态回退一阶**（与已落地的 `mag_delay` 补偿**同构** ✓）。
-/// 默认 `0` ⇒ 用内置 **8ms**（裸 bin 的 `.data` 未初始化读 0 也走此分支 ✓）；
+/// 默认 `0` ⇒ 用**自动标定值**（`Eskf::accel_lag_s`，由 `HilContext` 从实际滤波器系数导出 ✓）；
 /// `<0` ⇒ 关闭补偿（A/B 对照臂 ✓）；`>0` ⇒ 覆盖 τ（毫秒，整定用 ✓）。
 pub static mut G_ESKF_ACC_LAG_MS: f32 = 0.0;
 /// ★§5.136 一手旋钮：磁干扰检查（强度/倾角）——**默认关**（对齐 PX4 `ekf2_mag_check=0` ✓）；
@@ -668,6 +668,10 @@ pub struct Eskf {
     pub mag_disturbed_count: u32,
     /// ★§5.136 延迟补偿用【测量机体角速度】（调用方每拍设置 = PX4 `_state.gyro` 同源 ✓）
     pub mag_delay_omega: [f32; 3],
+    /// ★§5.187【比力低通群延迟 τ（秒）】：由宿主从**实际滤波器**自动标定后写入
+    /// （`Estimator::set_accel_lag_s` ✓）；重力辅助用它把预测姿态回退一阶
+    /// （`q_meas = exp(−ω·τ)⊗q` ✓）。`0` ⇒ 不补偿 ✓。
+    pub accel_lag_s: f32,
     /// ★§5.136：延迟对齐的**机动门**用水平加速度（调用方每拍设置；与 PX4 `_accel_horiz_lpf`
     ///   同源 ✓，门限照一手参数 `ekf2_mag_acclim`=0.5 m/s² ✓）
     pub mag_delay_accel_horiz: f32,
@@ -738,6 +742,7 @@ impl Eskf {
             mag_field_disturbed: false,
             mag_disturbed_count: 0,
             mag_delay_omega: [0.0; 3],
+            accel_lag_s: 0.0,
             mag_delay_accel_horiz: 0.0,
             last_mag_yaw_innov: 0.0,
             mag_hdg_innov_lpf: 0.0,
@@ -1035,7 +1040,8 @@ impl Eskf {
         //   带群延迟 τ ≈ 8ms ⇒ 它对应的是 **q(t−τ)** 而非 q(t)。
         //   不补偿 ⇒ 快速旋转下重力辅助系统性把姿态拉向滞后方向（误差 ≈ |ω|·τ ✓）。
         //   与 `mag_delay` **同构**：用当前机体角速率把姿态一阶回退 `exp(−ω·τ)⊗q` ✓。
-        //   旋钮 `G_ESKF_ACC_LAG_MS`：默认 0 ⇒ 内置 8ms；<0 ⇒ 关（A/B）；>0 ⇒ 覆盖 ✓。
+        //   旋钮 `G_ESKF_ACC_LAG_MS`：默认 0 ⇒ 用**自动标定**值（`self.accel_lag_s`，
+        //   由 `HilContext` 从实际滤波器系数导出 ✓）；<0 ⇒ 关（A/B）；>0 ⇒ 覆盖（ms，整定用 ✓）。
         let tau_s = {
             let ov = unsafe {
                 core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_ACC_LAG_MS))
@@ -1045,7 +1051,7 @@ impl Eskf {
             } else if ov > 0.0 {
                 ov * 1e-3
             } else {
-                8e-3
+                self.accel_lag_s
             }
         };
         let q_meas = if tau_s > 0.0 {

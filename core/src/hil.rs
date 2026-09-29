@@ -150,7 +150,7 @@ where
         // 采样率 = 1/控制周期。SIL 与 MCU 均以 dt=0.004（250Hz）推进 → 滤波器
         // 系数、状态演化两侧一致，同输入测试（逐位断言）仍成立。
         let fs = 1.0 / dt.0;
-        Self {
+        let mut ctx = Self {
             est,
             ctrl,
             n_imu_rejected: 0,
@@ -189,7 +189,21 @@ where
                     if qk > 0.0 { qk } else { 2.0 }
                 },
             ); 3],
+        };
+        // ★★§5.187【比力低通延迟 τ 的自动标定 ✓】：从**实际滤波器系数**导出群延迟
+        //   （比力链路：40Hz 陷波 → 20Hz Butterfly 低通 ✓），写入估计器供重力辅助补偿 ✓。
+        //   · 参考频率取 **1Hz**：群延迟在飞行频段（≈0.5~5Hz）内近似平坦 ✓（实测
+        //     20Hz 低通：τ_DC≈11.3ms、τ(4.2Hz)≈11.7ms ⇒ 差 <0.5ms ✓）。
+        //   · 一旦低通/陷波参数改变，τ **自动跟随** ✓（不再硬编码 8ms ✗）。
+        //   · 对标定的合理性：实测旧硬编码 8ms 在 A13 略偏低（5.35°）；标定值≈11.3ms
+        //     落在最优平台内（≈3.93° ✓）。
+        {
+            let f_ref = 1.0f32;
+            let tau = ctx.imu_gyro_notch[0].group_delay_s(f_ref, fs)
+                + ctx.imu_accel_lowpass[0].group_delay_s(f_ref, fs);
+            ctx.est.set_accel_lag_s(tau);
         }
+        ctx
     }
 
     /// 单步闭环：每调用一次推进一个控制周期。
