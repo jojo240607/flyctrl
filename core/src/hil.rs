@@ -79,6 +79,10 @@ where
     pub fdir: Fdir,
     /// 固定控制周期。
     pub dt: Second,
+    /// ★§5.166 **诊断钩子**（默认 `None` ⇒ 逐位不变 ✓，`no_std` 零分配 ✓）：
+    /// `Some((fn, mask))` ⇒ 用 `fn()` 返回的真值**覆盖 `est_state` 的指定位**。
+    /// 掩码：1=pos 2=vel 4=att 8=omega ✓（拆解"位置通道 vs 姿态通道"用 ✓ 生产恒 None ✓）
+    pub truth_overlay: Option<(fn() -> ([f32; 3], [f32; 3], [f32; 4]), u8)>,
     /// 累计是否触发过失控保护（单向，调试/判定用）。
     pub failsafe_engaged: bool,
     /// HIL 姿态初始化门控：基于首帧**真实** IMU 重力向量做 tilt alignment 后置位。
@@ -152,6 +156,7 @@ where
             n_imu_rejected: 0,
             fdir: Fdir::new(),
             dt,
+            truth_overlay: None,
             failsafe_engaged: false,
             hil_att_inited: false,
             hil_pos_inited: false,
@@ -551,7 +556,25 @@ where
             && self.hil_att_inited
             && self.hil_pos_inited
         {
-            self.ctrl.control(self.dt, setpoint, &est_state)
+            // ★§5.166 诊断：真值覆盖（默认 None ⇒ 不改变 ✓）
+            let mut est_for_ctrl = est_state;
+            if let Some((f, mask)) = self.truth_overlay {
+                let (p, v, q) = f();
+                if mask & 1 != 0 {
+                    for k in 0..3 {
+                        est_for_ctrl.pos[k] = crate::units::Meter(p[k]);
+                    }
+                }
+                if mask & 2 != 0 {
+                    for k in 0..3 {
+                        est_for_ctrl.vel[k] = crate::units::MeterPerSecond(v[k]);
+                    }
+                }
+                if mask & 4 != 0 {
+                    est_for_ctrl.att = crate::vehicle::Quaternion { w: q[0], x: q[1], y: q[2], z: q[3] };
+                }
+            }
+            self.ctrl.control(self.dt, setpoint, &est_for_ctrl)
         } else {
             ActuatorCmd::zero()
         };

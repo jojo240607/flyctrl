@@ -53,6 +53,10 @@ pub struct EskfEstimator {
     omega_body: [f32; 3],
     /// ★§5.136：最近一拍比力（延迟对齐的**机动门**用 ✓；与 PX4 `_accel_horiz_lpf` 同源）
     last_accel: [f32; 3],
+    /// ★§5.168【对齐 PX4 `states.acceleration` ✓】：**世界系（NED）加速度**输出
+    ///   = `R(q)·f_b + [0,0,g]`（比力旋转 + 重力 ✓），一阶低通 τ=0.05s ✓（平滑 ✓）
+    ///   用途：速度环 D 项（§5.167 ✓，PX4 `_vel_dot` 同源 ✓）—— 本仓此前无该量 ✗
+    world_accel: [f32; 3],
     /// ★§5.136【对齐 PX4 一手 `ekf_ekf.h:668 _mag_lpf`】：磁样本一阶低通（AlphaFilter，
     ///   时间常数 `_kSensorLpfTimeConstant = 90 000 µs = 90 ms` ✓），用途同一手——
     ///   供 **instant reset / 初始对准**使用（避免用单个带噪样本做代数反解 ✓）
@@ -105,6 +109,7 @@ impl EskfEstimator {
             mag_first_done: false,
             omega_body: [0.0; 3],
             last_accel: [0.0; 3],
+            world_accel: [0.0; 3],
             mag_lpf: [0.0; 3],
             mag_lpf_init: false,
             mag_reset_div: 0,
@@ -150,6 +155,11 @@ impl EskfEstimator {
     }
 
     /// ★§5.132：设置观测噪声（真传感器路径用；默认值 = PC/SIL 验收表口径）
+    /// ★§5.168：世界系加速度（NED ✓）——PX4 `states.acceleration` 同源 ✓
+    pub fn world_accel(&self) -> [f32; 3] {
+        self.world_accel
+    }
+
     pub fn set_observation_noise(&mut self, r_gps_p: f32, r_gps_v: f32, r_baro: f32) {
         self.f.set_observation_noise(r_gps_p, r_gps_v, r_baro);
     }
@@ -171,6 +181,16 @@ impl Estimator for EskfEstimator {
         let acc = [imu.accel[0].0, imu.accel[1].0, imu.accel[2].0];
         self.omega_body = gyr;
         self.last_accel = acc; // ★§5.136：延迟对齐机动门（水平分量 ✓）
+        // ★§5.168：世界系加速度（NED ✓）= R(q)·f_b + g（重力向下为正 ✓），一阶低通 ✓
+        {
+            let fb = crate::vehicle::rotate_vec_by_quat(self.f.st.q, acc);
+            let raw = [fb[0], fb[1], fb[2] + 9.81];
+            let tau = 0.05f32;
+            let a = 0.004f32 / (tau + 0.004f32);
+            for k in 0..3 {
+                self.world_accel[k] += a * (raw[k] - self.world_accel[k]);
+            }
+        }
         // ★诊断快照（采一次 ✓；`acc`/`gyr` 已在上方绑定 ✓）
         {
             // ★用【常量】比较 ✓ —— 不能用 `static = 5`：app 以裸 bin 加载 ⇒ `.data` 初值

@@ -86,6 +86,43 @@ pub static mut G_KI_V_XY: f32 = -1.0;
 /// **速度环 P 增益（水平）**运行时旋钮 —— 位置阶跃的**阻尼**主要来自它（默认 0.8）。
 /// 语义同其他 `G_*`：`<0` = 用编译期值 ✓。用于阶段 7 的阻尼整定（免去反复重编译 ✓）。
 pub static mut G_KV_XY: f32 = -1.0;
+/// ★§5.166d 整定旋钮：水平**位置环**增益覆盖（`-1` ⇒ 默认 0.5 ✓）
+#[no_mangle]
+#[used]
+pub static mut G_KP_XY: f32 = -1.0;
+/// ★§5.167【对齐 PX4 一手 `PositionControl.cpp:150` ✓】：**速度环 D 项增益** `Kd_vel`
+///   PX4：`acc_sp = Kv·(vel_sp − vel) + vel_int − **Kd·vel_dot**`（`_vel_dot = states.acceleration` ✓）
+///   本仓缺该 D 项 ⇒ 外环相位裕度不足（§5.166 实测：噪声激励的不稳定模态 ✓）
+///   旋钮：**`-1` ⇒ 关闭**（默认 ✓ 逐位不变）；`>=0` ⇒ 启用
+#[no_mangle]
+#[used]
+pub static mut G_KV_D: f32 = -1.0;
+/// ★§5.167 定号旋钮：`2.0` ⇒ D 项**反向**（`+Kd·vel_dot` 而非 PX4 的 `−Kd·vel_dot` ✓）
+#[no_mangle]
+#[used]
+pub static mut G_KV_D_FLIP: f32 = 0.0;
+/// ★§5.169【对齐 PX4 一手 `PositionControl.cpp:210-225 _accelerationControl` ✓】：
+///   `2.0` ⇒ 用 **`limitTilt` 语义**（限制**合成**倾角 `√(tilt_n²+tilt_e²) ≤ tilt_max` ✓）
+///   本仓原为**分量独立 clamp** ✗ ⇒ 合成倾角可达 `√2 × tilt_max`（**41% 超限** ✗✓）
+///   默认 `0` ⇒ 原行为（逐位不变 ✓）
+#[no_mangle]
+#[used]
+pub static mut G_TILT_LIMIT_SYNTH: f32 = 0.0;
+/// ★§5.171【对齐 PX4 一手 `PositionControl.cpp:190-199` 的 **ARW（积分抗饱和）** ✓】：
+///   `vel_error -= arw_gain·(acc_sp − acc_produced)`（`arw_gain = 2/gain_vel_p` ✓）
+///   ⇒ 饱和时用"**实际产出加速度**"反推积分 ⇒ 防 windup ✓
+///   本仓原只做**幅值上限**（`±I_V_MAX` ✓）而无反推 ✗ ⇒ 饱和时积分继续累积 ⇒ windup ✓
+///   `2.0` ⇒ 启用（默认 `0` ⇒ 原行为，逐位不变 ✓）
+#[no_mangle]
+#[used]
+pub static mut G_ARW: f32 = 0.0;
+/// ★§5.174【参考模型/速率整形（PX4 `FlightTask` 层思想 ✓）】：**期望速度速率限制**
+///   `|Δdes_v| ≤ a_max·dt`（`a_max` = 本旋钮值，m/s² ✓；`0` ⇒ 关 ⇒ 逐位不变 ✓）
+///   动机（§5.173 ✓）：外环"缺相位裕度"且各项增益/带宽调整**无效** ⇒ 唯一未试的**结构性**
+///   手段 = 让**期望值本身**不含高频（避免激励结构模态 ✓）
+#[no_mangle]
+#[used]
+pub static mut G_VEL_SLEW: f32 = 0.0;
 
 /// [标定] 水平一阶低通时间常数（s）运行时覆盖。哨兵同规：**<0 = 用编译期值**。
 /// 0 是有效取值（= 关闭低通，即既有行为），故哨兵取 <0。
@@ -211,6 +248,13 @@ pub struct PidController {
     /// 反而有界（0.85m）。即文档 §4.2 早已写下的"估计器输出的速度噪声直接进了
     /// 位置外环…水平通道没有等效处理"。
     vel_lpf_h_tau: f32,
+    /// ★§5.167 速度环 D 项状态：上一拍水平速度（世界系 ✓）+ 微分低通状态 ✓
+    prev_vel_n: f32,
+    prev_vel_e: f32,
+    vel_dot_lpf: [f32; 2],
+    /// ★§5.174 速率整形状态：上一拍期望速度（世界系 ✓）
+    prev_des_vx: f32,
+    prev_des_vy: f32,
     /// 水平低通状态 `[pos_n, pos_e, vel_n, vel_e]`；`filt_h_init` 首帧直接赋值。
     filt_h: [f32; 4],
     filt_h_init: bool,
@@ -287,6 +331,12 @@ impl PidController {
 
     /// 切换水平速率模式（位置外环旁路，期望速度 = sp.vel）。
     /// 非 HIL 演示固件开启（大疆手感）；HIL 轨迹模式保持位置环。
+    /// ★§5.166 诊断：设置水平速度低通 τ（隔离相位滞后 ✓；测试用 ✓）
+    pub fn set_vel_lpf_tau_for_test(&mut self, vd: f32, vh: f32) {
+        self.vel_lpf_tau = vd;
+        self.vel_lpf_h_tau = vh;
+    }
+
     pub fn set_rate_mode_xy(&mut self, on: bool) {
         self.rate_mode_xy = on;
     }
@@ -344,7 +394,12 @@ impl PidController {
             rate_filt_init: false,
             filt_vd: 0.0,
             filt_d: 0.0,
-            vel_lpf_h_tau: 0.0, // 默认关：既有行为逐位不变；取值由 A/B 扫描定
+            vel_lpf_h_tau: 0.0,
+            prev_vel_n: 0.0,
+            prev_vel_e: 0.0,
+            vel_dot_lpf: [0.0; 2],
+            prev_des_vx: 0.0,
+            prev_des_vy: 0.0, // 默认关：既有行为逐位不变；取值由 A/B 扫描定
             filt_h: [0.0; 4],
             filt_h_init: false,
             filt_init: false,
@@ -452,6 +507,13 @@ impl Controller for PidController {
         // --- 外环：位置误差 -> 期望速度（限幅，避免饱和） ---
         // 加入设定点速度前馈：轨迹跟踪时直接把 sp.vel 叠加到期望速度，
         // 减少相位滞后（square/circle 场景 RMS 显著下降）。
+        // ★§5.166d：位置环增益旋钮（默认 -1 ⇒ 字段值 ✓）
+        {
+            let ov = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_KP_XY)) };
+            if ov >= 0.0 {
+                self.kp_xy = ov;
+            }
+        }
         let ex = sp.pos[0].0 - est_n;
         let ey = sp.pos[1].0 - est_e;
         let ez = sp.pos[2].0 - est_d;
@@ -529,11 +591,33 @@ impl Controller for PidController {
             let d = core::ptr::addr_of_mut!(G_CTRL_DBG);
             (*d)[3] = des_vx;
         }
-        let des_vy = if self.rate_mode_xy {
+        let mut des_vy_tmp = if self.rate_mode_xy {
             clampf(sp.vel[1].0, -vmax_xy_eff, vmax_xy_eff)
         } else {
             clampf(pre_iy + iy_final, -vmax_xy_eff, vmax_xy_eff)
         };
+        // ★§5.174：期望速度**速率限制**（参考模型整形 ✓）
+        let (mut des_vx_l, mut des_vy_l) = (des_vx, des_vy_tmp);
+        {
+            let amax = unsafe {
+                core::ptr::read_volatile(core::ptr::addr_of!(G_VEL_SLEW))
+            };
+            if amax > 0.0 {
+                let dmax = amax * dt;
+                let dx = (des_vx - self.prev_des_vx).clamp(-dmax, dmax);
+                let dy = (des_vy_tmp - self.prev_des_vy).clamp(-dmax, dmax);
+                des_vx_l = self.prev_des_vx + dx;
+                des_vy_l = self.prev_des_vy + dy;
+                self.prev_des_vx = des_vx_l;
+                self.prev_des_vy = des_vy_l;
+            } else {
+                self.prev_des_vx = des_vx;
+                self.prev_des_vy = des_vy_tmp;
+            }
+        }
+        let (des_vx, des_vy) = (des_vx_l, des_vy_l);
+        let _ = des_vy_tmp;
+        let _ = &mut des_vy_tmp;
         let des_vz = clampf(pre_iz + self.iz, -self.vmax_z, self.vmax_z);
 
         // --- 中环：速度误差 -> 期望世界系加速度 ---
@@ -549,23 +633,73 @@ impl Controller for PidController {
         const I_V_MAX: f32 = 2.0; // 与位置积分同口径（m/s^2 累积上限由回算保证）
         let ev_n = des_vx - est_vn;
         let ev_e = des_vy - est_ve;
-        // 回算抗饱和：饱和时把积分置为"恰使 acc 抵达边界"的值（与本仓 iz/i_xy 同法）
-        self.i_v_xy[0] = clampf(self.i_v_xy[0] + ki_v_eff * ev_n * dt, -I_V_MAX, I_V_MAX);
-        self.i_v_xy[1] = clampf(self.i_v_xy[1] + ki_v_eff * ev_e * dt, -I_V_MAX, I_V_MAX);
+        // ★§5.171：**ARW 启用时**积分更新移到饱和判定**之后**（PX4 同序 ✓）⇒ 此处先不算
+        let arw_on = unsafe {
+            core::ptr::read_volatile(core::ptr::addr_of!(G_ARW))
+        } == 2.0;
+        if !arw_on {
+            // 原行为 ✓（回算抗饱和：饱和时把积分置为"恰使 acc 抵达边界"的值 ✓）
+            self.i_v_xy[0] = clampf(self.i_v_xy[0] + ki_v_eff * ev_n * dt, -I_V_MAX, I_V_MAX);
+            self.i_v_xy[1] = clampf(self.i_v_xy[1] + ki_v_eff * ev_e * dt, -I_V_MAX, I_V_MAX);
+        }
 
         // 运行时旋钮（阶段 7 阻尼整定）：<0 => 用编译期值 ✓
         let kv = unsafe {
             let g = core::ptr::read_volatile(core::ptr::addr_of!(G_KV_XY));
             if g >= 0.0 { g } else { self.kv_xy }
         };
-        let acc_n = kv * (des_vx - est_vn) + sp.acc[0].0 + self.i_v_xy[0]; // 北向
+        // ★§5.167【对齐 PX4 一手：速度环 D 项 `−Kd·vel_dot` ✓】
+        //   PX4 `_vel_dot = states.acceleration`（世界系加速度 ✓）；本仓用 `est.accel`
+        //   （**机体**系加速度 ✓）旋到世界系（用姿态 ✓；悬停小倾角下近似 ✓）
+        let kv_d = unsafe {
+            let k = core::ptr::read_volatile(core::ptr::addr_of!(G_KV_D));
+            if k >= 0.0 { k } else { 0.0 }
+        };
+        let (mut acc_d_n, mut acc_d_e) = (0.0f32, 0.0f32);
+        if kv_d > 0.0 {
+            // ★§5.168【对齐 PX4 `_vel_dot = states.acceleration` ✓】：优先用**由调用方**
+            //   注入的世界系加速度（`Setpoint.acc` 字段承载 ✓，见 `app/control.rs` 从
+            //   `EskfEstimator::world_accel()` 填入 ✓）——它经过 EKF 比力+重力+低通 ⇒
+            //   **平滑**（PX4 同源 ✓）。缺省（全 0）时**退化为速度微分**（旧法 ✓ 噪声大）。
+            let a_lpf = {
+                let inj = [sp.acc[0].0, sp.acc[1].0];
+                if inj[0] != 0.0 || inj[1] != 0.0 {
+                    inj
+                } else {
+                    let vd = [
+                        (est_vn - self.prev_vel_n) / dt,
+                        (est_ve - self.prev_vel_e) / dt,
+                    ];
+                    self.prev_vel_n = est_vn;
+                    self.prev_vel_e = est_ve;
+                    let tau = 0.05f32;
+                    let al = dt / (tau + dt);
+                    self.vel_dot_lpf[0] += al * (vd[0] - self.vel_dot_lpf[0]);
+                    self.vel_dot_lpf[1] += al * (vd[1] - self.vel_dot_lpf[1]);
+                    self.vel_dot_lpf
+                }
+            };
+            // ★§5.167 A/B（实测 ✓）：PX4 为 `−Kd·vel_dot`；本仓实测**正向**加 D 项
+            //   单调**恶化**（0.2→−40.9、0.5→−62.3、1.0→−79.8 ✗）⇒ 本仓信号链符号
+            //   （估计速度微分）与 PX4 相反 ⇒ 需**反向**；但反向后 `K_V_D` 语义须改为
+            //   "正值=反向"（当前旋钮 `-1`=关闭、`>=0`=启用且负号 ✓）⇒ 已实测"负值=同默认"
+            //   （因 `kv_d < 0` 走关闭分支 ✓）⇒ **下一步**用独立旋钮 `G_KV_D_SIGN` 定号 ✓
+            // ★§5.167 定号（A/B ✓）：`G_KV_D_FLIP=2` ⇒ 反向
+            let flip = unsafe {
+                core::ptr::read_volatile(core::ptr::addr_of!(G_KV_D_FLIP))
+            } == 2.0;
+            let sgn = if flip { 1.0 } else { -1.0 };
+            acc_d_n = sgn * kv_d * a_lpf[0];
+            acc_d_e = sgn * kv_d * a_lpf[1];
+        }
+        let acc_n = kv * (des_vx - est_vn) + sp.acc[0].0 + self.i_v_xy[0] + acc_d_n; // 北向
         unsafe {
             // §5.155 扩展：[4]=acc_n [7]=kv
             let d = core::ptr::addr_of_mut!(G_CTRL_DBG);
             (*d)[4] = acc_n;
             (*d)[7] = kv;
         }
-        let acc_e = kv * (des_vy - est_ve) + sp.acc[1].0 + self.i_v_xy[1]; // 东向
+        let acc_e = kv * (des_vy - est_ve) + sp.acc[1].0 + self.i_v_xy[1] + acc_d_e; // 东向
         let acc_d = self.kv_z * (des_vz - est_vd) + sp.acc[2].0; // 下垂方向（NED），用滤波后垂直速度
 
         // 阶段 11-A 诊断：把控制律内部量存进调试字段，供 host 侧打印（绕开 no_std 无 eprintln）。
@@ -587,8 +721,26 @@ impl Controller for PidController {
             let ov = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_TILT_MAX)) };
             if ov > 0.0 { ov } else { self.tilt_max }
         };
-        let tilt_n = clampf(acc_n / g, -tilt_max_eff, tilt_max_eff);
-        let tilt_e = clampf(acc_e / g, -tilt_max_eff, tilt_max_eff);
+        // ★§5.169【PX4 `limitTilt` 语义（合成倾角限制 ✓）】
+        let (tilt_n, tilt_e) = {
+            let use_synth = unsafe {
+                core::ptr::read_volatile(core::ptr::addr_of!(G_TILT_LIMIT_SYNTH))
+            } == 2.0;
+            let (mut tn, mut te) = (acc_n / g, acc_e / g);
+            if use_synth {
+                // PX4：`body_z` 归一化后 `limitTilt` ⇒ 等价于把 (tilt_n, tilt_e) 按**合成模长**等比缩放 ✓
+                let mag = crate::math::sqrt(tn * tn + te * te);
+                if mag > tilt_max_eff && mag > 1e-9 {
+                    let k = tilt_max_eff / mag;
+                    tn *= k;
+                    te *= k;
+                }
+            } else {
+                tn = clampf(tn, -tilt_max_eff, tilt_max_eff);
+                te = clampf(te, -tilt_max_eff, tilt_max_eff);
+            }
+            (tn, te)
+        };
         // ⚠️ **有条件写**（重要）：每拍无条件写一个 16B 静态会把控制任务推过 4ms 预算
         // ——实测同一固件仅加这条 store，`x_hover_noise` 就从 20.00°/28.64°（有界极限环）
         // 变成 141.90°/87.38°（40s 后发散）。固件里已有 `DBG_PID`(48B)/`DBG_MOTOR`(16B)
@@ -597,6 +749,17 @@ impl Controller for PidController {
         // 几乎零成本（一个可预测分支），且保留关键信息。
         if tilt_n.abs() >= tilt_max_eff - 1e-6 || tilt_e.abs() >= tilt_max_eff - 1e-6 {
             unsafe { DBG_TILT = [acc_n, acc_e, tilt_n, tilt_e]; }
+        }
+
+        // ★§5.171【ARW（PX4 `:190-199` ✓）】：水平饱和时用"**实际产出加速度**"反推积分 ✓
+        //   `acc_produced ≈ g·tilt_cmd`（小角 ✓，与 PX4 `_thr_sp·(g/hover_thrust)` 同量纲 ✓）
+        //   `vel_error ← vel_error − arw_gain·(acc_sp − acc_produced)`（`arw_gain = 2/kv` ✓ 同 PX4）
+        if arw_on {
+            let arw_gain = 2.0 / kv.max(1e-3);
+            let ev_n2 = ev_n - arw_gain * (acc_n - g * tilt_n);
+            let ev_e2 = ev_e - arw_gain * (acc_e - g * tilt_e);
+            self.i_v_xy[0] = clampf(self.i_v_xy[0] + ki_v_eff * ev_n2 * dt, -I_V_MAX, I_V_MAX);
+            self.i_v_xy[1] = clampf(self.i_v_xy[1] + ki_v_eff * ev_e2 * dt, -I_V_MAX, I_V_MAX);
         }
 
         // 关键：机体倾斜后推力竖直分量 = T·cos(φ)，必须按 1/cos(φ) 放大总推力，

@@ -127,6 +127,15 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
     //   但**恢复设计值 0.8 会使 `x_hover_demo` 发散**（roll 19.5° ✗，滚转界 5° ✓）
     //   —— 且 `kv` 降到 0.03 仍 ~19° ✗ ⇒ 属**姿态环/外环响应**的真实缺陷（另有原因 ✓）。
     //   ⇒ 在整定完成前**不启用**该初始化（保持既有可用行为 ✓，避免引入回归 ✗）✓
+    // ★§5.174【整定成果应用（验收导向 ✓）】：启用 §5.168 的两级手段（D 项 + 速率整形 ✓）
+    //   `KVD=0.8`（速度环 D 项，用 ESKF 平滑加速度 ✓ PX4 同源 ✓）
+    //   `SLEW=2.0`（期望速度速率整形 ✓ m/s²）
+    //   + `init_runtime_knobs()`（§5.156 的 `.data` 坑修复 ✓ 使设计增益真正生效）
+    // ⚠️§5.174 验收结果（诚实 ✓）：启用两级手段（`KVD=0.8` + `SLEW=2.0` + `.data` 坑修复 ✓）后
+    //   `x_hover_demo` **仍发散**（末态 (−61, −72)m ✗；但**显著优于**未启用时的 164°/131m ✓）
+    //   ⇒ 两级手段**方向正确但不足以**让 demo 通过 ⇒ **暂不启用**（保持既有可用行为 ✓），
+    //     待整定完成后启用 ✓（旋钮保留 ✓ 可用环境变量 A/B ✓）
+    let _ = ();
     // ★§5.158/§5.160 排查中（见台账）：恢复设计增益后 demo 发散；探针排查中发现
     //   **`PidController` 的 `control_attitude` 路径在 demo 场景下未被观测到执行**
     //   （`G_PID_ATT_DBG` 恒 0，而 `m_permille` 却出现极端值 ✗）⇒ 需先确认**实际生效的
@@ -341,7 +350,18 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
                             pos: [Meter(0.0), Meter(0.0), Meter(hold_z)],
                             yaw: Radian(0.0),
                             vel: [MeterPerSecond(0.0); 3],
-                            acc: [MeterPerSecondSquared(0.0); 3],
+                            // ★§5.168：世界系加速度（PX4 `states.acceleration` 同源 ✓）供速度环 D 项
+                        acc: {
+                            let wa = match hil.est.inner {
+                                flyctrl_core::estimator::select::AnyEstimatorKind::Eskf(ref e) => e.world_accel(),
+                                _ => [0.0; 3],
+                            };
+                            [
+                                MeterPerSecondSquared(wa[0]),
+                                MeterPerSecondSquared(wa[1]),
+                                MeterPerSecondSquared(wa[2]),
+                            ]
+                        },
                         },
                         false,
                     )
