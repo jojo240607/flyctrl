@@ -135,6 +135,10 @@ pub static mut G_ACC_FLIP: f32 = 0.0;
 #[no_mangle]
 #[used]
 pub static mut G_PID_ATT_DBG: [f32; 7] = [0.0; 7];
+/// ★§5.161 调用计数（`PidController::control` 被调用次数 ✓；用于确认实际控制路径 ✓）
+#[no_mangle]
+#[used]
+pub static mut G_PID_CALLS: u32 = 0;
 pub static mut G_ATT_KP: f32 = -1.0;
 pub static mut G_ATT_KD: f32 = -1.0;
 
@@ -373,6 +377,11 @@ impl PidController {
 
 impl Controller for PidController {
     fn control(&mut self, _dt: Second, sp: &Setpoint, est: &VehicleState) -> ActuatorCmd {
+        // ★§5.161 调用计数探针（唯一名 ✓ 查重名 ✓）
+        unsafe {
+            let c = core::ptr::read_volatile(core::ptr::addr_of!(G_PID_CALLS));
+            core::ptr::write_volatile(core::ptr::addr_of_mut!(G_PID_CALLS), c.wrapping_add(1));
+        }
         // 标定旋钮（易失读：由外部写入；0 是有效值故哨兵取 <0）
         {
             let ov = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_KI_XY)) };
@@ -838,6 +847,15 @@ impl PidController {
         }
         self.dbg_err = att_out.err;
         self.dbg_pqr = att_out.rates;
+        unsafe {
+            // ★§5.161 探针写入（唯一名 ✓）：[0..3)=err(机体系) [3..6)=rates [6]=thrust
+            let d = core::ptr::addr_of_mut!(G_PID_ATT_DBG);
+            for k in 0..3 {
+                (*d)[k] = att_out.err[k];
+                (*d)[3 + k] = att_out.rates[k];
+            }
+            (*d)[6] = des_thrust;
+        }
         unsafe {
             // ★§5.159 探针：[0..3)=err（机体轴） [3..6)=rates(p,q,r) [6]=des_thrust
             let d = core::ptr::addr_of_mut!(G_PID_ATT_DBG);
