@@ -128,6 +128,14 @@ pub static mut G_ATT_LEGACY: f32 = 0.0;
 #[no_mangle]
 #[used]
 pub static mut G_ACC_FLIP: f32 = 0.0;
+/// ★§5.165 整定旋钮：速度外推时域覆盖（秒 ✓；`0` ⇒ 用编译期默认 `VEL_PRED_HORIZON` ✓）
+#[no_mangle]
+#[used]
+pub static mut G_VEL_PRED: f32 = -1.0;
+/// ★§5.165 整定旋钮：水平速度低通 τ 覆盖（秒 ✓；`-1` ⇒ 用默认 ✓）
+#[no_mangle]
+#[used]
+pub static mut G_VEL_LPF_TAU_K: f32 = -1.0;
 /// ★§5.159 探针：[0..3)=姿态误差(机体系) [3..6)=rates(p,q,r) [6]=des_thrust
 ///   ⚠️§5.159 修：原名 `G_ATT_DBG` 与 `estimator/ekf.rs` 的**同名 `#[no_mangle]` 符号冲突** ✗
 ///   （实测 ELF 里两个符号都叫 `G_ATT_DBG` ⇒ linker 只保留一个 ⇒ 探针读到 0 ✗）
@@ -400,6 +408,11 @@ impl Controller for PidController {
         // IMU 抖动经 EKF 估计后直接驱动油门，会导致悬停向上发散（见 PLAN 阶段 11-A）。
         // 对垂直位置/速度估计做一阶低通，时间常数 vel_lpf_tau（0=不过滤，保持历史行为）。
         // 首帧直接赋值，避免启动瞬态。
+        // ★§5.165：水平速度低通 τ 可被旋钮覆盖（默认 -1 ⇒ 用字段 ✓）
+        let vel_lpf_h_tau = {
+            let ov = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_VEL_LPF_TAU_K)) };
+            if ov >= 0.0 { ov } else { self.vel_lpf_h_tau }
+        };
         let (est_d, est_vd) = if self.vel_lpf_tau > 0.0 {
             let alpha = (dt / (self.vel_lpf_tau + dt)).clamp(0.0, 1.0);
             if !self.filt_init {
@@ -415,8 +428,8 @@ impl Controller for PidController {
             (est.pos[2].0, est.vel[2].0)
         };
         // 水平低通：**与垂向完全同形**（位置+速度都滤、首帧直接赋值）。
-        let (est_n, est_e, est_vn, est_ve) = if self.vel_lpf_h_tau > 0.0 {
-            let alpha = (dt / (self.vel_lpf_h_tau + dt)).clamp(0.0, 1.0);
+        let (est_n, est_e, est_vn, est_ve) = if vel_lpf_h_tau > 0.0 {
+            let alpha = (dt / (vel_lpf_h_tau + dt)).clamp(0.0, 1.0);
             if !self.filt_h_init {
                 self.filt_h = [est.pos[0].0, est.pos[1].0, est.vel[0].0, est.vel[1].0];
                 self.filt_h_init = true;

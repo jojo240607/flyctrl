@@ -1,3 +1,16 @@
+//! ⚠️⚠️ **本模块是「Legacy 固定-α 锚定 EKF」，【不是生产默认估计器】** ⚠️⚠️
+//!
+//! ★生产默认 = **ESKF**（`eskf.rs` / `EskfEstimator` ✓，见 `estimator/select.rs`：
+//!   `AnyEstimatorKind::Eskf(EskfEstimator::default_quad())` ✓）。
+//!
+//! 本模块（`EkfEstimator`）仅用于：
+//!   · `flyctrl-sitl`（`bin/`）的**对照/回退**臂 ✓
+//!   · 少数测试（`props_invariant.rs` ✓）与 INDI 的对照 ✓
+//!
+//! ⚠️ **写"生产路径"自检 / 复现器时，务必用 `EskfEstimator`** —— 本会话曾误照抄
+//!    旧模板（用本模块 ✗）导致复现的不是生产路径 ✗（见迁移台账 §5.164 的用户纠正 ✓）。
+//! ⚠️ 另：本模块与 `controller/pid.rs` 的**探针符号重名**（`G_ATT_DBG` ✓）曾致调试
+//!    读到错地址 ✗ ⇒ 新增 `#[no_mangle]` 符号前**必须查重名** ✓。
 //! 松耦合误差状态 EKF 估计器（no_std, 无堆分配）。
 //!
 //! 松耦合误差状态 EKF 估计器（no_std, 无堆分配）。

@@ -432,10 +432,18 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
                     ),
                 };
                 // 速率模式：速度外推的预测位置（补偿 EKF 位置估计延迟）；位置模式：绝对目标。
+                // ★§5.165：外推时域可被旋钮覆盖（默认 -1 ⇒ 编译期值 ✓）
+                let pred_h = {
+                    let ov = unsafe {
+                        core::ptr::read_volatile(core::ptr::addr_of!(
+                            flyctrl_core::controller::pid::G_VEL_PRED))
+                    };
+                    if ov >= 0.0 { ov } else { VEL_PRED_HORIZON }
+                };
                 let pos = match (use_rc_vel, last_est) {
                     (true, Some(e)) => [
-                        Meter(e.pos[0].0 + e.vel[0].0 * VEL_PRED_HORIZON),
-                        Meter(e.pos[1].0 + e.vel[1].0 * VEL_PRED_HORIZON),
+                        Meter(e.pos[0].0 + e.vel[0].0 * pred_h),
+                        Meter(e.pos[1].0 + e.vel[1].0 * pred_h),
                         Meter(tz),
                     ],
                     (true, None) => [Meter(tx), Meter(ty), Meter(tz)],
