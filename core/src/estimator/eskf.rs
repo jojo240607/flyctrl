@@ -233,7 +233,10 @@ pub fn transition_matrix(
         f[I_POS + i][I_VEL + i] += dt;
     }
     // 速度×姿态：∂δv/∂δθ = 【+[a_world ×]·dt】（§12.8 ✓ 参照 derivation.py 169–182 行定形 ✓）
-    //   ★叉乘必须在【世界系】做（用 a_world = R·f ✓）——
+    //   ⚠️★§5.184【开放问题】：有限差分（与 `inject_error` 同约定）给出 **−[a_world×]·dt**，
+    //   与本行相反；但把本行改为 − 后 A13（陀螺饱和边）明显变差 ✗（补偿性符号错假设）
+    //   ⇒ 保持 + 号（H 场绿）并把矛盾登记在 `f_vel_att_sign_vs_finite_difference`（#[ignore]）✓。
+    //   叉乘必须在【世界系】做（用 a_world = R·f ✓）——
     //   写成 R·[f×] 是【结构性错误】✗（少一个 Rᵀ 的相似变换，怎么调符号都不对 ✓）
     let a_world = rotate_vec_by_quat(q, f_body);
     let (ax, ay, az) = (a_world[0], a_world[1], a_world[2]);
@@ -245,6 +248,13 @@ pub fn transition_matrix(
             _ => [ay, -ax, 0.0],
         };
         for i in 0..3 {
+            // ★§5.184【开放问题 ✗（重要）】：本行符号 **与有限差分相悖** ——
+            //   FD（与 `inject_error` 同约定：左乘 `q←exp(δθ)⊗q`）定形为 **−[a_world×]·dt** ✓；
+            //   而实测把符号改成 − 后 `mag_reference_quiet_scenario_regression::A13（陀螺饱和边）`
+            //   RMSE 5.27°→15.6° **变差 3×** ✗ ⇒ 说明**别处有补偿性符号错**，单独改此处会破平衡 ✗。
+            //   故此处暂**保持 + 号**（H 场绿 ✓），并把矛盾登记为 `#[ignore]`d 测试
+            //   `f_vel_att_sign_vs_finite_difference`（下轮专项审计：逐块 FD 核 H/F/injection 的
+            //   误差约定是否自洽 ✓）。F 符号本身**非本轮修复项** ✓。
             f[I_VEL + i][I_ATT + j] += col[i] * dt;
         }
     }
@@ -1912,6 +1922,96 @@ pub fn extract_error(q_old: Quaternion, st: &EskfState) -> ErrorState {
 mod tests {
     use super::*;
 
+    /// ★§5.184【FD 回归】：用**有限差分**（而非实现自证）校验重力 H 的符号/结构 ✓。
+    ///
+    /// 动机（本仓纪律 ✓）：`c1_extreme_cases` ③ 原先只断言"实现 = 实现"✗ ⇒ 一个**符号错**
+    /// 在身上多个会话未被发现 ✗。本测试用**前向差分**独立定形 ⇒ 符号/结构错当场暴露 ✓。
+    #[test]
+    fn gravity_h_matches_finite_difference() {
+        let q = Quaternion::from_axis_angle([0.2, 0.3, 0.5], Radian(0.4)).normalize();
+        let eps = 1e-4f32;
+        let basis = [[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let perturb = |q: Quaternion, e: [f32; 3]| -> Quaternion {
+            let dq = Quaternion::from_axis_angle([e[0] / eps, e[1] / eps, e[2] / eps], Radian(eps));
+            (dq * q).normalize()
+        };
+        let gned = [0.0f32, 0.0, 9.81];
+        let u0 = predicted_gravity_body(q, gned);
+        let hg = gravity_h(q, gned);
+        let mut maxdev = 0.0f32;
+        for (j, e) in basis.iter().enumerate() {
+            let u1 = predicted_gravity_body(perturb(q, *e), gned);
+            for i in 0..3 {
+                let fd = (u1[i] - u0[i]) / eps;
+                maxdev = maxdev.max((hg[i][I_ATT + j] - fd).abs());
+            }
+        }
+        assert!(maxdev < 1e-3, "重力 H 与有限差分不符（偏差 {maxdev:.2e}）⇒ 符号/结构错 ✗");
+    }
+
+    /// ★§5.184【FD 回归】：磁量测 H（`∂ĥ/∂δθ`）与有限差分一致（与重力 H 同族 ✓）。
+    #[test]
+    fn mag_h_matches_finite_difference() {
+        let q = Quaternion::from_axis_angle([0.2, 0.3, 0.5], Radian(0.4)).normalize();
+        let eps = 1e-4f32;
+        let basis = [[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let perturb = |q: Quaternion, e: [f32; 3]| -> Quaternion {
+            let dq = Quaternion::from_axis_angle([e[0] / eps, e[1] / eps, e[2] / eps], Radian(eps));
+            (dq * q).normalize()
+        };
+        let mag_i = [0.21f32, -0.02, 0.42];
+        let mag_b = [0.01f32, 0.02, -0.03];
+        let m0 = predicted_mag_body(q, mag_i, mag_b);
+        let hm = mag_h(q, mag_i);
+        let mut maxdev = 0.0f32;
+        for (j, e) in basis.iter().enumerate() {
+            let m1 = predicted_mag_body(perturb(q, *e), mag_i, mag_b);
+            for i in 0..3 {
+                let fd = (m1[i] - m0[i]) / eps;
+                maxdev = maxdev.max((hm[i][I_ATT + j] - fd).abs());
+            }
+        }
+        assert!(maxdev < 1e-3, "磁 H 与有限差分不符（偏差 {maxdev:.2e}）⇒ 符号/结构错 ✗");
+    }
+
+    /// ★§5.184【开放问题（已知 ✗）】：`F[vel,att]`（`∂δv/∂δθ`）符号与有限差分相悖。
+    ///
+    /// FD（与 `inject_error` 同约定：左乘 `q ← exp(δθ)⊗q`）定形为 **−[a_world×]·dt**；
+    /// 而实现用 **+[a_world×]·dt**（见 `transition_matrix`）。**把实现改成 −** 后：
+    ///   `mag_reference_quiet_scenario_regression::A13（陀螺饱和边）` RMSE 5.27°→15.6°（3× 变差 ✗）
+    /// ⇒ 不能单改一处 ⇒ **疑别处有补偿性符号错**（下轮逐块 FD 审计 F/H/injection 约定自洽性 ✓）。
+    /// 本测试用 `#[ignore]` **登记矛盾**（不阻塞 H 场 ✓），修好补偿错后去掉 ignore 即可作为守卫 ✓。
+    #[test]
+    #[ignore = "§5.184 开放问题：F[vel,att] 符号与 FD 相悖，疑补偿性符号错，待专项审计"]
+    fn f_vel_att_sign_vs_finite_difference() {
+        let g = [0.0f32, 0.0, 9.81];
+        let dt = 1e-3f32;
+        let q = Quaternion::from_axis_angle([0.2, 0.3, 0.5], Radian(0.4)).normalize();
+        let f_body = [0.3f32, -0.2, -9.7];
+        let delta_vel = [f_body[0] * dt, f_body[1] * dt, f_body[2] * dt];
+        let eps = 1e-4f32;
+        let basis = [[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        let perturb = |q: Quaternion, e: [f32; 3]| -> Quaternion {
+            let dq = Quaternion::from_axis_angle([e[0] / eps, e[1] / eps, e[2] / eps], Radian(eps));
+            (dq * q).normalize()
+        };
+        let mut s0 = EskfState { q, v: [0.0; 3], p: [0.0; 3], bg: [0.0; 3], ba: [0.0; 3] };
+        s0.predict(ImuDelta { delta_ang: [0.0; 3], delta_vel }, g, dt);
+        let r = rot_of(q);
+        let fm = transition_matrix(q, [0.0; 3], dt, &r, f_body).expect("F 应可构造");
+        let mut maxdev = 0.0f32;
+        for (j, e) in basis.iter().enumerate() {
+            let mut st = EskfState { q: perturb(q, *e), v: [0.0; 3], p: [0.0; 3], bg: [0.0; 3], ba: [0.0; 3] };
+            st.predict(ImuDelta { delta_ang: [0.0; 3], delta_vel }, g, dt);
+            for i in 0..3 {
+                let fd = (st.v[i] - s0.v[i]) / eps;
+                maxdev = maxdev.max((fm[I_VEL + i][I_ATT + j] - fd).abs());
+            }
+        }
+        // 期望实现 = 有限差分（当前会失败 ⇒ 这正是登记的矛盾 ✓）
+        assert!(maxdev < 1e-3, "F[vel,att] 与有限差分不符（偏差 {maxdev:.2e}）⇒ 符号/结构错 ✗");
+    }
+
     /// 三极限情形（与仿真侧工装同判据 ✓）
     #[test]
     fn c1_extreme_cases() {
@@ -1935,7 +2035,8 @@ mod tests {
             + (s2.v[1] - g[1] * dt).powi(2)
             + (s2.v[2] - g[2] * dt).powi(2);
         assert!(dev2 < 1e-12, "自由落体应以 g 加速（偏差² = {dev2:.2e}）✗");
-        // ③ δv/δθ 块：应为 +[a_world×]·dt（世界系叉乘 ✓），且整体返回 Ok ✓
+        // ③ δv/δθ 块：当前实现为 +[a_world×]·dt（⚠️★§5.184：FD 定形为 −[a_world×]·dt，
+        //    见 `f_vel_att_sign_vs_finite_difference`（#[ignore]）—— 本断言仅锁当前行为 ✓）
         let r = [[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
         let f_body = [0.3f32, -0.2, -9.7];
         let fm = transition_matrix(q, [0.0, 0.0, 0.0], dt, &r, f_body).expect("F 应可构造 ✓");
