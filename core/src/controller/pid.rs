@@ -102,6 +102,17 @@ pub static mut G_KI_V_XY: f32 = -1.0;
 pub static mut G_KP_Z: f32 = -1.0;
 pub static mut G_KV_Z: f32 = -1.0;
 pub static mut G_KI_Z: f32 = -1.0;
+/// ★★§5.197 A/B 旋钮：推力补偿的 `cos(tilt)` 取【**实际（估计）**倾角】而非【指令】倾角。
+/// `2.0` ⇒ 用 `est.att` 的机体 z 轴世界系 z 分量（cos 实际倾角 ✓）；默认 `0` ⇒ 原行为 ✓。
+/// 动机（§5.196 下轮候选① ✓）：`des_thrust = (hover − acc_d/g)/cos_tilt` 中 `cos_tilt`
+/// 现由**指令**加速度算出 ⇒ **假设姿态环完美跟随** ✗；姿态环有滞后时实际 `cos` 更大
+/// ⇒ 实际竖直加速度偏大 ⇒ 垂向偏差与**倾角**耦合（垂向 0.77m > 水平 0.55m ✓）。
+pub static mut G_THRUST_COS_ACTUAL: f32 = 0.0;
+/// ★★§5.197 A/B 旋钮：推力补偿的 `cos(tilt)` 取【**实际（估计）**倾角】而非【指令】倾角。
+/// `2.0` ⇒ 用 `est.att` 的机体 z 轴世界系 z 分量（cos 实际倾角 ✓）；默认 `0` ⇒ 原行为 ✓。
+/// 动机（§5.196 下轮候选①✓）：`des_thrust = (hover − acc_d/g)/cos_tilt` 中 `cos_tilt`
+/// 现由**指令**加速度算出 ⇒ **假设姿态环完美跟随** ✗；姿态环有滞后时实际 `cos` 更大
+/// ⇒ 实际竖直加速度偏大 ⇒ 垂向偏差与**倾角**耦合（垂向 0.77m > 水平 0.55m ✓）。
 
 /// **速度环 P 增益（水平）**运行时旋钮 —— 位置阶跃的**阻尼**主要来自它（默认 0.8）。
 /// 语义同其他 `G_*`：`<0` = 用编译期值 ✓。用于阶段 7 的阻尼整定（免去反复重编译 ✓）。
@@ -894,10 +905,20 @@ impl Controller for PidController {
         let f_w_mag = crate::math::sqrt(
             acc_n * acc_n + acc_e * acc_e + (acc_d - g) * (acc_d - g),
         );
-        let cos_tilt = if f_w_mag > 1e-3 {
-            ((acc_d - g).abs() / f_w_mag).clamp(0.2, 1.0)
-        } else {
-            1.0
+        // ★★§5.197 A/B：`G_THRUST_COS_ACTUAL=2` ⇒ 用**实际（估计）**倾角的 cos ✓
+        let cos_tilt = {
+            let use_actual = unsafe {
+                core::ptr::read_volatile(core::ptr::addr_of!(G_THRUST_COS_ACTUAL))
+            } == 2.0;
+            if use_actual {
+                // 机体 z 轴（NED 下向）旋到世界系 ⇒ 其 z 分量 = cos(实际倾角) ✓
+                let bz = crate::vehicle::rotate_vec_by_quat(est.att, [0.0, 0.0, 1.0]);
+                bz[2].abs().clamp(0.2, 1.0)
+            } else if f_w_mag > 1e-3 {
+                ((acc_d - g).abs() / f_w_mag).clamp(0.2, 1.0)
+            } else {
+                1.0
+            }
         };
         let tilt_mag = crate::math::atan2(
             crate::math::sqrt(acc_n * acc_n + acc_e * acc_e),
