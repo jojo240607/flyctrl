@@ -135,7 +135,8 @@ impl VehicleConfig {
             att_kp: 3.0,
             att_kd: 0.3,
             kp_xy: 0.3,
-            kv_xy: 0.8,
+            // ★§5.194：与 `PidController::default_quad()` 同步（0.8 → **1.5** ✓，理由见彼处注释）
+            kv_xy: 1.5,
             vel_lpf_tau: 0.15,
             // 0.5·ρ·Cd_h/m ≈ 0.5·1.225·0.18/1.2 ≈ 0.092（default_quad 机体水平型阻）
             // + P3-C1 BET 桨盘阻力（H 力 + 挥舞后倾，5 m/s 约 0.8 m/s²，≈0.033 平均到 v²）

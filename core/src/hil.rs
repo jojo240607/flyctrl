@@ -809,7 +809,7 @@ mod tests {
             PidController::default_quad(),
             Second(0.004),
         );
-        mcu_ctx.ctrl.apply_gains(&[0.3, 0.5, 0.8, 1.5, 0.5]); // 复刻 init_param_defaults（MCU 对齐 SIL）
+        mcu_ctx.ctrl.apply_gains(&[0.3, 0.5, 1.5, 1.5, 0.5]); // ★§5.194 kv_xy 0.8→1.5（复刻 init_param_defaults ✓）
         // SIL 侧配置（与 fly-sim-core controller.rs 完全一致）：from_config 派生。
         let mut sil_ctx = HilContext::new(
             EkfEstimator::default_quad(),
