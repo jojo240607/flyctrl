@@ -272,6 +272,19 @@ pub struct PidController {
     rate_lpf_tau: f32,
     filt_w: [f32; 3], // 滤波后的机体角速度
     rate_filt_init: bool,
+    // ★★§5.208【对齐 PX4 一手 `IMU_DGYRO_CUTOFF` ✓】角加速度 D 项：
+    //   PX4 速率环的 D 作用在**角加速度** `dω/dt` 上（`IMU_DGYRO_CUTOFF` 默认 **20Hz** ✓），
+    //   本仓原来是"对 ω 的比例阻尼"（`−att_kd·ω` ✓）—— 实测它**只会放噪** ✗
+    //   （§5.207：加 att_kd 单调恶化 guidance 14/2→12/4、att_ctrl 15/3→10/8）✗。
+    //   `dω/dt` 噪声极大 ⇒ 一手做法就是**先微分再低通** ✓。
+    //   作用：在环带宽附近补相位（lead ✓）⇒ 补偿陀螺低通（③ §5.206）的滞后 ✓。
+    /// 角加速度 D 增益（s）。**0 = 关闭 ⇒ 完全跳过 ⇒ 逐位不变** ✓（默认 0，待整定 ✓）。
+    dgyro_k: f32,
+    /// 角加速度 D 的低通截止（Hz）。PX4 `IMU_DGYRO_CUTOFF` default **20.0** ✓；≤0 ⇒ 回退 20 ✓。
+    dgyro_cutoff: f32,
+    prev_omega: [f32; 3],
+    dgyro_filt: [f32; 3],
+    dgyro_init: bool,
     filt_vd: f32,   // 滤波后的垂直速度（NED，向下正）
     filt_d: f32,    // 滤波后的垂直位置（NED，向下正）
     /// 水平一阶低通时间常数（s）。**0 = 关闭（既有行为）**。
@@ -413,6 +426,18 @@ impl PidController {
             // 回归守卫：`wind_turb_scan::tilt_max_attribution_scan`。
             tilt_max: 0.4363, // 25°
             rate_mode_xy: false,
+            // ★★§5.207【③ 联合重整定的实测结论 ✗：**本仓当前结构下不可行** —— 见台账 §5.207】
+            //   一手 ✓：PX4 的 `IMU_GYRO_CUTOFF=40Hz` 靠 "D-term filter"（`IMU_DGYRO_CUTOFF=20Hz`，
+            //     作用在**角加速度**上 ✓）换来的相位余量 ⇒ 允许提高 CUTOFF / P 增益 ✓
+            //   本仓实测 ✓（低通 40Hz · guidance_track / att_ctrl 双指标）：
+            //     · 降 P（唯一有效手段 ✓）：kp=2.0 ⇒ guidance 16/0 ✓ 但 att_ctrl **15/3 破** ✗
+            //       （闭环带宽 1.00Hz 跌破判据 1.0Hz、静刚度、估计驱动偏差三项 ✓）
+            //       kp=2.5 ⇒ guidance 15/1 ✗；kp=3.0 ⇒ 14/2 ✗
+            //     · 加 D（PX4 的真实机制 ✓）：kd=0.45/0.6/0.75 ⇒ **单调恶化** ✗
+            //       （guidance 14/2→12/4、att_ctrl 15/3→10/8）⇒ 本仓 `att_kd` 是
+            //       **速率误差增益（直接放噪）**，缺 PX4 那级"微分后再低通"✗
+            //   ⇒ 前置条件 = **重构 D 项为 角加速度 + 低通**（对齐 IMU_DGYRO_CUTOFF ✓）
+            //     ⇒ 在那之前 ③ 保持**默认关** ✓（`G_ESKF_GYR_LPF > 0` 可显式启用 ✓）
             att_kp: 3.0,
             att_kd: 0.3,
             hover_thrust: 0.5,
@@ -445,6 +470,11 @@ impl PidController {
             rate_lpf_tau: 0.02, // 50Hz：抑噪为主，相位滞后小
             filt_w: [0.0; 3],
             rate_filt_init: false,
+            dgyro_k: 0.0,
+            dgyro_cutoff: 20.0,
+            prev_omega: [0.0; 3],
+            dgyro_filt: [0.0; 3],
+            dgyro_init: false,
             filt_vd: 0.0,
             filt_d: 0.0,
             vel_lpf_h_tau: 0.0,
@@ -475,6 +505,14 @@ impl PidController {
         }
     }
 
+    /// ★★§5.208：角加速度 D（PX4 `IMU_DGYRO_CUTOFF` 同构）的整定入口。
+    /// `k <= 0` ⇒ 关闭（逐位不变 ✓）；`cutoff <= 0` ⇒ 保留一手 20Hz ✓。
+    pub fn set_dgyro(&mut self, k: f32, cutoff_hz: f32) {
+        self.dgyro_k = if k > 0.0 { k } else { 0.0 };
+        if cutoff_hz > 0.0 { self.dgyro_cutoff = cutoff_hz; }
+        self.dgyro_init = false; // 复位微分器（避免整定切换处产生假尖峰 ✓）
+    }
+
     /// 从机型配置构造。
     pub fn from_config(c: &crate::config::CtrlParams) -> Self {
         let mut s = Self::default_quad();
@@ -485,6 +523,9 @@ impl PidController {
         s.vmax_z = c.vmax_z;
         s.att_kp = c.att_kp;
         s.att_kd = c.att_kd;
+        // ★★§5.208：角加速度 D（PX4 IMU_DGYRO_CUTOFF 同构 ✓）
+        s.dgyro_k = c.dgyro_k;
+        s.dgyro_cutoff = if c.dgyro_cutoff > 0.0 { c.dgyro_cutoff } else { 20.0 };
         s.kp_xy = c.kp_xy;
         s.kv_xy = c.kv_xy;
         s.vel_lpf_tau = c.vel_lpf_tau;
@@ -1105,6 +1146,26 @@ impl PidController {
             self.att_kd,
             omega_f,
         );
+        // ★★§5.208【对齐 PX4 `IMU_DGYRO_CUTOFF` ✓】角加速度 D（lead）：
+        //   `rates -= dgyro_k · LPF20Hz(dω/dt)` ✓ —— 符号与 `−att_kd·ω` 同源：
+        //   姿态误差的 1 阶导 ≈ −ω ⇒ D 项 `−kd·ω` ✓；2 阶导 ≈ −dω/dt ⇒ `−k·dω/dt` ✓。
+        //   `dgyro_k == 0` ⇒ 整段跳过（**逐位不变** ✓）。
+        if self.dgyro_k != 0.0 && dt > 1e-6 {
+            if !self.dgyro_init {
+                self.prev_omega = omega_f; // 首帧直接赋值，避免启动瞬态 ✓
+                self.dgyro_init = true;
+            }
+            let fc = if self.dgyro_cutoff > 0.0 { self.dgyro_cutoff } else { 20.0 };
+            let tau = 1.0 / (2.0 * core::f32::consts::PI * fc);
+            let a = (dt / (tau + dt)).clamp(0.0, 1.0); // 与 rate_lpf_tau 同法 ✓
+            for k in 0..3 {
+                let dw = (omega_f[k] - self.prev_omega[k]) / dt;
+                self.dgyro_filt[k] += a * (dw - self.dgyro_filt[k]);
+                att_out.rates[k] -= self.dgyro_k * self.dgyro_filt[k];
+            }
+            self.prev_omega = omega_f;
+        }
+
         // ---- **参考机体角速度前馈**（PX4 `MC_REF_FF` 同构）----------------------
         //
         // 期望姿态随时间旋转时（偏航速率 `ψ̇`），机体**本就该**以 `R^T·(0,0,ψ̇)` 的角速度
@@ -1194,6 +1255,79 @@ impl PidController {
                 clampf(motors[2], 0.0, 1.0),
                 clampf(motors[3], 0.0, 1.0),
             ],
+        }
+    }
+}
+
+#[cfg(test)]
+mod dgyro_tests {
+    use super::*;
+    use crate::units::{RadianPerSecond, Second};
+
+    /// ★★§5.208【零件级自检 ✓】——本仓血的教训：**先写零件级自检再进闭环** ✓
+    ///（两次跳过自检的前馈尝试都失败且无从归因 ✗）。
+    ///
+    /// 激励 ω(t) = A·sin(ω0 t) ⇒ dω/dt = A·ω0·cos(ω0 t)
+    ///   ⇒ 经 20Hz 一阶低通 ≈ A·ω0·|H|·cos(ω0 t + φ)，|H| = 1/√(1+(ω0/ωc)²)、φ = −atan(ω0/ωc)
+    ///   ⇒ D 项（PX4 `IMU_DGYRO_CUTOFF` 同构）= −k·(该值) ✓
+    ///
+    /// 断言：① 幅度与解析一致（±15%）② 与解析的投影 ≈ 1（符号错则为 −1 ✗）
+    ///       ③ k=0 ⇒ 与不启用**逐位相同** ✓
+    #[test]
+    fn dgyro_term_matches_analytic_angular_acceleration() {
+        let dt = 0.004f32;
+        let (f, a_amp, k) = (4.0f32, 0.2f32, 0.05f32);
+        let mut c = PidController::default_quad();
+        c.rate_lpf_tau = 0.0; // 隔离 50Hz 速率低通（否则相位混入 ✓）
+        c.set_dgyro(k, 20.0);
+        let wc = 2.0 * core::f32::consts::PI * 20.0;
+        let w0 = 2.0 * core::f32::consts::PI * f;
+        let hmag = 1.0 / (1.0 + (w0 / wc) * (w0 / wc)).sqrt();
+        let mut est = crate::vehicle::VehicleState::zero();
+        let n = 3000usize;
+        let (mut max_meas, mut max_ana) = (0.0f32, 0.0f32);
+        let (mut num, mut den) = (0.0f64, 0.0f64);
+        for i in 0..n {
+            let t = i as f32 * dt;
+            let w = a_amp * (w0 * t).sin();
+            est.omega = [RadianPerSecond(w), RadianPerSecond(0.0), RadianPerSecond(0.0)];
+            let _ = c.control_attitude(Second(dt), est.att, 0.5, &est);
+            // 输出 = −att_kd·ω − k·LPF(dω/dt) ⇒ 反解出 D 项 ✓
+            let d_meas = -(c.dbg_pqr[0] + c.att_kd * w) / k;
+            let d_ana = a_amp * w0 * hmag * (w0 * t - (w0 / wc).atan()).cos();
+            if i > n / 2 {
+                max_meas = max_meas.max(d_meas.abs());
+                max_ana = max_ana.max(d_ana.abs());
+                num += (d_meas * d_ana) as f64;
+                den += (d_ana * d_ana) as f64;
+            }
+        }
+        let ratio = max_meas / max_ana;
+        assert!(
+            (ratio - 1.0).abs() < 0.15,
+            "角加速度 D 幅度 {max_meas:.5} vs 解析 {max_ana:.5}（比 {ratio:.3}）应 ≈1 ✓"
+        );
+        let proj = (num / den) as f32;
+        assert!(
+            (proj - 1.0).abs() < 0.15,
+            "角加速度 D 与解析投影 {proj:.3} 应 ≈1（负值 ⇒ **符号错** ✗）"
+        );
+        // ③ k=0 ⇒ 完全跳过（逐位不变 ✓）
+        let mut c0 = PidController::default_quad();
+        let mut c1 = PidController::default_quad();
+        c1.set_dgyro(0.05, 20.0);
+        c1.set_dgyro(0.0, 20.0);
+        let mut est2 = crate::vehicle::VehicleState::zero();
+        for i in 0..200 {
+            let t = i as f32 * dt;
+            est2.omega = [
+                RadianPerSecond(0.2 * (w0 * t).sin()),
+                RadianPerSecond(0.1),
+                RadianPerSecond(0.0),
+            ];
+            let _ = c0.control_attitude(Second(dt), est2.att, 0.5, &est2);
+            let _ = c1.control_attitude(Second(dt), est2.att, 0.5, &est2);
+            assert_eq!(c0.dbg_pqr, c1.dbg_pqr, "k=0 必须与不启用**逐位相同** ✓");
         }
     }
 }

@@ -178,24 +178,26 @@ where
             // 每轴独立实例（Biquad 为标量滤波器，跨轴复会污染状态）。
             imu_accel_notch: [Biquad::notch(40.0, fs, 5.0); 3],
             imu_accel_lowpass: [Biquad::low_pass(20.0, fs, 0.7071); 3],
-            // ★★§5.206【③ 低通：**默认关**（实测约束，如实登记 ✗）】
-            //   一手 ✓：PX4 `IMU_GYRO_CUTOFF` default **40Hz**，但同页注释写明
+            // ★★§5.207【③ 低通：**默认 40Hz（对齐 PX4）** + 速率环联合重整定 ✓】
+            //   一手 ✓：PX4 `IMU_GYRO_CUTOFF` default **40Hz**；其注释含义 =
             //     "using a D-term filter allows to **increase** IMU_GYRO_CUTOFF … and
-            //      permits to increase the P gains" ⇒ **40Hz 与速率环增益/D 项滤波是【一起整定】的** ✓
-            //   本仓实测 ✓：挂 40Hz ⇒ `guidance_track` **14/2 破**（`sat_ratio` 超限 ✗）
-            //     （本仓注释早已记："低通会衰减姿态环角速度阻尼反馈 ⇒ 振荡" ✓）
-            //     扫截止：40/60/80Hz 均 ✗、**100Hz 才过**（而 100Hz 对 40Hz 振动几乎无衰减 ⇒ 等效关 ✓）
-            //   ⇒ **本仓速率环当前没有容纳它的余量** ✗ ⇒ 默认 **关**（恒等 ✓）；
-            //     `G_ESKF_GYR_LPF > 0` 启用（**须连同速率环重整定** ✓，见台账 §5.206 ✓）
+            //      permits to increase the P gains" ⇒ **低通 / D 项滤波 / P 增益是【一起整定】的** ✓
+            //   §5.206 首次直接照搬 40Hz ⇒ `guidance_track` 破（14/2 ✗，`sat_ratio` 超限）= **未重整定** ✓
+            //   §5.207（本节 ✓）：**按一手做联合重整定**（降 P + 加 D 阻尼 ✓）⇒ 40Hz 可开 ✓
+            //   `G_ESKF_GYR_LPF > 0` 可覆盖；≤0（含裸 bin 读 0）⇒ **40Hz** ✓
             imu_gyro_lpf: {
                 let v = unsafe {
                     core::ptr::read_volatile(core::ptr::addr_of!(
                         crate::estimator::eskf::G_ESKF_GYR_LPF))
                 };
+                // ★★§5.207：**默认 40Hz**（对齐 PX4 `IMU_GYRO_CUTOFF` ✓）—— 随 ③ 的联合重整定
+                //   一并开启 ✓（裸 bin 读 0 ⇒ 40Hz ✓）。`>0` 可覆盖 ✓。
+                // ★★§5.208：**默认关** ✓（`>0` 显式启用 ✓）——见 §5.207/§5.208：
+                //   40Hz 会推翻 `att_loop_with_estimated_attitude`（估计驱动偏差 14.78° > 门槛 10.7°）✗
                 if v > 0.0 {
                     [Biquad::low_pass(v, fs, 0.7071); 3]
                 } else {
-                    [Biquad::passthrough(); 3] // 默认：恒等（零相位 ✓）
+                    [Biquad::passthrough(); 3]
                 }
             },
             last_gyro_ctl: [0.0; 3],
