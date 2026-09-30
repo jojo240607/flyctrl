@@ -501,16 +501,16 @@ impl Controller for PidController {
     fn control(&mut self, _dt: Second, sp: &Setpoint, est: &VehicleState) -> ActuatorCmd {
         // ★§5.161 调用计数探针（唯一名 ✓ 查重名 ✓）
         unsafe {
-            let c = core::ptr::read_volatile(core::ptr::addr_of!(G_PID_CALLS));
+            let c = crate::cost::knob_read(core::ptr::addr_of!(G_PID_CALLS));
             core::ptr::write_volatile(core::ptr::addr_of_mut!(G_PID_CALLS), c.wrapping_add(1));
         }
         // 标定旋钮（易失读：由外部写入；0 是有效值故哨兵取 <0）
         {
-            let ov = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_KI_XY)) };
+            let ov = unsafe { crate::cost::knob_read(core::ptr::addr_of!(G_KI_XY)) };
             if ov >= 0.0 {
                 self.ki_xy = ov;
             }
-            let ot = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_VEL_LPF_H_TAU)) };
+            let ot = unsafe { crate::cost::knob_read(core::ptr::addr_of!(G_VEL_LPF_H_TAU)) };
             if ot >= 0.0 {
                 self.vel_lpf_h_tau = ot;
             }
@@ -524,7 +524,7 @@ impl Controller for PidController {
         // 首帧直接赋值，避免启动瞬态。
         // ★§5.165：水平速度低通 τ 可被旋钮覆盖（默认 -1 ⇒ 用字段 ✓）
         let vel_lpf_h_tau = {
-            let ov = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_VEL_LPF_TAU_K)) };
+            let ov = unsafe { crate::cost::knob_read(core::ptr::addr_of!(G_VEL_LPF_TAU_K)) };
             if ov >= 0.0 { ov } else { self.vel_lpf_h_tau }
         };
         let (est_d, est_vd) = if self.vel_lpf_tau > 0.0 {
@@ -560,7 +560,7 @@ impl Controller for PidController {
 
         // ⚠️ 旋钮读取必须在**使用之前**（初版插在使用之后 ⇒ 旋钮无效、扫描逐位相同 ✗）
         let vmax_xy_eff = {
-            let ov = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_VMAX_XY)) };
+            let ov = unsafe { crate::cost::knob_read(core::ptr::addr_of!(G_VMAX_XY)) };
             if ov > 0.0 { ov } else { self.vmax_xy }
         };
         // --- 外环：位置误差 -> 期望速度（限幅，避免饱和） ---
@@ -568,7 +568,7 @@ impl Controller for PidController {
         // 减少相位滞后（square/circle 场景 RMS 显著下降）。
         // ★§5.166d：位置环增益旋钮（默认 -1 ⇒ 字段值 ✓）
         {
-            let ov = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_KP_XY)) };
+            let ov = unsafe { crate::cost::knob_read(core::ptr::addr_of!(G_KP_XY)) };
             if ov >= 0.0 {
                 self.kp_xy = ov;
             }
@@ -590,9 +590,9 @@ impl Controller for PidController {
         // 抵消 PD 爬升指令、悬停无法恢复。
         // ★§5.196：垂向三增益运行时旋钮（默认 -1 ⇒ 编译期值 ✓ 逐位不变）
         let (kp_z_e, kv_z_e, ki_z_e) = unsafe {
-            let kp = core::ptr::read_volatile(core::ptr::addr_of!(G_KP_Z));
-            let kv = core::ptr::read_volatile(core::ptr::addr_of!(G_KV_Z));
-            let ki = core::ptr::read_volatile(core::ptr::addr_of!(G_KI_Z));
+            let kp = crate::cost::knob_read(core::ptr::addr_of!(G_KP_Z));
+            let kv = crate::cost::knob_read(core::ptr::addr_of!(G_KV_Z));
+            let ki = crate::cost::knob_read(core::ptr::addr_of!(G_KI_Z));
             (
                 if kp >= 0.0 { kp } else { self.kp_z },
                 if kv >= 0.0 { kv } else { self.kv_z },
@@ -618,7 +618,7 @@ impl Controller for PidController {
         // B3 风下所需稳态速度指令 ≈ 2.26 m/s > 2.0 ⇒ **积分撞上限**，
         // 残余稳态偏移 = (des_v_need - I_XY_MAX)/kp_xy 被这个夹子决定。
         let i_xy_max = {
-            let ov = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_I_XY_MAX)) };
+            let ov = unsafe { crate::cost::knob_read(core::ptr::addr_of!(G_I_XY_MAX)) };
             if ov >= 0.0 {
                 ov
             } else {
@@ -631,8 +631,8 @@ impl Controller for PidController {
         let mut iy_final = clampf(self.i_xy[1] + self.ki_xy * ey * dt, -i_xy_max, i_xy_max);
         // ★§5.139 诊断旋钮覆盖（默认 -1 ⇒ 不覆盖 ✓）
         unsafe {
-            let kp = core::ptr::read_volatile(core::ptr::addr_of!(G_ATT_KP));
-            let kd = core::ptr::read_volatile(core::ptr::addr_of!(G_ATT_KD));
+            let kp = crate::cost::knob_read(core::ptr::addr_of!(G_ATT_KP));
+            let kd = crate::cost::knob_read(core::ptr::addr_of!(G_ATT_KD));
             if kp > 0.0 { self.att_kp = kp; }
             if kd > 0.0 { self.att_kd = kd; }
         }
@@ -658,7 +658,7 @@ impl Controller for PidController {
         //   ⇒ 即"纠偏方向错误" ⇒ 与 §5.179 的"权限"现象自洽 ✓
         //   旋钮 `G_CONSTRAIN_XY=2` ⇒ 启用合成限幅（默认 `0` ⇒ 原逐轴行为 ✓ 逐位不变 ✓）
         let use_xy_constrain = unsafe {
-            core::ptr::read_volatile(core::ptr::addr_of!(G_CONSTRAIN_XY))
+            crate::cost::knob_read(core::ptr::addr_of!(G_CONSTRAIN_XY))
         } == 2.0;
         let (raw_vx, raw_vy) = if self.rate_mode_xy {
             (sp.vel[0].0, sp.vel[1].0)
@@ -688,7 +688,7 @@ impl Controller for PidController {
         let (mut des_vx_l, mut des_vy_l) = (des_vx, des_vy_tmp);
         {
             let amax = unsafe {
-                core::ptr::read_volatile(core::ptr::addr_of!(G_VEL_SLEW))
+                crate::cost::knob_read(core::ptr::addr_of!(G_VEL_SLEW))
             };
             if amax > 0.0 {
                 let dmax = amax * dt;
@@ -713,12 +713,12 @@ impl Controller for PidController {
         // ---- 水平**速度环积分**（消除恒定阻力下的速度偏置）----
         // 读数：标定旋钮（易失读；0 是有效值 ⇒ 哨兵取 <0）
         let ki_v_eff = {
-            let ov = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_KI_V_XY)) };
+            let ov = unsafe { crate::cost::knob_read(core::ptr::addr_of!(G_KI_V_XY)) };
             if ov >= 0.0 { ov } else { self.ki_v_xy }
         };
         // ★§5.180：上限可被旋钮覆盖（默认 2.0 ✓）
         let I_V_MAX: f32 = {
-            let ov = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_IV_MAX)) };
+            let ov = unsafe { crate::cost::knob_read(core::ptr::addr_of!(G_IV_MAX)) };
             if ov >= 0.0 { ov } else { 2.0 }
         };
         let ev_n = des_vx - est_vn;
@@ -730,14 +730,14 @@ impl Controller for PidController {
         }
         // ★§5.171：**ARW 启用时**积分更新移到饱和判定**之后**（PX4 同序 ✓）⇒ 此处先不算
         let arw_on = unsafe {
-            core::ptr::read_volatile(core::ptr::addr_of!(G_ARW))
+            crate::cost::knob_read(core::ptr::addr_of!(G_ARW))
         } == 2.0;
         // ★§5.182【对齐 PX4 一手**时序** ✓】：PX4 的 `_vel_int` 在**饱和处理之后**累积
         //   （`PositionControl.cpp:190-199` 位于 `_accelerationControl` 与推力饱和之后 ✓）；
         //   本仓原在**之前** ✗ ⇒ 积分"看到"的是**未饱和**的 `acc` ⇒ 与饱和相互作用 ✓
         //   ⇒ 旋钮 `G_IV_AFTER_SAT=2` ⇒ 移到饱和之后累积（默认 `0` ⇒ 原时序 ✓ 逐位不变 ✓）
         let iv_after_sat = unsafe {
-            core::ptr::read_volatile(core::ptr::addr_of!(G_IV_AFTER_SAT))
+            crate::cost::knob_read(core::ptr::addr_of!(G_IV_AFTER_SAT))
         } == 2.0;
         if !arw_on && !iv_after_sat {
             // 原行为 ✓（回算抗饱和：饱和时把积分置为"恰使 acc 抵达边界"的值 ✓）
@@ -747,14 +747,14 @@ impl Controller for PidController {
 
         // 运行时旋钮（阶段 7 阻尼整定）：<0 => 用编译期值 ✓
         let kv = unsafe {
-            let g = core::ptr::read_volatile(core::ptr::addr_of!(G_KV_XY));
+            let g = crate::cost::knob_read(core::ptr::addr_of!(G_KV_XY));
             if g >= 0.0 { g } else { self.kv_xy }
         };
         // ★§5.167【对齐 PX4 一手：速度环 D 项 `−Kd·vel_dot` ✓】
         //   PX4 `_vel_dot = states.acceleration`（世界系加速度 ✓）；本仓用 `est.accel`
         //   （**机体**系加速度 ✓）旋到世界系（用姿态 ✓；悬停小倾角下近似 ✓）
         let kv_d = unsafe {
-            let k = core::ptr::read_volatile(core::ptr::addr_of!(G_KV_D));
+            let k = crate::cost::knob_read(core::ptr::addr_of!(G_KV_D));
             if k >= 0.0 { k } else { 0.0 }
         };
         let (mut acc_d_n, mut acc_d_e) = (0.0f32, 0.0f32);
@@ -788,7 +788,7 @@ impl Controller for PidController {
             //   （因 `kv_d < 0` 走关闭分支 ✓）⇒ **下一步**用独立旋钮 `G_KV_D_SIGN` 定号 ✓
             // ★§5.167 定号（A/B ✓）：`G_KV_D_FLIP=2` ⇒ 反向
             let flip = unsafe {
-                core::ptr::read_volatile(core::ptr::addr_of!(G_KV_D_FLIP))
+                crate::cost::knob_read(core::ptr::addr_of!(G_KV_D_FLIP))
             } == 2.0;
             let sgn = if flip { 1.0 } else { -1.0 };
             acc_d_n = sgn * kv_d * a_lpf[0];
@@ -825,13 +825,13 @@ impl Controller for PidController {
         // 采用四元数误差内环（见下），这里把世界系期望加速度转换为期望姿态四元数。
         // 倾角上限旋钮（易失读；哨兵 <0 = 用编译期值）
         let tilt_max_eff = {
-            let ov = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_TILT_MAX)) };
+            let ov = unsafe { crate::cost::knob_read(core::ptr::addr_of!(G_TILT_MAX)) };
             if ov > 0.0 { ov } else { self.tilt_max }
         };
         // ★§5.169【PX4 `limitTilt` 语义（合成倾角限制 ✓）】
         let (tilt_n, tilt_e) = {
             let use_synth = unsafe {
-                core::ptr::read_volatile(core::ptr::addr_of!(G_TILT_LIMIT_SYNTH))
+                crate::cost::knob_read(core::ptr::addr_of!(G_TILT_LIMIT_SYNTH))
             } == 2.0;
             let (mut tn, mut te) = (acc_n / g, acc_e / g);
             if use_synth {
@@ -960,7 +960,7 @@ impl Controller for PidController {
         // 更直接地：悬停 acc_d=0 时必须得 (0,0,-g) ⇒ 取 `acc_d - g`。
         // ★§5.158 A/B：水平符号翻转（排查"外环→姿态"符号约定 ✓）
         let flip = unsafe {
-            core::ptr::read_volatile(core::ptr::addr_of!(G_ACC_FLIP))
+            crate::cost::knob_read(core::ptr::addr_of!(G_ACC_FLIP))
         } == 2.0;
         let (acc_n, acc_e) = if flip { (-acc_n, -acc_e) } else { (acc_n, acc_e) };
         let f_w = [acc_n, acc_e, acc_d - g];
@@ -1023,7 +1023,7 @@ impl Controller for PidController {
         // ⇒ 回退。下一步须**先从 mixer/plant 反解出本仓的真实机体轴约定**，
         //   再据此改写构造（而不是照搬教科书 FRD）。
         // ★§5.158 A/B：切到 legacy（注释记载：thrust 版 8× 劣化 ✗；legacy 版实测 1.305m ✓）
-        let q_des = if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ATT_LEGACY)) } == 2.0 {
+        let q_des = if unsafe { crate::cost::knob_read(core::ptr::addr_of!(G_ATT_LEGACY)) } == 2.0 {
             q_des_legacy
         } else {
             q_des_thrust

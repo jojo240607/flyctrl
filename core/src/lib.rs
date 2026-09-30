@@ -8,6 +8,7 @@
 
 #![no_std]
 
+pub mod cost;
 pub mod math;
 pub mod units;
 pub mod filter;

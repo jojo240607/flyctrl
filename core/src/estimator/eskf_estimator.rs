@@ -251,7 +251,7 @@ impl Estimator for EskfEstimator {
         crate::perf::probe(10); // ESKF: 重力辅助完成
         // 3) GPS 位置/速度 ✓
         let gps_on = unsafe {
-            core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_GPS_ON))
+            crate::cost::knob_read(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_GPS_ON))
         } != 2.0; // ★0 = 默认开 ✓（裸 bin 的 .data 初值不生效 ✗）
         if let Some(p) = pos.filter(|_| gps_on) {
             let pm = [p.pos[0].0, p.pos[1].0, p.pos[2].0];
@@ -302,9 +302,9 @@ impl Estimator for EskfEstimator {
         // ★§5.138 诊断：先验磁场覆盖（默认全 0 ⇒ 不覆盖 ⇒ 行为逐位不变 ✓）
         {
             let p = unsafe {
-                let x = core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_I_PRIOR_X));
-                let y = core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_I_PRIOR_Y));
-                let z = core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_I_PRIOR_Z));
+                let x = crate::cost::knob_read(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_I_PRIOR_X));
+                let y = crate::cost::knob_read(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_I_PRIOR_Y));
+                let z = crate::cost::knob_read(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_I_PRIOR_Z));
                 [x, y, z]
             };
             if p[0] != 0.0 || p[1] != 0.0 || p[2] != 0.0 {
@@ -334,7 +334,7 @@ impl Estimator for EskfEstimator {
             // ★§5.136 阶段2：yaw-only 路径 ⇒ **对准标定**（吸收磁偏角/安装偏置）；
             //   legacy 三轴路径（旋钮 2.0）仍走代数反解 mag_B ✓
             let yaw_only = unsafe {
-                core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_YAW_ON))
+                crate::cost::knob_read(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_YAW_ON))
             } != 2.0;
             // ★一手：instant reset 用**低通后**的场值（`_mag_lpf.getState()` ✓ 见
             //   `mag_control.cpp:223/232/282/311` 全部 `resetMagStates(_mag_lpf.getState(), …)` ✓）
@@ -352,7 +352,7 @@ impl Estimator for EskfEstimator {
         }
         // ★重锚定（§3.6 ✓）：持续旋转时把 `mag_I` 软拉回先验（旋钮默认 0 = 关 ✓）
         let ra = unsafe {
-            core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_REANCHOR))
+            crate::cost::knob_read(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_REANCHOR))
         };
         if ra > 0.0 {
             let n = self.f.reanchor_mag_i(self.mag_i_prior, ra);
@@ -361,7 +361,7 @@ impl Estimator for EskfEstimator {
         // ★磁同样降频 ✓（磁方向变化更慢 ✓）
         // ★§5.139 诊断：磁更新降频率可覆盖（默认 0 ⇒ 用 aid_period ✓ 逐位不变）
         let mp = unsafe {
-            core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_PERIOD))
+            crate::cost::knob_read(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_PERIOD))
         };
         let peri = if mp >= 1.0 { mp as u32 } else { self.aid_period.max(1) };
         if self.aid_div % peri != 0 {
@@ -374,7 +374,7 @@ impl Estimator for EskfEstimator {
         //   3D 失稳发散；周期性重锚把该漂移**清零**（而非软拉回 ✗ 实测 reanchor 有害 ✓）
         {
             let period = unsafe {
-                core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_RESET_PERIOD))
+                crate::cost::knob_read(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_RESET_PERIOD))
             };
             if period >= 1.0 {
                 self.mag_reset_div = self.mag_reset_div.wrapping_add(1);
@@ -398,14 +398,14 @@ impl Estimator for EskfEstimator {
         //   旋钮 `G_ESKF_MAG_YAW_ON`：2.0 ⇒ 强制 heading（A/B ✓）；3.0 ⇒ 强制 3D（对照 ✓）；
         //     其余 ⇒ AUTO（上述一手判据 ✓）
         let knob = unsafe {
-            core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_YAW_ON))
+            crate::cost::knob_read(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_YAW_ON))
         };
         // ★§5.139【一手 `mag_control.cpp:488-500`】：**先**算航向新息并更新低通
         //   （`mag_heading_consistent` 的判据输入；3D 路径下也必须更新 ✓）。
         //   ⚠️纪律（H 场三表对默认路径敏感 ✓ 实测×3）：**仅当"航向一致性门控"启用**
         //   （`G_ESKF_MAG_HDG_GATE == 2.0`）时才调用 ⇒ 默认路径**逐位不变** ✓
         let hdg_gate_on = unsafe {
-            core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_HDG_GATE))
+            crate::cost::knob_read(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_HDG_GATE))
         } == 2.0;
         if hdg_gate_on {
             let _ = self.f.mag_heading_innov(m);
@@ -456,8 +456,8 @@ impl Estimator for EskfEstimator {
         //   （实测：无条件走 ext（即使 delay=0）⇒ 真机 heading 冒烟由 0.0°/0.00m 劣化为
         //    19.3°/11.8m ✗ ⇒ demo 失败；改为条件进入后恢复完美 ✓）
         let ext_on = unsafe {
-            core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_DELAY_MS)) > 0.0
-                || core::ptr::read_volatile(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_CHECK)) == 2.0
+            crate::cost::knob_read(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_DELAY_MS)) > 0.0
+                || crate::cost::knob_read(core::ptr::addr_of!(crate::estimator::eskf::G_ESKF_MAG_CHECK)) == 2.0
         };
         let r = if yaw_only {
             self.f.update_mag_yaw(m)

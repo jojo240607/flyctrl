@@ -179,7 +179,7 @@ where
                 fs,
                 {
                     let qk = unsafe {
-                        core::ptr::read_volatile(core::ptr::addr_of!(
+                        crate::cost::knob_read(core::ptr::addr_of!(
                             crate::estimator::eskf::G_ESKF_GYR_NOTCH_Q))
                     };
                     // ★§5.136 终版默认 **Q=2.0**（原 5.0）：实测 Q=5 在 9Hz 处相位滞后
@@ -413,7 +413,7 @@ where
                         acc[i] = self.imu_accel_lowpass[i].process(self.imu_accel_notch[i].process(a[i]));
                         // ★§5.136 A/B 旋钮：G_ESKF_BYPASS_GYR_NOTCH=2 ⇒ 旁路陀螺陷波
                         let bypass = unsafe {
-                            core::ptr::read_volatile(core::ptr::addr_of!(
+                            crate::cost::knob_read(core::ptr::addr_of!(
                                 crate::estimator::eskf::G_ESKF_BYPASS_GYR_NOTCH))
                         } == 2.0;
                         gy[i] = if bypass {

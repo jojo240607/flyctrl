@@ -772,11 +772,11 @@ impl Eskf {
         //   实测过度自信 v=204× / b=61× / p=4× ⇒ 需把 Q 放大 ~100~200 倍 ✓
         for i in 0..3 {
             // ★整定旋钮（默认 1.0 × 1e-4 ⇒ 与参照 ekf2_gyr_noise 同量级 ✓）
-            let qa = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_Q_ATT)) }
-                * unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_Q_ATT_BASE)) };
+            let qa = unsafe { crate::cost::knob_read(core::ptr::addr_of!(G_ESKF_Q_ATT)) }
+                * unsafe { crate::cost::knob_read(core::ptr::addr_of!(G_ESKF_Q_ATT_BASE)) };
             q[I_ATT + i][I_ATT + i] = qa * dt;
             let qvk = unsafe {
-                core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_Q_VEL_K))
+                crate::cost::knob_read(core::ptr::addr_of!(G_ESKF_Q_VEL_K))
             };
             let qvk = if qvk > 0.0 { qvk } else { 1.0 };
             q[I_VEL + i][I_VEL + i] = 2.0 * dt * qvk;
@@ -800,7 +800,7 @@ impl Eskf {
             //   机理：Q 过小 ⇒ P 速降 ⇒ 增益塌陷 ⇒ 冻结 ✓ ⇒ 提高 Q 以维持可修正性 ✓
             // ★§5.136 诊断：冻结旋钮 ⇒ 磁两态过程噪声置 0 ✓
             let frz = unsafe {
-                core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_FREEZE))
+                crate::cost::knob_read(core::ptr::addr_of!(G_ESKF_MAG_FREEZE))
             } == 2.0;
             q[I_MAGI + i][I_MAGI + i] = if frz { 0.0 } else { 1e-3 * dt };
             q[I_MAGB + i][I_MAGB + i] = if frz { 0.0 } else { 1e-3 * dt };
@@ -813,9 +813,9 @@ impl Eskf {
         {
             let k = {
                 let frz = unsafe {
-                    core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_FREEZE))
+                    crate::cost::knob_read(core::ptr::addr_of!(G_ESKF_MAG_FREEZE))
                 } == 2.0;
-                if frz { 0.0 } else { unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_VAR_FLOOR)) } }
+                if frz { 0.0 } else { unsafe { crate::cost::knob_read(core::ptr::addr_of!(G_ESKF_VAR_FLOOR)) } }
             };
             let f_mi = 1e-3f32 * k; // sq(ekf2_mag_e_noise) 量级 ✓
             let f_mb = 1e-4f32 * k; // sq(ekf2_mag_b_noise) 量级 ✓
@@ -973,7 +973,7 @@ impl Eskf {
 
     /// 气压高度（标量 ✓，h = −d ✓ 已数值验证 ✓）
     pub fn update_baro(&mut self, alt: f32) -> Result<f32, &'static str> {
-        if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_BARO_ON)) } == 2.0 {
+        if unsafe { crate::cost::knob_read(core::ptr::addr_of!(G_ESKF_BARO_ON)) } == 2.0 {
             return Err("气压：消融开关关闭 ✓（诊断用，非静默 ✗）");
         }
         let mut h = [0.0f32; N];
@@ -1018,7 +1018,7 @@ impl Eskf {
     pub fn update_gravity(&mut self, accel_body: [f32; 3], g_ned: [f32; 3]) -> Result<u32, &'static str> {
         // ★★**0 = 默认开** ✓（固件裸 bin 加载 ⇒ `.data` 初值不生效 ⇒ 旋钮读到 0 ✗）
         //   显式关闭用 **2.0** ✓（2026-09-23，§5.52 ✓）—— 否则诊断开关会把观测全关 ✗
-        if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_GRAV_ON)) } == 2.0 {
+        if unsafe { crate::cost::knob_read(core::ptr::addr_of!(G_ESKF_GRAV_ON)) } == 2.0 {
             return Err("重力辅助：对照臂【旋钮关闭】✓（实验用，非静默 ✗）");
         }
         let an = crate::math::sqrt(
@@ -1052,7 +1052,7 @@ impl Eskf {
         //   由 `HilContext` 从实际滤波器系数导出 ✓）；<0 ⇒ 关（A/B）；>0 ⇒ 覆盖（ms，整定用 ✓）。
         let tau_s = {
             let ov = unsafe {
-                core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_ACC_LAG_MS))
+                crate::cost::knob_read(core::ptr::addr_of!(G_ESKF_ACC_LAG_MS))
             };
             if ov < 0.0 {
                 0.0
@@ -1125,7 +1125,7 @@ impl Eskf {
                 //   roll/pitch 可观测性（验收表口径 ✓），但"mag_I↔mag_B 对倒"零空间消失
                 //   ⇒ mag_I 三轴可观测 ⇒ 无慢漂（对照方案 B：仅 yaw ⇒ 丢 roll/pitch 信息 ✗）
                 let freeze_magb = unsafe {
-                    core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_FREEZE_B))
+                    crate::cost::knob_read(core::ptr::addr_of!(G_ESKF_MAG_FREEZE_B))
                 } != 2.0;
                 e.d_mag_b[kk] = if freeze_magb { 0.0 } else { dx[I_MAGB + kk] };
             }
@@ -1171,7 +1171,7 @@ impl Eskf {
     }
 
     pub fn reset_mag_states(&mut self, meas: [f32; 3], mag_i_prior: [f32; 3]) {
-        if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_ON)) } < 0.5 {
+        if unsafe { crate::cost::knob_read(core::ptr::addr_of!(G_ESKF_MAG_ON)) } < 0.5 {
             return;
         }
         self.mag_i = mag_i_prior;
@@ -1321,7 +1321,7 @@ impl Eskf {
         //   （`mag_control.cpp::checkMagField` 首行：`if (ekf2_mag_check == 0) return true;`）
         //   本仓旋钮 `G_ESKF_MAG_CHECK`：`2.0` ⇒ 启用检查（A/B ✓）；其余（含裸 bin 的 0）⇒ 关闭 ✓
         let en = unsafe {
-            core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_CHECK))
+            crate::cost::knob_read(core::ptr::addr_of!(G_ESKF_MAG_CHECK))
         };
         if en != 2.0 {
             self.mag_field_disturbed = false;
@@ -1375,7 +1375,7 @@ impl Eskf {
     ///    · 新息 `wrap_pi(decl_pred − decl_meas)`；`S = P[magi][magi] 相关项 + R`；NIS 门 ✓
     ///    · **只更新 mag_I/mag_B，不更新姿态/速度**（PX4 `update_all_states=false` 分支 ✓）
     pub fn fuse_declination(&mut self, decl_meas_rad: f32, r_decl: f32) -> Result<f32, &'static str> {
-        if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_ON)) } == 2.0 {
+        if unsafe { crate::cost::knob_read(core::ptr::addr_of!(G_ESKF_MAG_ON)) } == 2.0 {
             return Err("磁偏角：对照臂【旋钮关闭】✓");
         }
         let h = crate::math::atan2(self.mag_i[1], self.mag_i[0]); // decl_pred ✓
@@ -1461,7 +1461,7 @@ impl Eskf {
     }
 
     pub fn update_mag_yaw(&mut self, meas_body: [f32; 3]) -> Result<f32, &'static str> {
-        if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_ON)) } == 2.0 {
+        if unsafe { crate::cost::knob_read(core::ptr::addr_of!(G_ESKF_MAG_ON)) } == 2.0 {
             return Err("磁量测：对照臂【旋钮关闭】✓（实验用，非静默 ✗）");
         }
         // ★§5.136【对齐 PX4】入口先做**磁干扰检测**（强度/倾角）⇒ 不合格拒融合 ✓
@@ -1486,7 +1486,7 @@ impl Eskf {
         //   姿态回退等价实现）：把预测机体场从【当前时刻】回退到【采样时刻】——
         //   q_sample ≈ q_now ⊖ ω·Δt（Δt = 延迟 ms）⇒ pred_b = R(q_sample)ᵀ·mag_I ✓
         let delay_ms = unsafe {
-            core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_DELAY_MS))
+            crate::cost::knob_read(core::ptr::addr_of!(G_ESKF_MAG_DELAY_MS))
         };
         let q_used = if delay_ms > 0.0 {
             let dt = (delay_ms * 1e-3f32).min(0.05); // 上限 50ms 防呆 ✓
@@ -1617,12 +1617,12 @@ impl Eskf {
     ///   （`ekf2_mag_delay` ✓）。**独立入口**，默认不调用 ⇒ `update_mag` 保持逐位等价
     ///   （实测：任何插进默认路径的等价改动都会扰动 att_est 三表 ✗ ⇒ 纪律性隔离 ✓）
     pub fn update_mag_ext(&mut self, meas_body: [f32; 3]) -> Result<f32, &'static str> {
-        if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_CHECK)) } == 2.0
+        if unsafe { crate::cost::knob_read(core::ptr::addr_of!(G_ESKF_MAG_CHECK)) } == 2.0
             && !self.check_mag_field(meas_body)
         {
             return Err("磁量测：磁场受扰（强度/倾角超差）⇒ 拒融合 ✓");
         }
-        let delay = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_DELAY_MS)) };
+        let delay = unsafe { crate::cost::knob_read(core::ptr::addr_of!(G_ESKF_MAG_DELAY_MS)) };
         if delay <= 0.0 {
             return self.update_mag(meas_body); // 无对齐需求 ⇒ 原路径 ✓
         }
@@ -1663,14 +1663,14 @@ impl Eskf {
         // ★§5.139 诊断：融合前低通（默认 0 ⇒ 关 ✓ 逐位不变）
         let _meas_body = {
             let tau_ms = unsafe {
-                core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_PRE_LPF_MS))
+                crate::cost::knob_read(core::ptr::addr_of!(G_ESKF_MAG_PRE_LPF_MS))
             };
             if tau_ms > 0.0 {
                 let tau = tau_ms * 1e-3f32;
                 let dt = 0.004f32;
                 let a = dt / (dt + tau);
                 let init = unsafe {
-                    core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_PRE_LPF_ST))
+                    crate::cost::knob_read(core::ptr::addr_of!(G_ESKF_MAG_PRE_LPF_ST))
                 };
                 let mut out = [0.0f32; 3];
                 for k in 0..3 {
@@ -1687,7 +1687,7 @@ impl Eskf {
             }
         };
         let meas_body = _meas_body;
-        if unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_MAG_ON)) } == 2.0 {
+        if unsafe { crate::cost::knob_read(core::ptr::addr_of!(G_ESKF_MAG_ON)) } == 2.0 {
             return Err("磁量测：对照臂【旋钮关闭】✓（实验用，非静默 ✗）");
         }
         let mut worst = 0.0f32;
@@ -1708,7 +1708,7 @@ impl Eskf {
             }
             let mut s_ = self.r_mag;
             // ★§5.139 诊断倍率（默认 0 ⇒ 不生效 ⇒ 逐位不变 ✓）——3D 融合路径 ✓
-            let rk3 = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_R_MAG_K)) };
+            let rk3 = unsafe { crate::cost::knob_read(core::ptr::addr_of!(G_ESKF_R_MAG_K)) };
             if rk3 > 0.0 { s_ *= rk3; }
             for k in 0..N {
                 s_ += h[k] * ph[k];
@@ -1722,7 +1722,7 @@ impl Eskf {
             }
             let nis = resid.abs() / crate::math::sqrt(s_);
             let gate_eff = {
-                let g = unsafe { core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_GATE)) };
+                let g = unsafe { crate::cost::knob_read(core::ptr::addr_of!(G_ESKF_GATE)) };
                 if g > 0.0 { g } else { self.gate }
             };
             if nis > gate_eff {
