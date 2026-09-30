@@ -342,13 +342,13 @@ const PARAM_MAX: [f32; 5] = [5.0, 5.0, 5.0, 5.0, 1.0];
 /// `[0.3,0.5,0.8,1.5,0.5]` 初值会被丢弃、运行期全 0。必须在 `init_param_defaults()`
 /// 里显式写入（与 mod.rs 里 EST_STATE 的运行时填充同款手法）。
 #[link_section = ".rust_bss"]
-static mut G_PARAM_VALS: [f32; 5] = [0.3, 0.5, 1.5, 1.5, 0.5]; // ★§5.194 kv_xy 0.8→1.5
+static mut G_PARAM_VALS: [f32; 5] = [0.3, 0.5, 3.0, 1.5, 0.5]; // ★§5.195 kv_xy 0.8→3.0 ✓
 
 /// 运行时填充 G_PARAM_VALS 初始值（`.rust_bss` 初值被加载器清零，必须显式写）。
 /// 由 spawn_flyctrl 在任务创建前调用一次。
 pub fn init_param_defaults() {
     unsafe {
-        *core::ptr::addr_of_mut!(G_PARAM_VALS) = [0.3, 0.5, 0.8, 1.5, 0.5];
+        *core::ptr::addr_of_mut!(G_PARAM_VALS) = [0.3, 0.5, 3.0, 1.5, 0.5];
     }
 }
 
