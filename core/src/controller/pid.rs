@@ -905,20 +905,16 @@ impl Controller for PidController {
         let f_w_mag = crate::math::sqrt(
             acc_n * acc_n + acc_e * acc_e + (acc_d - g) * (acc_d - g),
         );
-        // ★★§5.197 A/B：`G_THRUST_COS_ACTUAL=2` ⇒ 用**实际（估计）**倾角的 cos ✓
-        let cos_tilt = {
-            let use_actual = unsafe {
-                core::ptr::read_volatile(core::ptr::addr_of!(G_THRUST_COS_ACTUAL))
-            } == 2.0;
-            if use_actual {
-                // 机体 z 轴（NED 下向）旋到世界系 ⇒ 其 z 分量 = cos(实际倾角) ✓
-                let bz = crate::vehicle::rotate_vec_by_quat(est.att, [0.0, 0.0, 1.0]);
-                bz[2].abs().clamp(0.2, 1.0)
-            } else if f_w_mag > 1e-3 {
-                ((acc_d - g).abs() / f_w_mag).clamp(0.2, 1.0)
-            } else {
-                1.0
-            }
+        // ★§5.201：**回退 §5.197 的每拍旋钮读** ✓ —— A/B 已**否证**该假设（用实际倾角更差 ✓），
+        //   且实测**每拍 `read_volatile` 会吃掉控制预算** ⇒ 把 `x_env_motion::turn_yaw_rate_tracks`
+        //   推过边缘（`est_omz` 掉到 0.087 vs 真值 0.5 ✗，与 §5.186 的预算类回归同签名 ✓；
+        //   对照实验：**只加 static 不读 ⇒ 4/0 ✓ 通过** ⇒ 定因为"每拍读"而非布局 ✓）。
+        //   ⇒ 结论：**调参旋钮不是免费的**（§5.192 `cost_guard` 只数超越函数 ⇒ **未覆盖 volatile 读** ✗）。
+        //   A/B 已在 §5.197 完成并登记；需要时临时加回。
+        let cos_tilt = if f_w_mag > 1e-3 {
+            ((acc_d - g).abs() / f_w_mag).clamp(0.2, 1.0)
+        } else {
+            1.0
         };
         let tilt_mag = crate::math::atan2(
             crate::math::sqrt(acc_n * acc_n + acc_e * acc_e),
