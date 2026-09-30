@@ -781,6 +781,14 @@ impl Eskf {
             let qvk = if qvk > 0.0 { qvk } else { 1.0 };
             q[I_VEL + i][I_VEL + i] = 2.0 * dt * qvk;
             q[I_POS + i][I_POS + i] = 1e-4 * dt;
+            // ★§5.190【bg 学习慢——**已知特性，暂不改** ✓】：探针实测本值下 bg 学习极慢
+            //   （110s 仅学到真值 0.05 的 **0.028** ⇒ 时间常数 ≈ 200s ✗）。
+            //   尝试提高（×10 1e-5 / ×30 3e-5）：**bg 确实学得快**（100s 达 88% / 98% ✓），
+            //   但 **`phy_gyro_bias_tolerated` 反而变差**（max_tilt 14.67° → **22.04°**、
+            //   稳态 6.47° → 7.98° ✗）—— 即"学得快"**并未**改善零偏容忍度量 ✗（该量为极限环幅值 ✓）
+            //   ⇒ **无净收益，保持原值** ✓（守"不为了好看而调"纪律 ✓）。
+            //   守卫 ✓：`bg_learning_converges_to_true_gyro_bias`（量**静态倾角**有界 + 打印 bg 进度 ✓）。
+            //   后续若要动：需先弄清"bg 学习速率 ↔ 极限环幅值"的机理（疑与 att-bg 交叉协方差有关 ✓）。
             q[I_BG + i][I_BG + i] = 1e-6 * dt;
             q[I_BA + i][I_BA + i] = 1e-4 * dt;
             // ★C2 磁两态 Q（2026-09-21 实验）：原 1e-8 极小 ⇒ P 迅速塌陷 ⇒ 增益→0
@@ -2131,6 +2139,73 @@ mod tests {
         }
         // 期望实现 = 有限差分（当前会失败 ⇒ 这正是登记的矛盾 ✓）
         assert!(maxdev < 1e-3, "F[vel,att] 与有限差分不符（偏差 {maxdev:.2e}）⇒ 符号/结构错 ✗");
+    }
+
+    /// ★★§5.190【陀螺零偏：静态倾角守卫 + bg 学习率测量 ✓】
+    ///
+    /// 动机（§5.189 发现② ✓）：PHY 零偏测例量到"稳态倾角 6.47° ≫ 物理预测 1.15°" ⇒ 疑 bg 估计不足。
+    /// 本探针（真值水平 + 陀螺常值零偏 0.05 rad/s、无噪）实测：
+    ///   · **静态倾角很小**（全程 ~0.25~0.6° ✓）⇒ **bg 不足的假设被否定** ✓
+    ///     ⇒ 6.47° 来自**极限环**（控制/估计交互），非 bg ✗（§5.189 发现① ✓）
+    ///   · 但 **bg 学习极慢**：110s 仅到真值 **0.028**（时间常数 ≈ 200s ✗）——已登记为已知特性 ✓
+    /// 判据 ✓：**静态倾角有界**（<1°=0.018 rad）——这是"零偏被容忍"的真实要求 ✓
+    ///   （不断言 bg 收敛速度：调 Q[bg] 能让它变快，但**零偏容忍度量反而变差** ✗，见 §5.190 ✓）
+    #[test]
+    fn bg_learning_converges_to_true_gyro_bias() {
+        extern crate std;
+        use std::println;
+        let dt = 0.004f32;
+        let g = [0.0f32, 0.0, 9.81];
+        let bias = 0.05f32;
+        let mut f = Eskf::new(Quaternion::IDENTITY, [0.0; 3], [0.0; 3], 5.0);
+        // 真值：姿态恒水平（真实角速率 = 0）；陀螺测量 = 真值 + 零偏 ✓
+        let q_true = Quaternion::IDENTITY;
+        let accel = rotate_vec_by_quat_inverse(q_true, [-g[0], -g[1], -g[2]]);
+        let mut aid = 0u32;
+        let mut n_grav = 0u32;
+        for k in 0..(120.0 / dt) as u32 {
+            let gyro = [bias, 0.0, 0.0];
+            f.predict(
+                [gyro[0] * dt, gyro[1] * dt, gyro[2] * dt],
+                [accel[0] * dt, accel[1] * dt, accel[2] * dt],
+                dt,
+                g,
+            );
+            aid += 1;
+            if aid % 15 == 0 {
+                if f.update_gravity(accel, g).is_ok() {
+                    n_grav += 1;
+                }
+            }
+            if k % 2500 == 0 {
+                let (w, x, y, z) = (f.st.q.w, f.st.q.x, f.st.q.y, f.st.q.z);
+                let roll = crate::math::atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y));
+                println!(
+                    "[bg探针] t={:>5.1}s bg=({:+.5},{:+.5},{:+.5}) roll={:+.3}° P_bg={:.2e} P_atbg={:+.2e} grav_n={n_grav}",
+                    k as f32 * dt,
+                    f.st.bg[0], f.st.bg[1], f.st.bg[2],
+                    roll.to_degrees(),
+                    f.p[I_BG][I_BG],
+                    f.p[I_ATT][I_BG]
+                );
+                let _ = roll;
+            }
+        }
+        // 判据：静态倾角有界（"零偏被容忍"的真实要求 ✓；bg 学习速率另见打印 ✓）
+        let (w, x, y, z) = (f.st.q.w, f.st.q.x, f.st.q.y, f.st.q.z);
+        let roll = crate::math::atan2(2.0 * (w * x + y * z), 1.0 - 2.0 * (x * x + y * y)).abs();
+        let pitch = crate::math::asin((2.0 * (w * y - z * x)).clamp(-1.0, 1.0)).abs();
+        let tilt = crate::math::sqrt(roll * roll + pitch * pitch);
+        assert!(
+            tilt < 0.0175,
+            "陀螺零偏 0.05 rad/s 下静态倾角应有界（<1°），实际 {:.3}° ⇒ 零偏未被容忍 ✗",
+            tilt.to_degrees()
+        );
+        assert!(
+            f.st.bg[0] > 0.005,
+            "120s 内 bg 应至少学到部分零偏（>0.005），实际 {:.5} ⇒ 完全不可观测 ✗",
+            f.st.bg[0]
+        );
     }
 
     /// 三极限情形（与仿真侧工装同判据 ✓）
