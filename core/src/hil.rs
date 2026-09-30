@@ -130,6 +130,13 @@ where
     /// 从稳定（tilt≈4°）恶化到翻滚（tilt>18°））。40Hz 窄带陷波（Q=5，带宽 36~44Hz）
     /// 只切除振动带，在姿态环带宽（~5Hz）处零相位/幅值影响，直流/低频角速度无失真。
     pub imu_gyro_notch: [Biquad; 3],
+    /// ★★§5.206【对齐 PX4 一手 `IMU_GYRO_CUTOFF` ✓】控制器侧陀螺**低通**（默认 40Hz
+    /// 2 阶 Butterworth ✓）。PX4 的滤波链（`VehicleAngularVelocity.cpp:761-771` ✓）：
+    ///   `动态陷波 → NF0 → NF1 → **低通(40Hz)**` —— **仅喂控制器** ✓
+    ///   （参数表三处写明 "only affects the signal sent to the **controllers**, not the estimators" ✓）
+    pub imu_gyro_lpf: [Biquad; 3],
+    /// 本拍**控制器侧**陀螺（经 陷波(opt-in) → 低通(40Hz) ✓）——用于覆盖喂给控制器的 `omega` ✓
+    pub last_gyro_ctl: [f32; 3],
 }
 
 use crate::perf::probe;
@@ -171,25 +178,58 @@ where
             // 每轴独立实例（Biquad 为标量滤波器，跨轴复会污染状态）。
             imu_accel_notch: [Biquad::notch(40.0, fs, 5.0); 3],
             imu_accel_lowpass: [Biquad::low_pass(20.0, fs, 0.7071); 3],
+            // ★★§5.206【③ 低通：**默认关**（实测约束，如实登记 ✗）】
+            //   一手 ✓：PX4 `IMU_GYRO_CUTOFF` default **40Hz**，但同页注释写明
+            //     "using a D-term filter allows to **increase** IMU_GYRO_CUTOFF … and
+            //      permits to increase the P gains" ⇒ **40Hz 与速率环增益/D 项滤波是【一起整定】的** ✓
+            //   本仓实测 ✓：挂 40Hz ⇒ `guidance_track` **14/2 破**（`sat_ratio` 超限 ✗）
+            //     （本仓注释早已记："低通会衰减姿态环角速度阻尼反馈 ⇒ 振荡" ✓）
+            //     扫截止：40/60/80Hz 均 ✗、**100Hz 才过**（而 100Hz 对 40Hz 振动几乎无衰减 ⇒ 等效关 ✓）
+            //   ⇒ **本仓速率环当前没有容纳它的余量** ✗ ⇒ 默认 **关**（恒等 ✓）；
+            //     `G_ESKF_GYR_LPF > 0` 启用（**须连同速率环重整定** ✓，见台账 §5.206 ✓）
+            imu_gyro_lpf: {
+                let v = unsafe {
+                    core::ptr::read_volatile(core::ptr::addr_of!(
+                        crate::estimator::eskf::G_ESKF_GYR_LPF))
+                };
+                if v > 0.0 {
+                    [Biquad::low_pass(v, fs, 0.7071); 3]
+                } else {
+                    [Biquad::passthrough(); 3] // 默认：恒等（零相位 ✓）
+                }
+            },
+            last_gyro_ctl: [0.0; 3],
             // ★§5.136：陀螺陷波 Q 可配（A/B 定位 9Hz 姿态振荡的相位来源：
             //   实测 Q=5 时 9Hz 处相位滞后使姿态环越过临界 ⇒ 增长型振荡 ✗；
             //   旋钮 `G_ESKF_GYR_NOTCH_Q` >0 ⇒ 覆盖 Q（默认 5.0 保持既有行为 ✓）
-            imu_gyro_notch: [Biquad::notch(
-                40.0,
-                fs,
-                {
-                    let qk = unsafe {
-                        crate::cost::knob_read(core::ptr::addr_of!(
-                            crate::estimator::eskf::G_ESKF_GYR_NOTCH_Q))
-                    };
-                    // ★§5.136 终版默认 **Q=2.0**（原 5.0）：实测 Q=5 在 9Hz 处相位滞后
-                    //   吃掉姿态环裕度 ⇒ 增长型振荡（tilt 14°/漂移 6.4m ✗）；Q=2 下
-                    //   相位代价可接受（60s 全程完美 0.0°/0.01m ✓），且保留振动带抑制 ✓
-                    //   （对齐商用：PX4 `IMU_GYRO_NF0_*` 默认不启用陷波，启用时取保守 Q ✓）
-                    if qk > 0.0 { qk } else { 2.0 }
-                },
-            ); 3],
-        };
+            // ★★§5.206【对齐 PX4 一手 ✓✓】陀螺陷波：**默认禁用** + **BW 参数化** ✓
+            //   PX4：`IMU_GYRO_NF0_FRQ` default **0**（0 ⇒ **不 apply** ✓）、`IMU_GYRO_NF0_BW` default **20Hz** ✓
+            //   ⇒ `Q = f0 / BW` ✓（一手 `:176` 用 BW 调参 ✓）；opt-in 场景 = **结构共振** ✓
+            //   本仓历史（§5.136）：默认开 40Hz Q=2（为抑 40Hz 振动 ✓）——实测它吃掉 ~3.5~5dB 裕度 ✗
+            //   ⇒ 现按一手**改默认关** ✓（需要时由 `G_ESKF_GYR_NOTCH_FRQ` 开启 ✓）
+            //   ⚠️兼容：§5.136 的 `G_ESKF_GYR_NOTCH_Q`（>0 ⇒ 覆盖 Q ✓）保留 ✓
+            imu_gyro_notch: {
+                let frq = unsafe {
+                    core::ptr::read_volatile(core::ptr::addr_of!(
+                        crate::estimator::eskf::G_ESKF_GYR_NOTCH_FRQ))
+                };
+                let bw = unsafe {
+                    core::ptr::read_volatile(core::ptr::addr_of!(
+                        crate::estimator::eskf::G_ESKF_GYR_NOTCH_BW))
+                };
+                let bw = if bw > 0.0 { bw } else { 20.0 }; // 一手 default ✓
+                let q_ov = unsafe {
+                    core::ptr::read_volatile(core::ptr::addr_of!(
+                        crate::estimator::eskf::G_ESKF_GYR_NOTCH_Q))
+                };
+                if frq > 0.0 {
+                    let q = if q_ov > 0.0 { q_ov } else { frq / bw };
+                    [Biquad::notch(frq, fs, q); 3]
+                } else {
+                    // 0 ⇒ 禁用（一手语义 ✓）：恒等滤波（零相位/零开销 ✓）
+                    [Biquad::passthrough(); 3]
+                }
+            },        };
         // ★★§5.187【比力低通延迟 τ 的自动标定 ✓】：从**实际滤波器系数**导出群延迟
         //   （比力链路：40Hz 陷波 → 20Hz Butterfly 低通 ✓），写入估计器供重力辅助补偿 ✓。
         //   · 参考频率取 **1Hz**：群延迟在飞行频段（≈0.5~5Hz）内近似平坦 ✓（实测
@@ -422,14 +462,25 @@ where
                             self.imu_gyro_notch[i].process(g[i])
                         };
                     }
+                    // ★★§5.206【双链（对齐 PX4 一手 ✓✓）】：
+                    //   · **估计器**：加速度经滤波（供重力辅助 ✓）+ **陀螺走原始** ✓
+                    //     （PX4：陷波/低通 "not the estimators" ✓ ⇒ EKF2 用未滤波陀螺 ✓）
+                    //   · **控制器**：陀螺经 `陷波(opt-in, 默认关 ✓) → 低通(40Hz ✓)` ✓
+                    //     本拍算好存 `last_gyro_ctl`，在调控制律前覆盖 `est.omega` ✓
                     let filtered = ImuSample {
                         accel: [
                             MeterPerSecondSquared(acc[0]),
                             MeterPerSecondSquared(acc[1]),
                             MeterPerSecondSquared(acc[2]),
                         ],
-                        gyro: [RadianPerSecond(gy[0]), RadianPerSecond(gy[1]), RadianPerSecond(gy[2])],
+                        // 估计器侧：**原始陀螺**（不过陷波/低通 ✓，一手语义 ✓）
+                        gyro: [RadianPerSecond(g[0]), RadianPerSecond(g[1]), RadianPerSecond(g[2])],
                     };
+                    // 控制器侧链：陷波（`imu_gyro_notch`，默认恒等 ✓）→ 低通（40Hz ✓）
+                    for i in 0..3 {
+                        let nf = self.imu_gyro_notch[i].process(gy[i]);
+                        self.last_gyro_ctl[i] = self.imu_gyro_lpf[i].process(nf);
+                    }
                     self.last_real_imu = Some(filtered);
                     filtered
                 }
@@ -583,6 +634,10 @@ where
         {
             // ★§5.166 诊断：真值覆盖（默认 None ⇒ 不改变 ✓）
             let mut est_for_ctrl = est_state;
+            // ★§5.206：喂控制器的角速度 = **控制器侧链**（陷波→低通 ✓），非估计器那个 ✓
+            for k in 0..3 {
+                est_for_ctrl.omega[k] = crate::units::RadianPerSecond(self.last_gyro_ctl[k]);
+            }
             if let Some((f, mask)) = self.truth_overlay {
                 let (p, v, q) = f();
                 if mask & 1 != 0 {

@@ -97,6 +97,23 @@ pub const MAG_DELAY_DEFAULT_MS: f32 = 1.5;
 pub static mut G_ESKF_BYPASS_GYR_NOTCH: f32 = 0.0;
 /// ★§5.136 A/B 旋钮：陀螺陷波 Q 覆盖（>0 生效；默认 0 = 用既有 5.0 ✓）
 pub static mut G_ESKF_GYR_NOTCH_Q: f32 = 0.0;
+/// ★★§5.206【对齐 PX4 一手 ✓】陀螺陷波的**中心频率**（Hz）——**默认 0 = 禁用** ✓。
+///   PX4 一手（`imu_gyro_parameters.yaml` ✓）：`IMU_GYRO_NF0_FRQ` **default 0.0**，
+///   且实现里**仅当 `notch_freq > 0` 才 apply** ✓（`VehicleAngularVelocity.cpp:761` ✓）；
+///   用途注释："avoid feedback amplification of **structural resonances**" ✓ ⇒ **按需开启** ✓。
+///   实测（§5.205 ✓）：本仓原为"默认开 40Hz Q=2" ⇒ 吃掉 **~3.5~5dB** 增益裕度 ✗。
+///   ⚠️裸 bin 的 `.data` 不初始化 ⇒ 读到 0 ⇒ **等价于关闭** ✓（正是想要的默认 ✓）。
+pub static mut G_ESKF_GYR_NOTCH_FRQ: f32 = 0.0;
+/// ★★§5.206【对齐 PX4 一手 ✓】陷波**带宽**（Hz）——PX4 `IMU_GYRO_NF0_BW` **default 20.0** ✓。
+///   关系：`Q = f0 / BW` ✓（PX4 参数化用 BW；本仓原用 Q ✓ ⇒ 现按一手改 BW ✓）。
+///   ≤0（含裸 bin 读 0）⇒ 用 20Hz ✓。
+pub static mut G_ESKF_GYR_NOTCH_BW: f32 = 0.0;
+/// ★★§5.206【③ 控制器侧陀螺低通截止（Hz）】——PX4 `IMU_GYRO_CUTOFF` default **40.0** ✓。
+///   ⚠️**本仓默认 0 = 关闭** ✗（与 PX4 不同，理由实测 ✓）：挂 40Hz ⇒ `guidance_track` 破（`sat_ratio` ✗）；
+///   扫截止 40/60/80 均 ✗、100 才 ✓（≈ 无衰减 ⇒ 等效关 ✓）⇒ **速率环暂无余量容纳它** ✗。
+///   要启用（对齐 PX4 ✓）⇒ 必须**连同速率环增益 + D 项滤波一起重整定** ✓（PX4 一手注释同义 ✓）。
+///   **仅作用控制器** ✓（估计器走原始陀螺 ✓）。
+pub static mut G_ESKF_GYR_LPF: f32 = 0.0;
 /// ★★§5.186【加速度低通相位滞后的姿态回退补偿量（毫秒） ✓】
 ///
 /// 背景（本轮实测 ✓）：`step_hil` 对比力做 20Hz 二阶 Butterworth 低通（抑振/降噪 ✓），
