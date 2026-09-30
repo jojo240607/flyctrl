@@ -34,32 +34,75 @@ pub fn clamp(x: f32, lo: f32, hi: f32) -> f32 {
     }
 }
 
+// ★★§5.192【计算量探针（H 场"预算类回归"前移 ✓）】：统计**每拍昂贵运算**调用数。
+//
+// 动机（§5.191 ✓）：控制任务卡在 4ms 预算边缘（§5.135 启用 ESKF 即超预算；
+//   §5.161 仅加一条 16B store 就使 `x_hover_noise` 从 20° 到 142°；§5.186 每拍三角函数
+//   使 `x_env_motion::turn_yaw_rate_tracks` 回归 ✗）。而这些**只有 M 场（指令级时序模型）
+//   能发现** ✗ ⇒ 本探针把"每拍昂贵运算数"做成**H 场可断言**的代理量 ✓。
+//
+// 口径 ✓：`COST_TRANS` 只数**超越函数**（sin/cos/sin_cos/asin/atan2/exp/ln/pow —— M4F
+//   上是多项式/软件实现，几十~上百条指令 ✓）；`COST_SQRT` 单列（M4F 有 VSQRT，1 条 ✓）。
+// 编译期开关 ✓：`#[cfg(any(test, feature = "cost-probe"))]` ⇒ **默认固件零开销** ✓
+//   （feature 关闭时宏展开为空 ✓）。
+#[cfg(any(test, feature = "cost-probe"))]
+pub static mut COST_TRANS: u32 = 0;
+#[cfg(any(test, feature = "cost-probe"))]
+pub static mut COST_SQRT: u32 = 0;
+
+#[cfg(any(test, feature = "cost-probe"))]
+macro_rules! cost_trans { () => { unsafe { crate::math::COST_TRANS = crate::math::COST_TRANS.wrapping_add(1); } }; }
+#[cfg(not(any(test, feature = "cost-probe")))]
+macro_rules! cost_trans { () => {}; }
+#[cfg(any(test, feature = "cost-probe"))]
+macro_rules! cost_sqrt { () => { unsafe { crate::math::COST_SQRT = crate::math::COST_SQRT.wrapping_add(1); } }; }
+#[cfg(not(any(test, feature = "cost-probe")))]
+macro_rules! cost_sqrt { () => {}; }
+
+/// 复位/读取探针（仅 `cost-probe` 下存在 ✓）
+#[cfg(any(test, feature = "cost-probe"))]
+pub fn cost_reset() {
+    unsafe { COST_TRANS = 0; COST_SQRT = 0; }
+}
+#[cfg(any(test, feature = "cost-probe"))]
+pub fn cost_read() -> (u32, u32) {
+    unsafe { (COST_TRANS, COST_SQRT) }
+}
+
 #[cfg(target_os = "none")]
 mod backend {
     use fpmath::FloatMath;
 
     pub fn sin(x: f32) -> f32 {
+        cost_trans!();
         fpmath::sin(x)
     }
     pub fn cos(x: f32) -> f32 {
+        cost_trans!();
         fpmath::cos(x)
     }
     pub fn sin_cos(x: f32) -> (f32, f32) {
+        cost_trans!();
         fpmath::sin_cos(x)
     }
     pub fn asin(x: f32) -> f32 {
+        cost_trans!();
         fpmath::asin(x)
     }
     pub fn atan2(y: f32, x: f32) -> f32 {
+        cost_trans!();
         fpmath::atan2(y, x)
     }
     pub fn sqrt(x: f32) -> f32 {
+        cost_sqrt!();
         fpmath::sqrt(x)
     }
     pub fn ln(x: f32) -> f32 {
+        cost_trans!();
         fpmath::log(x)
     }
     pub fn exp(x: f32) -> f32 {
+        cost_trans!();
         fpmath::exp(x)
     }
     pub fn abs(x: f32) -> f32 {
@@ -69,6 +112,7 @@ mod backend {
         fpmath::round(x)
     }
     pub fn pow(x: f32, y: f32) -> f32 {
+        cost_trans!();
         fpmath::pow(x, y)
     }
 }
@@ -76,27 +120,35 @@ mod backend {
 #[cfg(not(target_os = "none"))]
 mod backend {
     pub fn sin(x: f32) -> f32 {
+        cost_trans!();
         libm::sinf(x)
     }
     pub fn cos(x: f32) -> f32 {
+        cost_trans!();
         libm::cosf(x)
     }
     pub fn sin_cos(x: f32) -> (f32, f32) {
+        cost_trans!();
         (libm::sinf(x), libm::cosf(x))
     }
     pub fn asin(x: f32) -> f32 {
+        cost_trans!();
         libm::asinf(x)
     }
     pub fn atan2(y: f32, x: f32) -> f32 {
+        cost_trans!();
         libm::atan2f(y, x)
     }
     pub fn sqrt(x: f32) -> f32 {
+        cost_sqrt!();
         libm::sqrtf(x)
     }
     pub fn ln(x: f32) -> f32 {
+        cost_trans!();
         libm::logf(x)
     }
     pub fn exp(x: f32) -> f32 {
+        cost_trans!();
         libm::expf(x)
     }
     pub fn abs(x: f32) -> f32 {
@@ -106,6 +158,7 @@ mod backend {
         libm::roundf(x)
     }
     pub fn pow(x: f32, y: f32) -> f32 {
+        cost_trans!();
         libm::powf(x, y)
     }
 }
