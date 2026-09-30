@@ -97,6 +97,11 @@ pub static mut G_I_XY_MAX: f32 = -1.0;
 /// 稳态实际速度应等于指令速度，误差 <5%"）→ 启用 → 全量回归 → 按失败清单重导判据。
 #[used]
 pub static mut G_KI_V_XY: f32 = -1.0;
+/// ★§5.196【垂向通道整定旋钮 ✓】：`kp_z` / `kv_z` / `ki_z` 运行时覆盖（哨兵同规 **<0 = 编译期值** ✓）。
+/// 动机：§5.195 把水平游走压到 ~0.55m 后，**垂向（~0.77m）成了主要误差源** ✗ ⇒ 需单独扫 ✓。
+pub static mut G_KP_Z: f32 = -1.0;
+pub static mut G_KV_Z: f32 = -1.0;
+pub static mut G_KI_Z: f32 = -1.0;
 
 /// **速度环 P 增益（水平）**运行时旋钮 —— 位置阶跃的**阻尼**主要来自它（默认 0.8）。
 /// 语义同其他 `G_*`：`<0` = 用编译期值 ✓。用于阶段 7 的阻尼整定（免去反复重编译 ✓）。
@@ -572,8 +577,19 @@ impl Controller for PidController {
         // 注意：下行饱和（需最大爬升）时 iz 应取正值（与 pre_iz 反向，二者相加恰为 -vmax_z），
         // 旧实现把 clamp 上下界写反且夹了错误变量，导致 iz 朝错误方向 windup 到限幅之外、
         // 抵消 PD 爬升指令、悬停无法恢复。
-        let pre_iz = self.kp_z * ez + sp.vel[2].0; // P 项 + 速度前馈（不含积分）
-        let iz_tent = clampf(self.iz + self.ki_z * ez * dt, -2.0, 2.0);
+        // ★§5.196：垂向三增益运行时旋钮（默认 -1 ⇒ 编译期值 ✓ 逐位不变）
+        let (kp_z_e, kv_z_e, ki_z_e) = unsafe {
+            let kp = core::ptr::read_volatile(core::ptr::addr_of!(G_KP_Z));
+            let kv = core::ptr::read_volatile(core::ptr::addr_of!(G_KV_Z));
+            let ki = core::ptr::read_volatile(core::ptr::addr_of!(G_KI_Z));
+            (
+                if kp >= 0.0 { kp } else { self.kp_z },
+                if kv >= 0.0 { kv } else { self.kv_z },
+                if ki >= 0.0 { ki } else { self.ki_z },
+            )
+        };
+        let pre_iz = kp_z_e * ez + sp.vel[2].0; // P 项 + 速度前馈（不含积分）
+        let iz_tent = clampf(self.iz + ki_z_e * ez * dt, -2.0, 2.0);
         let des_vz_tent = pre_iz + iz_tent;
         let mut iz_final = iz_tent;
         if des_vz_tent > self.vmax_z {
@@ -780,7 +796,7 @@ impl Controller for PidController {
             let d = core::ptr::addr_of_mut!(G_CTRL_DBG);
             (*d)[5] = acc_e;
         }
-        let acc_d = self.kv_z * (des_vz - est_vd) + sp.acc[2].0; // 下垂方向（NED），用滤波后垂直速度
+        let acc_d = kv_z_e * (des_vz - est_vd) + sp.acc[2].0; // 下垂方向（NED），用滤波后垂直速度（★§5.196 旋钮 ✓）
 
         // 阶段 11-A 诊断：把控制律内部量存进调试字段，供 host 侧打印（绕开 no_std 无 eprintln）。
         self.dbg_raw_d = est.pos[2].0;
