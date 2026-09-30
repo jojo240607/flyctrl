@@ -66,10 +66,6 @@ impl Default for SimImu {
     }
 }
 
-/// ★§5.187b：比力低通 τ(ω) 查找表规模/上限频率（预计算 ⇒ 每拍仅插值，无三角函数 ✓）
-const ACC_LAG_N: usize = 17;
-const ACC_LAG_FMAX: f32 = 16.0; // Hz（覆盖 100 rad/s 旋转；再高则取端点 ✓）
-
 /// 单步闭环上下文（跨步持久状态）。
 pub struct HilContext<E, C>
 where
@@ -134,14 +130,6 @@ where
     /// 从稳定（tilt≈4°）恶化到翻滚（tilt>18°））。40Hz 窄带陷波（Q=5，带宽 36~44Hz）
     /// 只切除振动带，在姿态环带宽（~5Hz）处零相位/幅值影响，直流/低频角速度无失真。
     pub imu_gyro_notch: [Biquad; 3],
-    /// ★★§5.187b【比力低通 τ(ω) 查找表 ✓】：预计算 `τ(f)` 于 `[0, ACC_LAG_FMAX]`
-    /// （`ACC_LAG_N` 点等间隔），每拍仅**查表+线性插值**（O(1) 浮点，**无三角函数** ✓）。
-    ///
-    /// 为何不用每拍直接求群延迟 ✗：控制任务已在 4ms 预算边缘（§5.161 实测：仅加一条
-    /// 16B store 就把 `x_hover_noise` 从 20° 推到 142°）⇒ 每拍 ~24 次三角函数会**超预算**
-    /// （实测：每拍直算 ⇒ `x_env_motion::turn_yaw_rate_tracks` 回归 ✗）。查表则**零额外负担** ✓。
-    pub acc_lag_table: [f32; ACC_LAG_N],
-    pub acc_lag_df: f32,
 }
 
 use crate::perf::probe;
@@ -201,24 +189,19 @@ where
                     if qk > 0.0 { qk } else { 2.0 }
                 },
             ); 3],
-            // ★§5.187b：τ(ω) 查找表（见下方构造 ✓；此处先置零，下方填充 ✓）
-            acc_lag_table: [0.0f32; ACC_LAG_N],
-            acc_lag_df: 0.0,
         };
-        // ★★§5.187b【比力低通 τ(ω) 自动标定（查表版 ✓）】：从**实际滤波器系数**
-        //   预计算 `τ(f)`（比力链路：40Hz 陷波 → 20Hz Butterworth 低通 ✓），存为等间隔表 ✓。
-        //   · 一次构建（三角函数仅此处，**不在控制热路径** ✓），每拍查表+线性插值 ✓。
-        //   · 频率范围 `[0, ACC_LAG_FMAX]`；超出取端点（高转时群延迟变化已饱和 ✓）。
-        //   · 实测本配置：τ 在 0~4Hz 为 ~12.8ms（低通 11.0 + 陷波 1.8 ✓）。
+        // ★★§5.187【比力低通延迟 τ 的自动标定 ✓】：从**实际滤波器系数**导出群延迟
+        //   （比力链路：40Hz 陷波 → 20Hz Butterfly 低通 ✓），写入估计器供重力辅助补偿 ✓。
+        //   · 参考频率取 **1Hz**：群延迟在飞行频段（≈0.5~5Hz）内近似平坦 ✓（实测
+        //     20Hz 低通：τ_DC≈11.3ms、τ(4.2Hz)≈11.7ms ⇒ 差 <0.5ms ✓）。
+        //   · 一旦低通/陷波参数改变，τ **自动跟随** ✓（不再硬编码 8ms ✗）。
+        //   · 对标定的合理性：实测旧硬编码 8ms 在 A13 略偏低（5.35°）；标定值≈11.3ms
+        //     落在最优平台内（≈3.93° ✓）。
         {
-            ctx.acc_lag_df = ACC_LAG_FMAX / (ACC_LAG_N as f32 - 1.0);
-            for k in 0..ACC_LAG_N {
-                let f = k as f32 * ctx.acc_lag_df;
-                ctx.acc_lag_table[k] = ctx.imu_gyro_notch[0].group_delay_s(f, fs)
-                    + ctx.imu_accel_lowpass[0].group_delay_s(f, fs);
-            }
-            // 初始值：用表在 f=0 处（静止 ⇒ 补偿与 ω 无关，仅需有效值 ✓）
-            ctx.est.set_accel_lag_s(ctx.acc_lag_table[0]);
+            let f_ref = 1.0f32;
+            let tau = ctx.imu_gyro_notch[0].group_delay_s(f_ref, fs)
+                + ctx.imu_accel_lowpass[0].group_delay_s(f_ref, fs);
+            ctx.est.set_accel_lag_s(tau);
         }
         ctx
     }
@@ -457,30 +440,6 @@ where
         };
 
         probe(1); // IMU 预处理（陷波/低通滤波）完成
-
-        // ★★§5.187b【比力低通 τ 按**当前 |ω|** 取值 ✓】：滤波器群延迟随频率变化，旋转频率
-        //   高出飞行频段时 1Hz 参考会有偏差 ⇒ 用**当前机体角速率**作参考频率 ✓。
-        //   ⚠️**必须查表**（不能在此每拍算三角函数 ✗）：控制任务已在 4ms 预算边缘
-        //   （§5.161：仅加一条 store 就使 `x_hover_noise` 发散）——实测每拍直算三角函数
-        //   ⇒ `x_env_motion::turn_yaw_rate_tracks` 回归 ✗；查表为 **O(1) 浮点、零三角** ✓。
-        {
-            let g = [
-                imu_sample.gyro[0].0,
-                imu_sample.gyro[1].0,
-                imu_sample.gyro[2].0,
-            ];
-            let wnorm = math::sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2]);
-            let f = wnorm * (1.0 / (2.0 * core::f32::consts::PI));
-            let x = (f / self.acc_lag_df).min(ACC_LAG_N as f32 - 1.0).max(0.0);
-            let k = x as usize;
-            let frac = x - k as f32;
-            let tau = if k + 1 < ACC_LAG_N {
-                self.acc_lag_table[k] * (1.0 - frac) + self.acc_lag_table[k + 1] * frac
-            } else {
-                self.acc_lag_table[k]
-            };
-            self.est.set_accel_lag_s(tau);
-        }
 
         // 2) 姿态初始化门控：仅当本拍拿到**真实** IMU 帧才做 tilt alignment。
         //    悬停/静止时比力 a=(0,0,-9.81)（FRD，z 向下），重力方向即 -a：
