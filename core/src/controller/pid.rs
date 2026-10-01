@@ -282,6 +282,16 @@ pub struct PidController {
     dgyro_k: f32,
     /// 角加速度 D 的低通截止（Hz）。PX4 `IMU_DGYRO_CUTOFF` default **20.0** ✓；≤0 ⇒ 回退 20 ✓。
     dgyro_cutoff: f32,
+    // ★★§5.212【对齐 PX4 串级结构的**速率环 I** 项 ✓】：`rates += i_rate`，
+    //   `i_rate += ki_rate·(w_sp − ω_f)·dt`（机体系 ✓）
+    //   为什么需要 ✓（实测量化）：本仓"姿态 PD → 速率指令 → 混控"**没有速率环** ✗ ⇒
+    //   恒速偏航所需**配平力矩**（克服气动阻尼）只能由**姿态 P 的稳态误差**提供 ✓
+    //   ⇒ 实测切向偏航 R=7m 稳态**偏航误差 11.5°** ✗（解析重构 `ez=(r_trim+att_kd·ψ̇)/att_kp≈10.9°` ✓ 吻合）
+    //   PX4 用**速率环 I** 把它积掉 ⇒ 姿态误差 →0 ✓（且对重心偏移/电机不均/风阻一并有效 ✓）
+    //   ⚠️ 仓内旧注释"恒速旋转本来不需要力矩"**物理上是错的** ✗（要克服阻尼力矩 ✓）
+    /// 速率环积分增益（1/s）。**0 = 关 ⇒ 完全跳过 ⇒ 逐位不变** ✓（默认 0，待整定 ✓）。
+    ki_rate: f32,
+    i_rate: [f32; 3],
     prev_omega: [f32; 3],
     dgyro_filt: [f32; 3],
     dgyro_init: bool,
@@ -471,6 +481,8 @@ impl PidController {
             filt_w: [0.0; 3],
             rate_filt_init: false,
             dgyro_k: 0.02,
+            ki_rate: 0.0,
+            i_rate: [0.0; 3],
             dgyro_cutoff: 20.0,
             prev_omega: [0.0; 3],
             dgyro_filt: [0.0; 3],
@@ -507,6 +519,17 @@ impl PidController {
 
     /// ★★§5.208：角加速度 D（PX4 `IMU_DGYRO_CUTOFF` 同构）的整定入口。
     /// `k <= 0` ⇒ 关闭（逐位不变 ✓）；`cutoff <= 0` ⇒ 保留一手 20Hz ✓。
+    /// ★★§5.212：速率环积分增益整定入口。`ki <= 0` ⇒ 关闭（逐位不变 ✓）+ 复位积分。
+    pub fn set_ki_rate(&mut self, ki: f32) {
+        self.ki_rate = if ki > 0.0 { ki } else { 0.0 };
+        self.i_rate = [0.0; 3];
+    }
+
+    /// 只读：当前速率环积分状态（诊断 ✓）
+    pub fn rate_integral(&self) -> [f32; 3] {
+        self.i_rate
+    }
+
     pub fn set_dgyro(&mut self, k: f32, cutoff_hz: f32) {
         self.dgyro_k = if k > 0.0 { k } else { 0.0 };
         if cutoff_hz > 0.0 { self.dgyro_cutoff = cutoff_hz; }
@@ -526,6 +549,8 @@ impl PidController {
         // ★★§5.208：角加速度 D（PX4 IMU_DGYRO_CUTOFF 同构 ✓）
         s.dgyro_k = c.dgyro_k;
         s.dgyro_cutoff = if c.dgyro_cutoff > 0.0 { c.dgyro_cutoff } else { 20.0 };
+        // ★★§5.212：速率环 I（消稳态配平 ✓）
+        s.ki_rate = if c.ki_rate > 0.0 { c.ki_rate } else { 0.0 };
         s.kp_xy = c.kp_xy;
         s.kv_xy = c.kv_xy;
         s.vel_lpf_tau = c.vel_lpf_tau;
@@ -1166,6 +1191,22 @@ impl PidController {
             self.prev_omega = omega_f;
         }
 
+        // ★★§5.212【速率环 I（PX4 串级结构 ✓）】——消掉**稳态配平**：
+        //   恒速偏航/侧滑需要非零力矩（气动阻尼、重心偏移、电机不均 ✓）
+        //   ⇒ 只用姿态 P 的稳态误差去顶 ⇒ 实测**偏航滞后 11.5°** ✗
+        //   本项把该误差**积掉** ⇒ 姿态误差 →0 ✓（等价 PX4 `rate_control` 的 I 通道 ✓）
+        //   `ki_rate == 0` ⇒ 整段跳过（**逐位不变** ✓）。
+        if self.ki_rate != 0.0 && dt > 1e-6 {
+            // 抗饱和：与 `i_v_xy` 同法（幅值夹紧 ✓）；上限取 2.0 rad/s
+            //（实测配平量级 `r_trim≈1.7·ψ̇` ⇒ 1 rad/s 偏航下 ≈1.7 ✓ ⇒ 2.0 留余量 ✓）
+            const I_RATE_MAX: f32 = 2.0;
+            for k in 0..3 {
+                let e = att_out.rates[k] - omega_f[k]; // 速率指令 − 实测（同为机体系 ✓）
+                self.i_rate[k] = clampf(self.i_rate[k] + self.ki_rate * e * dt, -I_RATE_MAX, I_RATE_MAX);
+                att_out.rates[k] += self.i_rate[k];
+            }
+        }
+
         // ---- **参考机体角速度前馈**（PX4 `MC_REF_FF` 同构）----------------------
         //
         // 期望姿态随时间旋转时（偏航速率 `ψ̇`），机体**本就该**以 `R^T·(0,0,ψ̇)` 的角速度
@@ -1261,6 +1302,66 @@ impl PidController {
 
 #[cfg(test)]
 mod dgyro_tests {
+
+
+    /// ★★§5.212【零件级自检 ✓】速率环 I：
+    ///  ① **符号**：速率指令 > 实测（e>0）⇒ 积分**增大**输出（正确的纠偏方向 ✓）
+    ///  ② **量级**：恒定误差下 `i ≈ ki·e·t`（解析 ✓），并夹在 ±2.0 rad/s
+    ///  ③ `ki=0` ⇒ 与不启用**逐位相同** ✓
+    #[test]
+    fn rate_integral_matches_analytic_and_has_correct_sign() {
+        use crate::units::{RadianPerSecond, Second};
+        let dt = 0.004f32;
+        let (ki, e) = (2.0f32, 0.1f32);
+        let mut c = PidController::default_quad();
+        c.rate_lpf_tau = 0.0;
+        c.set_ki_rate(ki);
+        // 构造恒定速率误差：期望姿态恒定、实测 ω 恒为 −e ⇒ e = 0 − (−e) = +e ✓
+        let mut est = crate::vehicle::VehicleState::zero();
+        est.omega = [RadianPerSecond(-e), RadianPerSecond(0.0), RadianPerSecond(0.0)];
+        let n = 200usize;
+        for _ in 0..n {
+            let _ = c.control_attitude(Second(dt), est.att, 0.5, &est);
+        }
+        let t = n as f32 * dt;
+        // ★解析必须含**全部**输出分量（第一版漏了 `−att_kd·ω` 那一路 ⇒ 自检当场抓出 ✗✓）：
+        //   w_sp = att_kp·0 − att_kd·ω − dgyro·(dω/dt=0) = −att_kd·(−e) = att_kd·e
+        //   e_rate = w_sp − ω = att_kd·e + e = e·(1 + att_kd) ✓
+        let ana = ki * e * (1.0 + c.att_kd) * t;
+        let got = c.rate_integral()[0];
+        assert!(
+            (got - ana).abs() < 0.15 * ana,
+            "速率环 I 实测 {got:.4} vs 解析 ki·e·t={ana:.4}（应一致 ✓）"
+        );
+        assert!(got > 0.0, "符号错 ✗：e>0 时积分应为正（增大输出以纠偏 ✓）");
+        // 长跑到饱和 ⇒ 夹在 +2.0 ✓
+        for _ in 0..20000 {
+            let _ = c.control_attitude(Second(dt), est.att, 0.5, &est);
+        }
+        assert!(
+            (c.rate_integral()[0] - 2.0).abs() < 1e-6,
+            "应夹在 +2.0 rad/s，实测 {}",
+            c.rate_integral()[0]
+        );
+        // ③ ki=0 ⇒ 逐位相同 ✓
+        let mut c0 = PidController::default_quad();
+        c0.set_ki_rate(0.0);
+        let mut c1 = PidController::default_quad();
+        c1.set_ki_rate(3.0);
+        c1.set_ki_rate(0.0);
+        let mut e2 = crate::vehicle::VehicleState::zero();
+        for i in 0..300 {
+            let t = i as f32 * dt;
+            e2.omega = [
+                RadianPerSecond(0.2 * (8.0 * t).sin()),
+                RadianPerSecond(0.1),
+                RadianPerSecond(0.05),
+            ];
+            let _ = c0.control_attitude(Second(dt), e2.att, 0.5, &e2);
+            let _ = c1.control_attitude(Second(dt), e2.att, 0.5, &e2);
+            assert_eq!(c0.dbg_pqr, c1.dbg_pqr, "ki=0 必须与不启用**逐位相同** ✓");
+        }
+    }
     use super::*;
     use crate::units::{RadianPerSecond, Second};
 
