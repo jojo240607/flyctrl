@@ -192,12 +192,15 @@ where
                 };
                 // ★★§5.207：**默认 40Hz**（对齐 PX4 `IMU_GYRO_CUTOFF` ✓）—— 随 ③ 的联合重整定
                 //   一并开启 ✓（裸 bin 读 0 ⇒ 40Hz ✓）。`>0` 可覆盖 ✓。
-                // ★★§5.208：**默认关** ✓（`>0` 显式启用 ✓）——见 §5.207/§5.208：
-                //   40Hz 会推翻 `att_loop_with_estimated_attitude`（估计驱动偏差 14.78° > 门槛 10.7°）✗
-                if v > 0.0 {
-                    [Biquad::low_pass(v, fs, 0.7071); 3]
-                } else {
+                // ★★§5.210【③ 默认 40Hz（对齐 PX4 `IMU_GYRO_CUTOFF` ✓）】
+                //   §5.207 直接照搬 40Hz 破（未重整定 ✗）⇒ §5.208 补上 PX4 的角加速度 D ✓
+                //   ⇒ §5.209 找到根因（姿态估计滞后 = 重力锚定）并给出闭环境配置 `att_alpha=0` ✓
+                //   ⇒ 三者齐备后 40Hz 可默认开 ✓（`>0` 覆盖；`<0` 强制关，A/B 用 ✓）
+                if v < 0.0 {
                     [Biquad::passthrough(); 3]
+                } else {
+                    let fc = if v > 0.0 { v } else { 40.0 };
+                    [Biquad::low_pass(fc, fs, 0.7071); 3]
                 }
             },
             last_gyro_ctl: [0.0; 3],

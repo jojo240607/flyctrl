@@ -470,7 +470,7 @@ impl PidController {
             rate_lpf_tau: 0.02, // 50Hz：抑噪为主，相位滞后小
             filt_w: [0.0; 3],
             rate_filt_init: false,
-            dgyro_k: 0.0,
+            dgyro_k: 0.02,
             dgyro_cutoff: 20.0,
             prev_omega: [0.0; 3],
             dgyro_filt: [0.0; 3],
@@ -1313,7 +1313,10 @@ mod dgyro_tests {
             "角加速度 D 与解析投影 {proj:.3} 应 ≈1（负值 ⇒ **符号错** ✗）"
         );
         // ③ k=0 ⇒ 完全跳过（逐位不变 ✓）
+        //   ★§5.210：`default_quad()` 现已默认 `dgyro_k=0.02` ⇒ 两侧都显式归零再比 ✓
+        //   （这条自检的正确姿势是"验证 k=0 与**不启用**等价" ✓，与出厂默认无关 ✓）
         let mut c0 = PidController::default_quad();
+        c0.set_dgyro(0.0, 20.0);
         let mut c1 = PidController::default_quad();
         c1.set_dgyro(0.05, 20.0);
         c1.set_dgyro(0.0, 20.0);

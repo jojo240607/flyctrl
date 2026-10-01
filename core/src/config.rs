@@ -138,7 +138,7 @@ impl VehicleConfig {
             vmax_z: 2.0,
             att_kp: 3.0,
             att_kd: 0.3,
-            dgyro_k: 0.0,
+            dgyro_k: 0.02,
             dgyro_cutoff: 20.0,
             kp_xy: 0.3,
             // ★§5.195：与 `PidController::default_quad()` 同步（0.8 → **3.0** ✓，理由见彼处注释）
