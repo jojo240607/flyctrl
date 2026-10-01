@@ -68,6 +68,17 @@ impl EskfState {
 /// ★**实验旋钮**（对照臂用 ✓，默认 1.0 = 开）：重力辅助开关。
 /// 置 0 ⇒ `update_gravity` 立即返回**带理由的** `Err` ✗（绝不静默跳过 ✗）。
 pub static mut G_ESKF_GRAV_ON: f32 = 1.0;
+
+/// ★★§5.225【对齐 PX4 一手 `gravity_fusion.cpp` ✓】重力辅助的**幅值门**（占 `g` 的比例）。
+///   PX4 ✓：`upper = 1.1g / lower = 0.9g` ⇒ **±10%**（`accel_lpf_norm_good` ✓）；
+///   本仓原为 **±25%**（`dev > 0.25·gn` ⇒ 关 ✗）⇒ **宽 2.5 倍** ✗ ⇒ 机动中会接受更脏的重力观测 ✗。
+///   `> 0` ⇒ 用该比例；`<= 0`（含裸 bin 读 0）⇒ **默认 0.10**（PX4 一手 ±10% ✓）。
+///   §5.225 实测（急刹 0.5g）：0.25 ⇒ RMSE 11.044°/max 26.490° ✗；
+///     **0.10 ⇒ 8.735°/22.780° ✓（−21%）**；0.05 ⇒ 4.233°/10.484°（更优但更激进，
+///     收窄门 = 少用被污染观测 ✓，代价是长跑漂移抑制变弱 ⇒ 待长跑验证再定 ✓）。
+///   取值的量纲 ✓：`dev = |R·a_body + g_ned|` ⇒ `dev/g` 即"比力相对 1g 的偏差比例" ✓，
+///   与 PX4 的 `|a| ∈ (0.9g,1.1g)` 同义 ✓。
+pub static mut G_ESKF_GRAV_GATE: f32 = 0.0;
 /// ★§5.136 方案 B 旋钮：`2.0` ⇒ 回退【三轴磁矢量融合】（legacy A/B 对照）；
 /// 其余值（含裸 bin 的 0）⇒ 默认走【仅 yaw 观测】(update_mag_yaw ✓)。
 pub static mut G_ESKF_MAG_YAW_ON: f32 = 0.0;
@@ -660,6 +671,11 @@ pub struct Eskf {
     pub p: Cov,
     /// NIS 门限（σ ✓；参照：mag 3.0σ / hdg 2.6σ / baro·gps 5.0σ ✓）
     pub gate: f32,
+    /// ★★§5.225【对齐 PX4 `gravity_fusion.cpp` ✓】重力辅助幅值门（占 g 比例 ✓）。
+    ///   构造期由旋钮 `G_ESKF_GRAV_GATE` 读一次（**非热路径** ✓ —— 热路径每拍读会被
+    ///   `cost::hot_path_knob_reads_bounded` 拦下 ✓，§5.201 实证过加一个读就吃预算 ✗）。
+    ///   默认 **0.10** = PX4 一手（`|a| ∈ (0.9g, 1.1g)` ✓）；原 0.25 ✗（宽 2.5 倍）。
+    pub grav_gate_frac: f32,
     pub r_gps_p: f32,
     pub r_gps_v: f32,
     pub r_baro: f32,
@@ -735,6 +751,11 @@ impl Eskf {
             mag_b: [0.0; 3], // 未知硬铁 ⇒ 0 起步 ✓
             p,
             gate,
+            // ★§5.225：幅值门在**构造期**读一次旋钮（非热路径 ✓）；>0 用旋钮，否则 0.10（PX4 ✓）
+            grav_gate_frac: unsafe {
+                let v = core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_GRAV_GATE));
+                if v > 0.0 { v } else { 0.10 }
+            },
             // ★R 由【残差反推】重新标定（2026-09-21 ✓）：PC/SIL 口径（验收表以此为锚 ✓）。
             //   ⚠️【§5.132】这组值是按 PC 级微噪声（σ_gps=1.7cm/σ_baro=1.2cm）标定的，
             //   而真传感器路径（M 场 real-sensors：GPS 位置 σ≈0.5m、气压 σ≈0.3m）残差
@@ -1055,7 +1076,11 @@ impl Eskf {
             ESKF_LAST_DEV[0] = dev;
             ESKF_LAST_DEV[1] = dev / gn;
         }
-        if dev > 0.25 * gn {
+        // ★★§5.225：幅值门（对齐 PX4 `gravity_fusion.cpp` 的 (0.9g,1.1g) ✓）
+        //   旋钮 `G_ESKF_GRAV_GATE`：>0 ⇒ 该比例；<=0（默认/裸 bin）⇒ 沿用 0.25 ✓ 逐位不变 ✓
+        // ★§5.225：用**构造期读入的字段** ✓（热路径不新增每拍旋钮读 ✗ —— 静态守卫会拦 ✓）
+        let gate_frac = self.grav_gate_frac;
+        if dev > gate_frac * gn {
             unsafe { ESKF_GRAV_BRANCH[1] += 1.0; }
             return Err("重力辅助：总加速度过大 ⇒ 关闭 ✓（照参照 ✓）");
         }
