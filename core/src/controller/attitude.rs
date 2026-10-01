@@ -142,7 +142,10 @@ pub fn x4_mix_px4(des_thrust: f32, pqr: [f32; 3]) -> [f32; 4] {
     }
     // ★★一手 `mixYaw()` ✓：对 yaw 去饱和时**临时把上界扩 `MINIMUM_YAW_MARGIN`** ⇒
     //   "允许满推力下仍有一些 yaw 响应"（不让 yaw 被立刻削掉 ✓）；随后恢复上界 ✓
-    const MINIMUM_YAW_MARGIN: f32 = 0.0; // ⚠️§5.217：PX4 一手值 0.15 ✓，但**开启即在 MCU 固件触发内存越界写** ✗
+    // ⚠️§5.217/§5.218：PX4 一手值 = 0.15 ✓，但**开启即在 MCU 固件触发野跳转崩溃** ✗
+    //   （已排除：栈溢出 ✗ · 栈内容 ✗ · 日志子系统 ✗ —— 见台账 §5.218 的三次否证）
+    //   ⇒ 修复前保持 0 ✓（该值下与 §5.216 行为、算术完全一致 ✓）
+    const MINIMUM_YAW_MARGIN: f32 = 0.0;
                                               //   （已定位到 rtos_app_sdk::log::emit ✓，LR=4 栈损坏 ✗）⇒ 修复前保持 0 ✓
     desaturate(&mut m, &YAW, 0.0, 1.0 + MINIMUM_YAW_MARGIN, false);
     // 再把总推力**只减不增**地拉回 [0,1]（一手 ✓：`desaturate(thrust_z, reduce-only)` ✓）
