@@ -31,6 +31,7 @@ fpmath = "0.1.1"
 libm = "0.2"
 
 [features]
+buf-guard = ["mavlink-core/buf-guard"]
 # 启用具体芯片实现（HAL 的 stm32f407 真实寄存器级驱动）。host/SIL 默认关闭。
 stm32f407 = ["dep:stm32f4", "dep:cortex-m", "dep:cortex-m-rt"]
 # ★§5.192 计算量探针（H 场"预算类回归"守卫；**默认关 ⇒ 固件零开销** ✓）

@@ -19,12 +19,10 @@ pub use mavlink_core::frame::{
     crc16_x25, decode, encode, put_f32, put_i16, put_i32, put_u16, MAVLINK_MAGIC, CRC_EXTRA,
     COMP_ID, MAX_FRAME_LEN, SYS_ID, Frame, enums, msg_id,
 };
-/// ★§5.220：悬垂输出缓冲守卫（见 `mavlink_core::frame` 的注释 ✓）
-#[cfg(target_arch = "arm")]
-pub use mavlink_core::frame::{
-    GUARD_HI, GUARD_LO,
-};
-#[cfg(target_arch = "arm")]
+/// ★§5.220：悬垂输出缓冲守卫（见 `mavlink_core::frame` 的注释 ✓；`buf-guard` feature 门控 ✓）
+#[cfg(all(target_arch = "arm", feature = "buf-guard"))]
+pub use mavlink_core::frame::{GUARD_HI, GUARD_LO};
+#[cfg(all(target_arch = "arm", feature = "buf-guard"))]
 pub use mavlink_core::frame::{BAD_BUF_ADDR, BAD_BUF_COUNT, BAD_BUF_LR};
 pub use mavlink_core::codec::{
     Attitude, CommandLong, FencePoint, HilActuatorControls, LocalPositionNed, MissionItem,
