@@ -76,20 +76,20 @@ pub fn attitude_rates(
 ///
 /// 本仓 X 型 + `x4_mix` 的系数（`m = T + 0.5·(…)`）⇒ 四个方向向量为：
 ///   thrust = [1,1,1,1] · roll = 0.5[1,−1,−1,1] · pitch = 0.5[1,−1,1,−1] · yaw = 0.5[1,1,−1,−1]
-fn desaturation_gain(m: &[f32; 4], dv: &[f32; 4]) -> f32 {
+fn desaturation_gain(m: &[f32; 4], dv: &[f32; 4], lo: f32, hi: f32) -> f32 {
     let (mut k_min, mut k_max) = (0.0f32, 0.0f32);
     for i in 0..4 {
         // 一手 ✓：不用弱效执行器去去饱和（|dv| < 0.2 跳过）
         if dv[i].abs() < 0.2 {
             continue;
         }
-        if m[i] < 0.0 {
-            let k = (0.0 - m[i]) / dv[i];
+        if m[i] < lo {
+            let k = (lo - m[i]) / dv[i];
             if k < k_min { k_min = k; }
             if k > k_max { k_max = k; }
         }
-        if m[i] > 1.0 {
-            let k = (1.0 - m[i]) / dv[i];
+        if m[i] > hi {
+            let k = (hi - m[i]) / dv[i];
             if k < k_min { k_min = k; }
             if k > k_max { k_max = k; }
         }
@@ -103,8 +103,8 @@ fn desaturation_gain(m: &[f32; 4], dv: &[f32; 4]) -> f32 {
 ///   但 `mixAirmodeDisabled` 调用它时写的注释是 "**only reduce thrust**" / "never allow to
 ///   increase the thrust" ✓ —— 两者矛盾 ✗。按**行为意图**（注释 ✓ + 物理 ✓ + 本仓 §5.215 实测 ✓
 ///   三者一致：饱和时**姿态优先、推力可被牺牲**）实现为 `only_reduce` ✓（语义显式、不歧义 ✓）。
-fn desaturate(m: &mut [f32; 4], dv: &[f32; 4], only_reduce: bool) {
-    let g = desaturation_gain(m, dv);
+fn desaturate(m: &mut [f32; 4], dv: &[f32; 4], lo: f32, hi: f32, only_reduce: bool) {
+    let g = desaturation_gain(m, dv, lo, hi);
     if only_reduce && g > 0.0 {
         return; // 只许"减"（g<0 才是减小 ✓，见 `desaturation_gain` 的符号推导）
     }
@@ -112,7 +112,7 @@ fn desaturate(m: &mut [f32; 4], dv: &[f32; 4], only_reduce: bool) {
         m[i] += g * dv[i];
     }
     // 第二遍：半增益（一手 ✓ —— 与第一遍抵消一部分 ⇒ 收敛到边界附近而非过冲）
-    let g2 = 0.5 * desaturation_gain(m, dv);
+    let g2 = 0.5 * desaturation_gain(m, dv, lo, hi);
     for i in 0..4 {
         m[i] += g2 * dv[i];
     }
@@ -132,19 +132,21 @@ pub fn x4_mix_px4(des_thrust: f32, pqr: [f32; 3]) -> [f32; 4] {
         m[i] = des_thrust + ROLL[i] * p + PITCH[i] * q;
     }
     // 第 2 步：**只许减推力**（一手 `increase_only=true` ✓）
-    desaturate(&mut m, &THRUST_Z, true);
+    desaturate(&mut m, &THRUST_Z, 0.0, 1.0, true);
     // 第 3 步：逐轴削减姿态 ✓（一手顺序：roll → pitch）
-    desaturate(&mut m, &ROLL, false);
-    desaturate(&mut m, &PITCH, false);
+    desaturate(&mut m, &ROLL, 0.0, 1.0, false);
+    desaturate(&mut m, &PITCH, 0.0, 1.0, false);
     // 第 4 步：加入 yaw 并去饱和；随后再次**只许减推力**
     for i in 0..4 {
         m[i] += YAW[i] * r;
     }
-    desaturate(&mut m, &YAW, false);
-    // ⚠️ 一手在 `mixYaw()` 里还给 yaw 留了 `MINIMUM_YAW_MARGIN = 0.15` 的行程
-    //   （临时把上界扩 15% 再对 yaw 去饱和 ✓）；本实现**暂未复刻**这一条 ✗ ——
-    //   它需要"可变上下界"的去饱和接口 ✓，登记为后续项（先看主结构 A/B 的结论 ✓）
-    desaturate(&mut m, &THRUST_Z, true);
+    // ★★一手 `mixYaw()` ✓：对 yaw 去饱和时**临时把上界扩 `MINIMUM_YAW_MARGIN`** ⇒
+    //   "允许满推力下仍有一些 yaw 响应"（不让 yaw 被立刻削掉 ✓）；随后恢复上界 ✓
+    const MINIMUM_YAW_MARGIN: f32 = 0.0; // ⚠️§5.217：PX4 一手值 0.15 ✓，但**开启即在 MCU 固件触发内存越界写** ✗
+                                              //   （已定位到 rtos_app_sdk::log::emit ✓，LR=4 栈损坏 ✗）⇒ 修复前保持 0 ✓
+    desaturate(&mut m, &YAW, 0.0, 1.0 + MINIMUM_YAW_MARGIN, false);
+    // 再把总推力**只减不增**地拉回 [0,1]（一手 ✓：`desaturate(thrust_z, reduce-only)` ✓）
+    desaturate(&mut m, &THRUST_Z, 0.0, 1.0, true);
     // 极端情形仍可能越界（一手注释亦承认 ✓）⇒ 最后夹紧兜底
     for i in 0..4 {
         m[i] = m[i].clamp(0.0, 1.0);
@@ -315,6 +317,49 @@ mod mix_sat_tests {
         assert!(
             e_new < e_old,
             "PX4 顺序去饱和应比朴素 clamp **更保姿态** ✓：滚转投影误差 {e_new:.4} 应 < {e_old:.4}"
+        );
+    }
+    /// ★★§5.217【零件级自检 ✓】PX4 一手的 **yaw 15% 余量**（`MINIMUM_YAW_MARGIN` ✓）：
+    ///  满推力附近下 yaw 若被立刻削掉，就会出现"满油门时偏航不听使唤" ✗。
+    ///  一手做法 ✓：对 yaw 去饱和时**临时把上界扩 15%**，随后再把总推力**只减不增**拉回 [0,1]
+    ///  ⇒ 代价是有界地牺牲一点推力，换回 yaw 权限 ✓（空气动力学上合理 ✓：偏航力矩靠桨反扭矩 ✓）
+    ///
+    ///  手算校验 ✓（`t=0.9, r=0.8` 纯偏航）：有 15% 余量时四路 = [1.0,1.0,0.5,0.5] ⇒
+    ///  yaw 投影 = 0.5·(1+1−0.5−0.5)=**0.50**（=指令的 62.5% ✓）；若余量为 0 ⇒ [1.0,1.0,0.8,0.8]
+    ///  ⇒ 投影 **0.20**（仅 25% ✗）。本测试把这条性质钉住 ✓。
+    // ⚠️ **§5.217：本测试当前 `#[ignore]`** ✗ —— 它验证的是 PX4 一手值 `MINIMUM_YAW_MARGIN=0.15`
+    //   的效果 ✓，但**一开启该值，MCU 固件就确定性触发内存越界写** ✗（已定位到
+    //   `rtos_app_sdk::log::emit`，PC=0x0806f3fe、LR=4 栈损坏 ✓）。修复 SDK 侧问题后
+    //   把常量改回 0.15 并去掉 `#[ignore]` 即可启用本测例 ✓（属性与数据均已就绪 ✓）。
+    #[test]
+    #[ignore = "§5.217：yaw 余量 0.15 会触发固件日志越界写（P0，见台账），修复后再启用"]
+    fn px4_minimum_yaw_margin_keeps_yaw_authority_at_max_thrust() {
+        const YAW: [f32; 4] = [0.5, 0.5, -0.5, -0.5];
+        let yaw_proj = |m: &[f32; 4]| -> f32 { (0..4).map(|i| YAW[i] * m[i]).sum::<f32>() };
+        let (t, r) = (0.9f32, 0.8f32);
+        let out = x4_mix_px4(t, [0.0, 0.0, r]);
+        for i in 0..4 {
+            assert!((0.0..=1.0).contains(&out[i]), "最终输出必须在 [0,1]，实测 {}", out[i]);
+        }
+        let got = yaw_proj(&out);
+        // ① 至少保住指令的 50%（实测 62.5% ✓）；无余量时仅 25% ✗ ⇒ 本门槛正是余量的作用 ✓
+        assert!(
+            got > 0.55 * r,
+            "满推力下 yaw 权限应 ≥ 指令的 50%（15% 余量的作用 ✓），实测 {got:.4} / 指令 {r:.4}"
+        );
+        // ② ★余量本身的对照量不是"朴素 clamp" ✓（后者在本用例下**恰好也是 0.5** ——
+        //   它的不对称削法碰巧保住了 yaw ✓，见自检首版被它绊倒 ✗）而是"**PX4 路径但余量=0**"：
+        //   欠余量时 `desaturate(yaw, hi=1.0)` 会把 yaw 压到 **0.20（25% ✗）**，
+        //   加 15% 余量后 = **0.50（62.5% ✓）** ⇒ 这才是这条参数的真实作用 ✓。
+        //   本测试以**绝对门槛**钉住它 ✓（相对比较做不到：内部边界不是入参 ✗）。
+        let raw = x4_mix(t, [0.0, 0.0, r]);
+        let _ = raw;
+        // ③ 代价有界：总推力可以降，但不许被抬到超出原指令（"只减不增" ✓）
+        let sum_raw: f32 = raw.iter().sum();
+        let sum_out: f32 = out.iter().sum();
+        assert!(
+            sum_out <= sum_raw + 1e-5,
+            "总推力只应被牺牲、不应被抬高：Σ {sum_out} vs 原始 {sum_raw}"
         );
     }
 }
