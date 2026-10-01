@@ -453,8 +453,8 @@ impl PidController {
             //       **速率误差增益（直接放噪）**，缺 PX4 那级"微分后再低通"✗
             //   ⇒ 前置条件 = **重构 D 项为 角加速度 + 低通**（对齐 IMU_DGYRO_CUTOFF ✓）
             //     ⇒ 在那之前 ③ 保持**默认关** ✓（`G_ESKF_GYR_LPF > 0` 可显式启用 ✓）
-            att_kp: 3.0,
-            att_kd: 0.3,
+            att_kp: 4.5,
+            att_kd: 0.45,
             hover_thrust: 0.5,
             gravity: 9.81,
             ki_z: 0.3, // 原 0.6：积分零点从 ωz=1.2 降到 0.6 rad/s（低于增益穿越 ωc≈0.68 rad/s），
@@ -486,7 +486,7 @@ impl PidController {
             filt_w: [0.0; 3],
             rate_filt_init: false,
             dgyro_k: 0.02,
-            ki_rate: 0.0,
+            ki_rate: 0.5,
             i_rate: [0.0; 3],
             dgyro_cutoff: 20.0,
             prev_omega: [0.0; 3],

@@ -138,11 +138,11 @@ impl VehicleConfig {
             hover_thrust: 0.5,
             vmax_xy: 2.0,
             vmax_z: 2.0,
-            att_kp: 3.0,
-            att_kd: 0.3,
+            att_kp: 4.5,
+            att_kd: 0.45,
             dgyro_k: 0.02,
             dgyro_cutoff: 20.0,
-            ki_rate: 0.0,
+            ki_rate: 0.5,
             kp_xy: 0.3,
             // ★§5.195：与 `PidController::default_quad()` 同步（0.8 → **3.0** ✓，理由见彼处注释）
             kv_xy: 3.0, // ★§5.195
