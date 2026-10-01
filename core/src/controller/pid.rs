@@ -297,8 +297,11 @@ pub struct PidController {
     /// 速率环积分增益（1/s）。**0 = 关 ⇒ 完全跳过 ⇒ 逐位不变** ✓（默认 0，待整定 ✓）。
     ki_rate: f32,
     i_rate: [f32; 3],
-    /// ★★§5.215【控制分配：推力优先的饱和管理 ✓】`false` = 原路径（四路各自 clamp ✓ 逐位不变 ✓）。
-    mix_sat: bool,
+    /// ★★§5.215/§5.216【控制分配饱和管理档位 ✓】
+    ///   `0` = 原路径（四路各自 clamp ✓ **逐位不变** ✓）
+    ///   `1` = §5.215 **保推力**缩放（实测更差 ✗，留档对照 ✓）
+    ///   `2` = §5.216 **PX4 一手同构**（顺序去饱和、**姿态优先于推力** ✓）
+    mix_mode: u8,
     prev_omega: [f32; 3],
     dgyro_filt: [f32; 3],
     dgyro_init: bool,
@@ -490,7 +493,7 @@ impl PidController {
             dgyro_k: 0.02,
             ki_rate: 0.5,
             i_rate: [0.0; 3],
-            mix_sat: false,
+            mix_mode: 2, // ★§5.216 PX4 一手同构（姿态优先 ✓）默认开
             dgyro_cutoff: 20.0,
             prev_omega: [0.0; 3],
             dgyro_filt: [0.0; 3],
@@ -538,9 +541,9 @@ impl PidController {
         self.i_rate
     }
 
-    /// ★★§5.215：控制分配饱和管理开关（A/B 用 ✓）。`false` = 原路径（逐位不变 ✓）。
-    pub fn set_mix_sat(&mut self, on: bool) {
-        self.mix_sat = on;
+    /// ★★§5.215/§5.216：控制分配档位（A/B 用 ✓）。`0` = 原路径（逐位不变 ✓）。
+    pub fn set_mix_mode(&mut self, mode: u8) {
+        self.mix_mode = mode;
     }
 
     pub fn set_dgyro(&mut self, k: f32, cutoff_hz: f32) {
@@ -564,8 +567,8 @@ impl PidController {
         s.dgyro_cutoff = if c.dgyro_cutoff > 0.0 { c.dgyro_cutoff } else { 20.0 };
         // ★★§5.212：速率环 I（消稳态配平 ✓）
         s.ki_rate = if c.ki_rate > 0.0 { c.ki_rate } else { 0.0 };
-        // ★★§5.215：控制分配饱和管理
-        s.mix_sat = c.mix_sat;
+        // ★★§5.215/§5.216：控制分配档位
+        s.mix_mode = c.mix_mode;
         s.kp_xy = c.kp_xy;
         s.kv_xy = c.kv_xy;
         s.vel_lpf_tau = c.vel_lpf_tau;
@@ -1304,7 +1307,11 @@ impl PidController {
         // ★★§5.215：`mix_sat=true` ⇒ **推力优先**的饱和管理 ✓（差动塞不下时绕均值缩放 ⇒
         //   **均值/总推力精确保住** ✓，代价是短时牺牲姿态权限 ✓）；
         //   `false` ⇒ 原路径（四路各自 clamp ✗ ⇒ 触界时均值丢失 ⇒ 掉高 ✗）**逐位不变** ✓
-        let motors = if self.mix_sat {
+        let motors = if self.mix_mode == 2 {
+            // ★★§5.216：PX4 一手同构（姿态优先 ✓）
+            super::attitude::x4_mix_px4(des_thrust, att_out.rates)
+        } else if self.mix_mode == 1 {
+            // §5.215：保推力缩放（实测更差 ✗，留档）
             super::attitude::x4_mix_sat(des_thrust, att_out.rates)
         } else {
             let m = super::attitude::x4_mix(des_thrust, att_out.rates);

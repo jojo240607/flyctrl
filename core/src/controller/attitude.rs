@@ -62,6 +62,96 @@ pub fn attitude_rates(
 ///    —— 这是与"各自 clamp"的本质区别 ✓：后者均值会漂 ✗
 ///
 /// 只在**第 3 种**情形下改变行为 ✓ ⇒ A/B 可归因 ✓。
+/// ★★§5.216【**PX4 一手同构**：沿优先级顺序的去饱和 ✓】（`ControlAllocationSequentialDesaturation.cpp`）
+///
+/// 与 §5.215 那个"保推力缩放"的**本质区别** ✓（§5.215 实测更差 ✗ 且与一手不符 ✗）：
+/// 一手把饱和处理**按优先级逐轴**做，且**姿态优先于推力** ✓ ——
+///   · 第 2 步 `desaturate(thrust_z, increase_only=true)` ⇒ **只许减推力** ⇒ 推力最先被牺牲 ✓
+///   · 第 3 步再逐轴削减 roll / pitch ✓
+///   · 第 4 步加 yaw 后去饱和，且给 yaw 留 **15% 行程**（一手 `MINIMUM_YAW_MARGIN=0.15f` ✓）
+///   · airmode（一手 `MC_AIRMODE`）才是"允许抬高推力换姿态权限"的那档 ✓
+/// 去饱和增益（一手 `computeDesaturationGain` ✓）：对每个执行器解 `k=(bound−sp)/dv`，
+/// 取 `k_min+k_max`，**跑两遍**（第二遍半增益，收敛到边界 ✓），并**跳过 |dv|<0.2**
+/// 的弱效执行器（一手注释：否则会得到巨大的去饱和增益 ✓）。
+///
+/// 本仓 X 型 + `x4_mix` 的系数（`m = T + 0.5·(…)`）⇒ 四个方向向量为：
+///   thrust = [1,1,1,1] · roll = 0.5[1,−1,−1,1] · pitch = 0.5[1,−1,1,−1] · yaw = 0.5[1,1,−1,−1]
+fn desaturation_gain(m: &[f32; 4], dv: &[f32; 4]) -> f32 {
+    let (mut k_min, mut k_max) = (0.0f32, 0.0f32);
+    for i in 0..4 {
+        // 一手 ✓：不用弱效执行器去去饱和（|dv| < 0.2 跳过）
+        if dv[i].abs() < 0.2 {
+            continue;
+        }
+        if m[i] < 0.0 {
+            let k = (0.0 - m[i]) / dv[i];
+            if k < k_min { k_min = k; }
+            if k > k_max { k_max = k; }
+        }
+        if m[i] > 1.0 {
+            let k = (1.0 - m[i]) / dv[i];
+            if k < k_min { k_min = k; }
+            if k > k_max { k_max = k; }
+        }
+    }
+    // 一手注释 ✓："Reduce the saturation as much as possible"
+    k_min + k_max
+}
+
+/// ⚠️ **PX4 一手此处命名/注释自相矛盾** ✗（如实注记 ✓）：`desaturateActuators(..., increase_only)`
+///   的函数体是 `if (increase_only && gain < 0) return;` ⇒ 为真时**只允许增大** ✗；
+///   但 `mixAirmodeDisabled` 调用它时写的注释是 "**only reduce thrust**" / "never allow to
+///   increase the thrust" ✓ —— 两者矛盾 ✗。按**行为意图**（注释 ✓ + 物理 ✓ + 本仓 §5.215 实测 ✓
+///   三者一致：饱和时**姿态优先、推力可被牺牲**）实现为 `only_reduce` ✓（语义显式、不歧义 ✓）。
+fn desaturate(m: &mut [f32; 4], dv: &[f32; 4], only_reduce: bool) {
+    let g = desaturation_gain(m, dv);
+    if only_reduce && g > 0.0 {
+        return; // 只许"减"（g<0 才是减小 ✓，见 `desaturation_gain` 的符号推导）
+    }
+    for i in 0..4 {
+        m[i] += g * dv[i];
+    }
+    // 第二遍：半增益（一手 ✓ —— 与第一遍抵消一部分 ⇒ 收敛到边界附近而非过冲）
+    let g2 = 0.5 * desaturation_gain(m, dv);
+    for i in 0..4 {
+        m[i] += g2 * dv[i];
+    }
+}
+
+/// ★★§5.216：PX4 一手同构的四旋翼控制分配（**姿态优先于推力** ✓）。
+/// `mix_sat == false` 时不必调用（原路径逐位不变 ✓）。
+pub fn x4_mix_px4(des_thrust: f32, pqr: [f32; 3]) -> [f32; 4] {
+    let (p, q, r) = (pqr[0], pqr[1], pqr[2]);
+    const THRUST_Z: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+    const ROLL: [f32; 4] = [0.5, -0.5, -0.5, 0.5];
+    const PITCH: [f32; 4] = [0.5, -0.5, 0.5, -0.5];
+    const YAW: [f32; 4] = [0.5, 0.5, -0.5, -0.5];
+    // 第 1 步：混 roll + pitch + thrust（**不含 yaw** ✓）
+    let mut m = [0.0f32; 4];
+    for i in 0..4 {
+        m[i] = des_thrust + ROLL[i] * p + PITCH[i] * q;
+    }
+    // 第 2 步：**只许减推力**（一手 `increase_only=true` ✓）
+    desaturate(&mut m, &THRUST_Z, true);
+    // 第 3 步：逐轴削减姿态 ✓（一手顺序：roll → pitch）
+    desaturate(&mut m, &ROLL, false);
+    desaturate(&mut m, &PITCH, false);
+    // 第 4 步：加入 yaw 并去饱和；随后再次**只许减推力**
+    for i in 0..4 {
+        m[i] += YAW[i] * r;
+    }
+    desaturate(&mut m, &YAW, false);
+    // ⚠️ 一手在 `mixYaw()` 里还给 yaw 留了 `MINIMUM_YAW_MARGIN = 0.15` 的行程
+    //   （临时把上界扩 15% 再对 yaw 去饱和 ✓）；本实现**暂未复刻**这一条 ✗ ——
+    //   它需要"可变上下界"的去饱和接口 ✓，登记为后续项（先看主结构 A/B 的结论 ✓）
+    desaturate(&mut m, &THRUST_Z, true);
+    // 极端情形仍可能越界（一手注释亦承认 ✓）⇒ 最后夹紧兜底
+    for i in 0..4 {
+        m[i] = m[i].clamp(0.0, 1.0);
+    }
+    m
+}
+
 pub fn x4_mix_sat(des_thrust: f32, pqr: [f32; 3]) -> [f32; 4] {
     let m = x4_mix(des_thrust, pqr);
     let mut mmin = f32::INFINITY;
@@ -180,6 +270,51 @@ mod mix_sat_tests {
         assert!(
             (s_out - s_raw).abs() < (s_old - s_raw).abs() * 0.05,
             "新路径的均值误差应远小于旧路径 ✓"
+        );
+    }
+    /// ★★§5.216【零件级自检 ✓】PX4 一手同构的顺序去饱和：
+    ///  ① 未触界 ⇒ 与 `x4_mix` **逐位相同** ✓
+    ///  ② 任何输入 ⇒ 四路全在 `[0,1]` ✓
+    ///  ③ ★**姿态优先**：饱和时**姿态投影**（= Σ ROLLᵢ·mᵢ，正比于实际滚转力矩 ✓）
+    ///     比"四路各自 clamp"**更接近指令** ✓ —— 这是"牺牲推力保姿态"的可测判据 ✓
+    #[test]
+    fn px4_sequential_desaturation_prioritizes_attitude() {
+        const ROLL: [f32; 4] = [0.5, -0.5, -0.5, 0.5];
+        let proj = |m: &[f32; 4]| -> f32 { (0..4).map(|i| ROLL[i] * m[i]).sum::<f32>() };
+        // ① 未触界 ⇒ 逐位相同
+        for (t, p, q, r) in [(0.5f32, 0.0f32, 0.0f32, 0.0f32), (0.5, 0.2, -0.15, 0.05)] {
+            let raw = x4_mix(t, [p, q, r]);
+            let out = x4_mix_px4(t, [p, q, r]);
+            for i in 0..4 {
+                // ⚠️ 这里只能用 `1e-6` 而非**逐位相等** ✓：PX4 路径按一手**分步混**
+                //   （先 roll/pitch/thrust，再加 yaw ✓），与 `x4_mix` 的一次性
+                //   `0.5·(p+q+r)` **浮点结合序不同** ⇒ 末位 ULP 差异（实测 0.65000004 vs 0.65 ✓）。
+                //   该差异只在**量化/对拍**意义上存在 ✓，不影响任何飞行行为 ✓。
+                assert!(
+                    (out[i] - raw[i]).abs() < 1e-6,
+                    "未触界应等价（允许 ULP 级结合序差异 ✓）：{} vs {}",
+                    out[i], raw[i]
+                );
+            }
+        }
+        // ② + ③ 触界工况：大滚转指令 + 高推力 ⇒ 朴素 clamp 会削掉滚转
+        let (t, p, q, r) = (0.85f32, 0.6f32, 0.3f32, 0.2f32);
+        let raw = x4_mix(t, [p, q, r]);
+        let clamped = [
+            raw[0].clamp(0.0, 1.0),
+            raw[1].clamp(0.0, 1.0),
+            raw[2].clamp(0.0, 1.0),
+            raw[3].clamp(0.0, 1.0),
+        ];
+        let out = x4_mix_px4(t, [p, q, r]);
+        for i in 0..4 {
+            assert!((0.0..=1.0).contains(&out[i]), "应在 [0,1]，实测 {}", out[i]);
+        }
+        let e_old = (proj(&clamped) - p).abs();
+        let e_new = (proj(&out) - p).abs();
+        assert!(
+            e_new < e_old,
+            "PX4 顺序去饱和应比朴素 clamp **更保姿态** ✓：滚转投影误差 {e_new:.4} 应 < {e_old:.4}"
         );
     }
 }
