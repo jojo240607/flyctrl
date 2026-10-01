@@ -154,6 +154,11 @@ pub static mut G_ARW: f32 = 0.0;
 #[no_mangle]
 #[used]
 pub static mut G_VEL_SLEW: f32 = 2.0;
+
+/// ★★§5.212：速率环 I 的**幅值上限**（rad/s）——按实测配平量级取值 ✓：
+///   切向偏航 ψ̇=0.286 实测需 `r_trim≈0.486`（`≈1.7·ψ̇` ✓）⇒ 取 0.5 覆盖常见机动 ✓；
+///   取太大（曾用 2.0 ✗）会让积分在测试的扫频暂态里跑偏 ⇒ 带宽指标被污染 ✗
+pub const I_RATE_MAX: f32 = 0.5;
 /// ★§5.177 探针：速度环积分 `i_v_xy`（windup 判定 ✓）
 #[no_mangle]
 #[used]
@@ -1199,7 +1204,6 @@ impl PidController {
         if self.ki_rate != 0.0 && dt > 1e-6 {
             // 抗饱和：与 `i_v_xy` 同法（幅值夹紧 ✓）；上限取 2.0 rad/s
             //（实测配平量级 `r_trim≈1.7·ψ̇` ⇒ 1 rad/s 偏航下 ≈1.7 ✓ ⇒ 2.0 留余量 ✓）
-            const I_RATE_MAX: f32 = 2.0;
             for k in 0..3 {
                 let e = att_out.rates[k] - omega_f[k]; // 速率指令 − 实测（同为机体系 ✓）
                 self.i_rate[k] = clampf(self.i_rate[k] + self.ki_rate * e * dt, -I_RATE_MAX, I_RATE_MAX);
@@ -1339,8 +1343,8 @@ mod dgyro_tests {
             let _ = c.control_attitude(Second(dt), est.att, 0.5, &est);
         }
         assert!(
-            (c.rate_integral()[0] - 2.0).abs() < 1e-6,
-            "应夹在 +2.0 rad/s，实测 {}",
+            (c.rate_integral()[0] - I_RATE_MAX).abs() < 1e-6,
+            "应夹在 +{I_RATE_MAX} rad/s（引用同一常量 ✓），实测 {}",
             c.rate_integral()[0]
         );
         // ③ ki=0 ⇒ 逐位相同 ✓
