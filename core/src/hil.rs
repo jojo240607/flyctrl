@@ -697,6 +697,7 @@ mod tests {
     use crate::controller::pid::PidController;
     use crate::controller::Controller;
     use crate::estimator::ekf::EkfEstimator;
+use crate::estimator::eskf_estimator::EskfEstimator;
     use crate::hal::actuator::MockMotors;
     use crate::hal::sensor::{MockAirspeed, MockBaro, MockGps, MockImu, MockMag, MockRtk, MockVio};
     use crate::invariants::{actuator_bounded, state_finite};
@@ -858,21 +859,25 @@ mod tests {
     /// 输入序列设计：恒定倾斜姿态（roll=10°,pitch=-5°,yaw=30°，比力 = R·(0,0,-9.81)，
     /// gyro=0）+ 恒定位置偏移 (2,1,-5) + 恒定设定点（原点悬停 (0,0,-5)）。让位置环
     /// 与姿态环持续存在误差，否则稳态下输出恒为悬停油门、参数差异被掩盖。
-    /// 两侧 EKF 输入相同 → 估计状态逐位一致，输出差异纯粹来自 PID 参数。
+    /// 两侧估计器输入相同 → 估计状态逐位一致，输出差异纯粹来自 PID 参数。
+    ///
+    /// ★★§5.226【去 Legacy 影响 ✓】：本测例原用 `EkfEstimator`（Legacy）**复刻产品** ✗ ——
+    ///   而产品（`app/src/flyctrl/control.rs`）用的是 `AnyEstimator::default_product()` = **ESKF** ✗
+    ///   ⇒ 它复刻的是**过期配置** ✗。改为两侧都用 **ESKF**（= 产品实际 ✓）⇒ 结论才代表产品 ✓。
     #[test]
     fn hil_same_input_sil_vs_mcu_output_compare() {
         let cfg = VehicleConfig::default_quad();
-        // MCU 侧配置（复刻 flyctrl/app control.rs）：default_quad + sync_gains_to_pid
+        // MCU 侧配置（复刻 flyctrl/app control.rs）：**ESKF** + default_quad + sync_gains_to_pid
         // 每周期用 G_PARAM_VALS 默认值覆盖 → 已对齐 SIL：kp_xy=0.3, kv_z=1.5。
         let mut mcu_ctx = HilContext::new(
-            EkfEstimator::default_quad(),
+            EskfEstimator::default_quad(),
             PidController::default_quad(),
             Second(0.004),
         );
         mcu_ctx.ctrl.apply_gains(&[0.3, 0.5, 3.0, 1.5, 0.5]); // ★§5.195 kv_xy 0.8→3.0 ✓（复刻 init_param_defaults ✓）
         // SIL 侧配置（与 fly-sim-core controller.rs 完全一致）：from_config 派生。
         let mut sil_ctx = HilContext::new(
-            EkfEstimator::default_quad(),
+            EskfEstimator::default_quad(), // ★§5.226：与产品一致（ESKF ✓）
             PidController::from_config(&cfg.ctrl_params()),
             Second(0.004),
         );
