@@ -65,7 +65,7 @@ pub static mut G_IV_MAX: f32 = -1.0;
 ///   （**保方向** ✓）；`0` ⇒ 原**逐轴**限幅（默认 ✓ 逐位不变）
 #[no_mangle]
 #[used]
-pub static mut G_CONSTRAIN_XY: f32 = 0.0;
+pub static mut G_CONSTRAIN_XY: f32 = 2.0;
 /// ★§5.182【对齐 PX4 `_vel_int` **累积时序** ✓】：`2.0` ⇒ 积分在**饱和判定之后**累积
 ///   （PX4 一手 `:190-199` 位于推力饱和之后 ✓）；`0` ⇒ 原时序（默认 ✓ 逐位不变）
 #[no_mangle]
@@ -138,7 +138,7 @@ pub static mut G_KV_D_FLIP: f32 = 0.0;
 ///   默认 `0` ⇒ 原行为（逐位不变 ✓）
 #[no_mangle]
 #[used]
-pub static mut G_TILT_LIMIT_SYNTH: f32 = 0.0;
+pub static mut G_TILT_LIMIT_SYNTH: f32 = 2.0;
 /// ★§5.171【对齐 PX4 一手 `PositionControl.cpp:190-199` 的 **ARW（积分抗饱和）** ✓】：
 ///   `vel_error -= arw_gain·(acc_sp − acc_produced)`（`arw_gain = 2/gain_vel_p` ✓）
 ///   ⇒ 饱和时用"**实际产出加速度**"反推积分 ⇒ 防 windup ✓

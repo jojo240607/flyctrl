@@ -37,7 +37,7 @@ buf-guard = ["flyctrl-core/buf-guard"]
 #   恢复**地面站链路**（上行 DO_SET_MODE/PARAM + 遥测下行 ✓）。
 #   ⚠️历史：曾因 ① 固件超 app slot（128KB）② "用 usb0 后控制任务 8~10s 阻塞（机制待查）"
 #   而默认关闭 ⇒ 本次重新评估：① 已解决（§5.202 ✓）② **须复验**（若仍在 ⇒ 另作处置 ✓）
-default = ["usb-link"]
+default = ["usb-link", "buf-guard"]
 # 调试 feature：启用极简 demo 入口（只起一个打日志任务，不碰任何外设），
 # 用于先验证 App 拉起链路（RTOS 异步 app_host 任务）是否跑通，再切回正式 flyctrl。
 demo = []
