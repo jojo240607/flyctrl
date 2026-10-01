@@ -145,7 +145,7 @@ pub fn x4_mix_px4(des_thrust: f32, pqr: [f32; 3]) -> [f32; 4] {
     // ⚠️§5.217/§5.218：PX4 一手值 = 0.15 ✓，但**开启即在 MCU 固件触发野跳转崩溃** ✗
     //   （已排除：栈溢出 ✗ · 栈内容 ✗ · 日志子系统 ✗ —— 见台账 §5.218 的三次否证）
     //   ⇒ 修复前保持 0 ✓（该值下与 §5.216 行为、算术完全一致 ✓）
-    const MINIMUM_YAW_MARGIN: f32 = 0.0;
+    const MINIMUM_YAW_MARGIN: f32 = 0.15;
                                               //   （已定位到 rtos_app_sdk::log::emit ✓，LR=4 栈损坏 ✗）⇒ 修复前保持 0 ✓
     desaturate(&mut m, &YAW, 0.0, 1.0 + MINIMUM_YAW_MARGIN, false);
     // 再把总推力**只减不增**地拉回 [0,1]（一手 ✓：`desaturate(thrust_z, reduce-only)` ✓）
@@ -330,12 +330,11 @@ mod mix_sat_tests {
     ///  手算校验 ✓（`t=0.9, r=0.8` 纯偏航）：有 15% 余量时四路 = [1.0,1.0,0.5,0.5] ⇒
     ///  yaw 投影 = 0.5·(1+1−0.5−0.5)=**0.50**（=指令的 62.5% ✓）；若余量为 0 ⇒ [1.0,1.0,0.8,0.8]
     ///  ⇒ 投影 **0.20**（仅 25% ✗）。本测试把这条性质钉住 ✓。
-    // ⚠️ **§5.217：本测试当前 `#[ignore]`** ✗ —— 它验证的是 PX4 一手值 `MINIMUM_YAW_MARGIN=0.15`
-    //   的效果 ✓，但**一开启该值，MCU 固件就确定性触发内存越界写** ✗（已定位到
-    //   `rtos_app_sdk::log::emit`，PC=0x0806f3fe、LR=4 栈损坏 ✓）。修复 SDK 侧问题后
-    //   把常量改回 0.15 并去掉 `#[ignore]` 即可启用本测例 ✓（属性与数据均已就绪 ✓）。
+    // ★★§5.223：本测例已**解除 ignore** ✓ —— 当初"开启余量即触发固件内存越界写"的
+    //   现象，最终定位为**模拟器缺陷**（`enter_exception` 压栈 xPSR 时只留条件标志、
+    //   丢掉 IT/ICI ⇒ 块级重放时 IT 块失去约束 ⇒ 单条 `strne` 被无条件执行 ⇒ 野写 ✗），
+    //   已在 `mcu_simulater/src/machine/mod.rs` 修复 ✓；**固件本身无 bug** ✓。
     #[test]
-    #[ignore = "§5.217：yaw 余量 0.15 会触发固件日志越界写（P0，见台账），修复后再启用"]
     fn px4_minimum_yaw_margin_keeps_yaw_authority_at_max_thrust() {
         const YAW: [f32; 4] = [0.5, 0.5, -0.5, -0.5];
         let yaw_proj = |m: &[f32; 4]| -> f32 { (0..4).map(|i| YAW[i] * m[i]).sum::<f32>() };
