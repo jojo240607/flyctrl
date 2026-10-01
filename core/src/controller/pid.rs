@@ -153,7 +153,7 @@ pub static mut G_ARW: f32 = 0.0;
 ///   手段 = 让**期望值本身**不含高频（避免激励结构模态 ✓）
 #[no_mangle]
 #[used]
-pub static mut G_VEL_SLEW: f32 = 0.0;
+pub static mut G_VEL_SLEW: f32 = 2.0;
 /// ★§5.177 探针：速度环积分 `i_v_xy`（windup 判定 ✓）
 #[no_mangle]
 #[used]
