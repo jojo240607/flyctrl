@@ -80,6 +80,8 @@ pub struct VehicleConfig {
     pub dgyro_cutoff: f32,
     /// ★★§5.212 速率环积分增益（1/s）。**0 = 关** ✓（消稳态配平：偏航/侧滑需非零力矩 ✓）。
     pub ki_rate: f32,
+    /// ★★§5.215 控制分配饱和管理（推力优先 ✓）。`false` = 四路各自 clamp（逐位不变 ✓）。
+    pub mix_sat: bool,
     /// 位置外环比例增益（位置误差 -> 期望速度）。
     pub kp_xy: f32,
     /// 速度中环比例增益（速度误差 -> 期望加速度）。
@@ -143,6 +145,7 @@ impl VehicleConfig {
             dgyro_k: 0.02,
             dgyro_cutoff: 20.0,
             ki_rate: 0.5,
+            mix_sat: false,
             kp_xy: 0.3,
             // ★§5.195：与 `PidController::default_quad()` 同步（0.8 → **3.0** ✓，理由见彼处注释）
             kv_xy: 3.0, // ★§5.195
@@ -192,6 +195,7 @@ impl VehicleConfig {
             dgyro_k: self.dgyro_k,
             dgyro_cutoff: self.dgyro_cutoff,
             ki_rate: self.ki_rate,
+            mix_sat: self.mix_sat,
             kp_xy: self.kp_xy,
             kv_xy: self.kv_xy,
             vel_lpf_tau: self.vel_lpf_tau,
@@ -265,6 +269,8 @@ pub struct CtrlParams {
     pub dgyro_cutoff: f32,
     /// ★★§5.212 速率环积分增益（1/s）。**0 = 关** ✓。
     pub ki_rate: f32,
+    /// ★★§5.215 控制分配饱和管理（推力优先 ✓）。`false` = 四路各自 clamp（逐位不变 ✓）。
+    pub mix_sat: bool,
     /// 位置外环比例增益（位置误差 -> 期望速度）。
     pub kp_xy: f32,
     /// 速度中环比例增益（速度误差 -> 期望加速度）。

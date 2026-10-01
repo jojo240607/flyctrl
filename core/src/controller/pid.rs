@@ -297,6 +297,8 @@ pub struct PidController {
     /// 速率环积分增益（1/s）。**0 = 关 ⇒ 完全跳过 ⇒ 逐位不变** ✓（默认 0，待整定 ✓）。
     ki_rate: f32,
     i_rate: [f32; 3],
+    /// ★★§5.215【控制分配：推力优先的饱和管理 ✓】`false` = 原路径（四路各自 clamp ✓ 逐位不变 ✓）。
+    mix_sat: bool,
     prev_omega: [f32; 3],
     dgyro_filt: [f32; 3],
     dgyro_init: bool,
@@ -488,6 +490,7 @@ impl PidController {
             dgyro_k: 0.02,
             ki_rate: 0.5,
             i_rate: [0.0; 3],
+            mix_sat: false,
             dgyro_cutoff: 20.0,
             prev_omega: [0.0; 3],
             dgyro_filt: [0.0; 3],
@@ -535,6 +538,11 @@ impl PidController {
         self.i_rate
     }
 
+    /// ★★§5.215：控制分配饱和管理开关（A/B 用 ✓）。`false` = 原路径（逐位不变 ✓）。
+    pub fn set_mix_sat(&mut self, on: bool) {
+        self.mix_sat = on;
+    }
+
     pub fn set_dgyro(&mut self, k: f32, cutoff_hz: f32) {
         self.dgyro_k = if k > 0.0 { k } else { 0.0 };
         if cutoff_hz > 0.0 { self.dgyro_cutoff = cutoff_hz; }
@@ -556,6 +564,8 @@ impl PidController {
         s.dgyro_cutoff = if c.dgyro_cutoff > 0.0 { c.dgyro_cutoff } else { 20.0 };
         // ★★§5.212：速率环 I（消稳态配平 ✓）
         s.ki_rate = if c.ki_rate > 0.0 { c.ki_rate } else { 0.0 };
+        // ★★§5.215：控制分配饱和管理
+        s.mix_sat = c.mix_sat;
         s.kp_xy = c.kp_xy;
         s.kv_xy = c.kv_xy;
         s.vel_lpf_tau = c.vel_lpf_tau;
@@ -1291,16 +1301,22 @@ impl PidController {
         // 复用共享混控 `attitude::x4_mix`（P3-A3 提取，与 TECS 完全一致）。
         // 布局与符号（含 yaw 取 +r_cmd 的符号修正）见 attitude.rs 混控注释；
         // 控制器命令 (p_cmd,q_cmd,r_cmd) 定义在飞控机体轴（NED/FRD：前-X 右-Y 下-Z）。
-        let motors = super::attitude::x4_mix(des_thrust, att_out.rates);
+        // ★★§5.215：`mix_sat=true` ⇒ **推力优先**的饱和管理 ✓（差动塞不下时绕均值缩放 ⇒
+        //   **均值/总推力精确保住** ✓，代价是短时牺牲姿态权限 ✓）；
+        //   `false` ⇒ 原路径（四路各自 clamp ✗ ⇒ 触界时均值丢失 ⇒ 掉高 ✗）**逐位不变** ✓
+        let motors = if self.mix_sat {
+            super::attitude::x4_mix_sat(des_thrust, att_out.rates)
+        } else {
+            let m = super::attitude::x4_mix(des_thrust, att_out.rates);
+            [
+                clampf(m[0], 0.0, 1.0),
+                clampf(m[1], 0.0, 1.0),
+                clampf(m[2], 0.0, 1.0),
+                clampf(m[3], 0.0, 1.0),
+            ]
+        };
 
-        ActuatorCmd {
-            motor: [
-                clampf(motors[0], 0.0, 1.0),
-                clampf(motors[1], 0.0, 1.0),
-                clampf(motors[2], 0.0, 1.0),
-                clampf(motors[3], 0.0, 1.0),
-            ],
-        }
+        ActuatorCmd { motor: motors }
     }
 }
 
