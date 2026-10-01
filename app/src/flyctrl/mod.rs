@@ -220,6 +220,15 @@ pub fn spawn_flyctrl() {
     // 业务任务的 info! 日志能及时被输出（只写 ring，绝不阻塞业务任务）。
     rtos_app_sdk::log::spawn_log_task();
 
+    // ★★§5.220：把"栈竞技场"范围交给 MAVLink 编码器的**悬垂缓冲守卫** ✓
+    //   只按"地址 < SP"判会误伤静态/.bss 缓冲 ✗（它们天生在栈下方 ✓）⇒ 必须显式给范围 ✓
+    unsafe {
+        let lo = STACK_CTRL_BUF.as_ptr() as usize;
+        let hi = STACK_UPLINK_BUF.as_ptr() as usize + STACK_UPLINK;
+        flyctrl_core::comm::mavlink::GUARD_LO = lo;
+        flyctrl_core::comm::mavlink::GUARD_HI = hi;
+    }
+
     // control：硬实时 prio=4, priv=1, RTOS_RT_HARD
     spawn_rt(
         "control",
