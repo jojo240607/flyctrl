@@ -47,7 +47,13 @@ impl EskfState {
             // no_std：用 crate 的 sqrt（与其他模块一致 ✓）
             let wn = crate::math::sqrt(wn2);
             let dq = Quaternion::from_axis_angle([w[0] / wn, w[1] / wn, w[2] / wn], Radian(wn * dt));
-            // ★【左乘】✓ —— 本项目语义下"机体角速率"必须是左乘（§12.6 ✓）
+            // ⚠️§5.233【**已知缺陷** ✓，待整体一致化修复 ✗】：此处应为**右乘** ✓
+            //   （PX4 `ekf.cpp:253` = `quat_nominal * dq` ✓；守卫
+            //    `nominal_propagation_matches_world_frame_exponential` 实测偏差 9.6e-3 ✗）
+            //   但**单独改这一行会更糟** ✗（实测：完整 att_est ESKF 口径 57/6 → **56/7** ✗）
+            //   —— 因为 F 的姿态块（`+[ω×]` = 左乘线性化 ✗）与观测辅助也是按左乘建立的 ✓
+            //   ⇒ 必须**整体一致**改：传播 + F 姿态块 + `gravity_h`/`mag_h` + 4 处机体帧回退 ✓
+            //     （注入保持左乘 ✓ = PX4 ✓ 不动 ✓，见台账 §5.231/§5.232/§5.233 ✓）
             self.q = (dq * self.q).normalize();
         }
         let f = [
@@ -2023,6 +2029,77 @@ mod tests {
     ///
     /// 方法：与 `inject_error` **同约定**（左乘 `q ← exp(δθ)⊗q`）扰动对应状态块，调**真** `predict`，
     /// 把输出差 / eps 与 F 对应块逐元素比。
+    /// ★★§5.233【守卫 ✓】名义传播必须与**世界系独立推导**一致 —— 与乘序约定无关的锚 ✓
+    ///
+    /// 物理事实 ✓：机体角速率 ω_body 的含义是"世界系角速度 = R(q)·ω_body" ⇒ 精确解
+    ///   `q' = exp_world( R(q)·ω_body·dt ) ⊗ q`   （世界系形式 ✓ **独立成立** ✓）
+    ///   ⇔ `q ⊗ exp_body(ω_body·dt)`              （两者恒等 ✓）
+    /// ⇒ **右乘**实现满足 ✓；**左乘**实现（`exp_body(ωdt) ⊗ q` ✗）差 **O(|ω|·dt)** ✗
+    ///   —— 与 §5.231/§5.232 的 A/B 一致 ✓，且量级远大于容差 ⇒ 可断言 ✓
+    /// （原有 4 个 FD 自检抓不到 ✗：它们看**线性化**，左右乘之差在扰动下报**二阶** ✓
+    ///   ⇒ 落在 1e-3 容差内 ✗ ⇒ 必须用本守卫补位 ✓）
+    ///
+    /// 距离用**基向量偏差**（`max|R(a)v − R(b)v|` ✓，只需 `rotate_vec_by_quat` + abs ✓，
+    /// 无超越函数 ✓ 与 no_std 相容 ✓）
+    // ⚠️§5.233：本守卫**当前红** ✗ —— 它证明的正是"传播用左乘"这一**已知缺陷** ✓。
+    //   在"整体一致化修复"落地前保持 `#[ignore]` ✓（否则 H 场红 ✗），修复时**去掉 ignore** 即可 ✓。
+    #[test]
+    #[ignore = "§5.233：传播用左乘（已知缺陷，待整体一致化修复）；修复时去掉本 ignore"]
+    fn nominal_propagation_matches_world_frame_exponential() {
+        let dt = 0.004f32;
+        let q = Quaternion::from_axis_angle([0.0, 0.0, 1.0], Radian(0.7)).normalize();
+        let w_body = [3.0f32, -2.0, 1.0];
+        let da = [w_body[0] * dt, w_body[1] * dt, w_body[2] * dt];
+        let mut st = EskfState {
+            q,
+            v: [0.0; 3],
+            p: [0.0; 3],
+            bg: [0.0; 3],
+            ba: [0.0; 3],
+        };
+        st.predict(ImuDelta { delta_ang: da, delta_vel: [0.0; 3] }, [0.0, 0.0, 9.81], dt);
+        // 世界系独立锚 ✓
+        let a_world = crate::vehicle::rotate_vec_by_quat(q, da);
+        let nw = crate::math::sqrt(
+            a_world[0] * a_world[0] + a_world[1] * a_world[1] + a_world[2] * a_world[2],
+        );
+        let q_world = (Quaternion::from_axis_angle(
+            [a_world[0] / nw, a_world[1] / nw, a_world[2] / nw],
+            Radian(nw),
+        ) * q)
+            .normalize();
+        // 对照臂：错的那一侧（左乘 ✗）
+        let nb = crate::math::sqrt(da[0] * da[0] + da[1] * da[1] + da[2] * da[2]);
+        let q_left = (Quaternion::from_axis_angle(
+            [da[0] / nb, da[1] / nb, da[2] / nb],
+            Radian(nb),
+        ) * q)
+            .normalize();
+        let dev = |a: Quaternion, b: Quaternion| -> f32 {
+            let mut m = 0.0f32;
+            for v in [[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]] {
+                let va = crate::vehicle::rotate_vec_by_quat(a, v);
+                let vb = crate::vehicle::rotate_vec_by_quat(b, v);
+                for k in 0..3 {
+                    let d = (va[k] - vb[k]).abs();
+                    if d > m { m = d; }
+                }
+            }
+            m
+        };
+        let e_world = dev(st.q, q_world);
+        let e_left = dev(st.q, q_left);
+        assert!(
+            e_world < 1e-4,
+            "名义传播应与**世界系独立推导**一致 ✓（实测基向量偏差 {e_world:.6}）\
+             —— 偏大 ⇒ 乘序/约定与项目不符 ✗（§5.233）"
+        );
+        assert!(
+            e_left > 1e-3,
+            "守卫自检：应能被左乘形式**区分**（实测 {e_left:.6}）⇒ 否则守卫无效 ✗"
+        );
+    }
+
     #[test]
     fn f_state_transition_blocks_match_finite_difference() {
         let g = [0.0f32, 0.0, 9.81];
