@@ -1128,7 +1128,16 @@ impl Eskf {
         //   每次含 3 次四元数旋转 ⇒ 白做 2/3 ✓；与 N³/H·P 两轮同类的"重复构造"缺陷 ✓）
         //   ★§5.186：均用回退后的 `q_meas`（与量测同刻 ✓）
         let pred_all = predicted_gravity_body(q_meas, g_ned);
-        let h_all = gravity_h(q_meas, g_ned);
+        let mut h_all = gravity_h(q_meas, g_ned);
+        // ★§5.241【重力观测**不含 yaw 信息** ✓ ⇒ 显式屏蔽 yaw 耦合（PX4 式 tilt-only ✓）】
+        //   依据 ✓：重力观测的局部 h = [u]×，其 yaw 列 = u × e_z ≈ 0（水平时**恰为 0** ✓）
+        //     ⇒ 该列本应是零信息 ✓，实测却经 P[θz][·] 交叉项在 30Hz 振动下形成 **yaw 正反馈** ✗
+        //     （关重力 ⇒ a10 的 yaw 跑飞完全消失 ✓：−46.88° → **−3.45°** ✓）
+        //   物理正当性 ✓：加速度计只测**重力方向** ⇒ 对偏航**不可观测** ✓（PX4 gravity_fusion
+        //     只做 tilt ✓）⇒ 把该列置零**不损失任何信息** ✓，只切断伪耦合 ✓
+        for i in 0..3 {
+            h_all[i][I_ATT + 2] = 0.0;
+        }
         for i in 0..3 {
             let pred = pred_all;
             let resid = meas[i] - pred[i];
