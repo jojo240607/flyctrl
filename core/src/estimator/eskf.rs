@@ -724,6 +724,21 @@ pub struct Eskf {
     ///   ⇒ 门控判据 ✓：**滞后窗内姿态变化量 `|Δω|·τ`**（量纲 = rad ✓）
     ///     超过 2° ⇒ 认为 ω 非缓变 ⇒ 本拍**停用**该补偿 ✓（A13 ✓ 与 a10 ✓ 各自取到最优 ✓）
     pub prev_grav_omega: [f32; 3],
+    /// ★★§5.247【延迟时刻融合架构 ✓】近期姿态**环形历史**（32 × 16B = 512B ✓）
+    ///   动机 ✓（§5.246 结论 ✓）：本仓原先用【标量回退】`q ⊗ exp(−ω·τ)` 近似**延迟量测** ✗
+    ///     —— 该一阶近似隐含"τ 内 ω 恒定" ⇒ ω 快变时失效 ✗（实测：A13 最优 τ=22ms vs
+    ///     自动标定 11.3ms ✓；a10 更要 0ms ✓ ⇒ 两项残余同源 ✓）。
+    ///   PX4 一手 ✓：**不做事后回退** —— 量测进 IMU 缓冲，在**量测自身的延迟时刻**融合 ✓。
+    ///   本架构 ✓：每拍把姿态推入环形缓冲 ⇒ 需要延迟姿态时**O(1) 精确查表** ✓
+    ///     （`delayed_attitude(τ)` ✓，含小数步的 nlerp 插值 ✓）⇒ 与 PX4 语义等价 ✓
+    ///   零热路径开销 ✓：查表不含旋钮读 ✓（不触发 `cost::hot_path_knob_reads_bounded` ✓）
+    pub q_hist: [Quaternion; 32],
+    /// 环写下标（下一写入位置 ✓）
+    pub q_hist_head: usize,
+    /// 已填充长度（上限 32 ✓）
+    pub q_hist_len: usize,
+    /// 最近一次的预测步长（秒 ✓）—— 用于把 `τ` 换算成步数 ✓
+    pub last_dt: f32,
     /// ★§5.187【比力低通群延迟 τ（秒）】：由宿主从**实际滤波器**自动标定后写入
     /// （`Estimator::set_accel_lag_s` ✓）；重力辅助用它把预测姿态回退一阶
     /// （`q_meas = exp(−ω·τ)⊗q` ✓）。`0` ⇒ 不补偿 ✓。
@@ -828,6 +843,10 @@ impl Eskf {
             mag_disturbed_count: 0,
             mag_delay_omega: [0.0; 3],
             prev_grav_omega: [0.0; 3],
+            q_hist: [Quaternion { w: 1.0, x: 0.0, y: 0.0, z: 0.0 }; 32],
+            q_hist_head: 0,
+            q_hist_len: 0,
+            last_dt: 0.004,
             accel_lag_s: 0.0,
             mag_delay_accel_horiz: 0.0,
             last_mag_yaw_innov: 0.0,
@@ -961,6 +980,13 @@ impl Eskf {
             }
         }
         self.st.predict(ImuDelta { delta_ang, delta_vel }, g, dt);
+        // ★§5.247【姿态历史推入 ✓】每拍记录（供延迟时刻查表 ✓；O(1) ✓）
+        self.last_dt = dt;
+        self.q_hist[self.q_hist_head] = self.st.q;
+        self.q_hist_head = (self.q_hist_head + 1) % 32;
+        if self.q_hist_len < 32 {
+            self.q_hist_len += 1;
+        }
     }
 
     /// 量测步：注入【修正】✓
@@ -1101,6 +1127,45 @@ impl Eskf {
     /// · 观测量：**归一化的机体比力** ✓（静止/零加速度时 = Rᵀ·ĝ ✓ 与预测同式 ✓）
     /// · ★**加速度门控**：`|a_world − (−g_ned)|` 超过阈值 ⇒ 拒绝 ✓（照 line 61 的语义 ✓）
     /// · 逐分量顺序融合 ✓（与磁同法 ✓）· 新息门控用 `self.gate` ✓
+    /// ★★§5.247【延迟时刻姿态 ✓】返回 `τ` 秒前的姿态：**O(1) 查表 + nlerp** ✓
+    ///   · 与 PX4 语义等价 ✓：PX4 把量测放进 IMU 缓冲、在**量测自身的延迟时刻**融合 ✓；
+    ///     本仓用环形姿态历史达到同一效果 ✓（精确取代标量回退 ✗）
+    ///   · 小数步用 nlerp（2ms 级小角 ⇒ 与 slerp 等价 ✓，但便宜 ✓）
+    ///   · 半球对齐 ✓（避免走长弧 ✓）；越界 ⇒ 退最早可用样本 ✓
+    ///   · **无旋钮读** ✓ ⇒ 不触发 `cost::hot_path_knob_reads_bounded` ✓
+    pub fn delayed_attitude(&self, tau_s: f32) -> Quaternion {
+        if tau_s <= 0.0 || self.q_hist_len < 2 || self.last_dt <= 0.0 {
+            return self.st.q;
+        }
+        let steps = tau_s / self.last_dt;
+        let m = steps as usize; // no_std：steps>0 ⇒ 截断即 floor ✓
+        if m >= self.q_hist_len - 1 {
+            let i = (self.q_hist_head + 32 - (self.q_hist_len - 1)) % 32;
+            return self.q_hist[i];
+        }
+        let frac = steps - m as f32;
+        let i0 = (self.q_hist_head + 32 - 1 - m) % 32;
+        let a = self.q_hist[i0];
+        if frac <= 0.01 {
+            return a;
+        }
+        let i1 = (self.q_hist_head + 32 - 2 - m) % 32;
+        let b = self.q_hist[i1];
+        let d = a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z;
+        let (bw, bx, by, bz) = if d < 0.0 {
+            (-b.w, -b.x, -b.y, -b.z)
+        } else {
+            (b.w, b.x, b.y, b.z)
+        };
+        Quaternion {
+            w: a.w + (bw - a.w) * frac,
+            x: a.x + (bx - a.x) * frac,
+            y: a.y + (by - a.y) * frac,
+            z: a.z + (bz - a.z) * frac,
+        }
+        .normalize()
+    }
+
     pub fn update_gravity(&mut self, accel_body: [f32; 3], g_ned: [f32; 3]) -> Result<u32, &'static str> {
         // ★★**0 = 默认开** ✓（固件裸 bin 加载 ⇒ `.data` 初值不生效 ⇒ 旋钮读到 0 ✗）
         //   显式关闭用 **2.0** ✓（2026-09-23，§5.52 ✓）—— 否则诊断开关会把观测全关 ✗
@@ -1152,49 +1217,10 @@ impl Eskf {
                 self.accel_lag_s
             }
         };
-        // ★★§5.242【有效性门控 ✓】：标量滞后模型隐含"τ 内 ω 恒定" ⇒ ω 快变时失效 ✗
-        //   判据 = **滞后窗内姿态变化量** `|Δω|·τ`（rad ✓）；> 2° ⇒ 本拍停用补偿 ✓
-        //   实测依据 ✓：A13（恒定 ω ✓）需 ~20ms、a10（30Hz 振荡 ✗）需 0ms ⇒ 该门控让两者
-        //   各自取到最优 ✓（见字段 `prev_grav_omega` 的注释 ✓）
-        let tau_s = {
-            let w = self.mag_delay_omega;
-            let dw = [
-                w[0] - self.prev_grav_omega[0],
-                w[1] - self.prev_grav_omega[1],
-                w[2] - self.prev_grav_omega[2],
-            ];
-            let dwn = crate::math::sqrt(dw[0] * dw[0] + dw[1] * dw[1] + dw[2] * dw[2]);
-            let max_rad = 2.0f32 * core::f32::consts::PI / 180.0; // 2° ✓
-            if dwn * tau_s > max_rad {
-                unsafe { ESKF_GRAV_BRANCH[3] += 1.0; } // 门控计数（诊断 ✓）
-                // ✗§5.246【已试并**否决** ✗：整条更新停用】—— 实测更差，回退到"只置 τ=0" ✓
-                //   实测 ✓：a10 反而 10.045 → **27.723°** ✗（A13 略好 28.1 → 21.9 ✓）
-                //   ⇒ 机理 ✓：**间歇性**门控使辅助时断时续 ⇒ 比"一直关"（关重力 7.783° ✓）
-                //     更糟 ✗ —— 不一致的辅助比没有辅助伤害更大 ✓
-                //   ⇒ 保留"只置 τ=0"（§5.242 ✓）；a10/A13 的张力属**架构项** ✓：
-                //     本仓用"标量回退"近似**延迟量测** ✓（PX4 用 IMU 缓冲，在**量测自身时刻**
-                //     融合 ✓）⇒ 正解 = 延迟时刻融合架构 ✓（与 A13 的结论同源 ✓，记录待做 ✓）
-                0.0
-            } else {
-                tau_s
-            }
-        };
-        self.prev_grav_omega = self.mag_delay_omega;
-        let q_meas = if tau_s > 0.0 {
-            let w = self.mag_delay_omega; // 当前机体角速率 ✓（`eskf_estimator` 每拍写入 ✓）
-            let wn = crate::math::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
-            if wn > 1e-6 {
-                let dq = Quaternion::from_axis_angle(
-                    [w[0] / wn, w[1] / wn, w[2] / wn],
-                    Radian(-wn * tau_s),
-                );
-                (self.st.q * dq).normalize() // §5.240 机体帧回退 ⇒ 右
-            } else {
-                self.st.q
-            }
-        } else {
-            self.st.q
-        };
+        // ★★§5.247【延迟时刻融合 ✓】—— 原为标量回退 `q ⊗ exp(−ω·τ)` ✗（一阶近似，
+        //   ω 快变时失效 ✗，§5.242 曾用"速率变化门控"打补丁 ✓）⇒ 现改为**精确查表** ✓
+        //   ⇒ §5.242 的门控**不再需要**（精确查表对快变 ω 同样正确 ✓，无需关闭补偿 ✓）
+        let q_meas = self.delayed_attitude(tau_s);
         // ★把 H 与预测【提到分量循环外】算一次 ✓（原在循环内被重建 3 次 ✗，
         //   每次含 3 次四元数旋转 ⇒ 白做 2/3 ✓；与 N³/H·P 两轮同类的"重复构造"缺陷 ✓）
         //   ★§5.186：均用回退后的 `q_meas`（与量测同刻 ✓）
@@ -3410,6 +3436,42 @@ mod tests {
     /// （且滤波器对此**自认一致** ✓ NIS≈1 ✓）
     /// ⇒ 按【可观测性极限】重导为：**速度与位置必须【有界且不增长】**
     ///   （可追溯到本测试的目的"不发散"✓ 与上述物理极限 ✓，非放宽 ✗）
+    /// ★§5.247【延迟查表单测 ✓】直接验证环形索引与插值 ✓（回归的定位手段 ✓）
+    #[test]
+    fn delayed_attitude_indexing_is_correct() {
+        use crate::vehicle::Quaternion;
+        let mut e = Eskf::new(Quaternion { w: 1.0, x: 0.0, y: 0.0, z: 0.0 }, [0.0; 3], [0.0; 3], 3.0);
+        e.last_dt = 0.004;
+        // 推入 10 个已知姿态：绕 z 每次 +r
+        let step = 0.02f32;
+        for k in 0..10 {
+            e.q_hist[e.q_hist_head] = Quaternion::from_axis_angle([0.0, 0.0, 1.0], Radian(step * k as f32));
+            e.q_hist_head = (e.q_hist_head + 1) % 32;
+            if e.q_hist_len < 32 { e.q_hist_len += 1; }
+        }
+        // 语义 ✓：`τ <= 0` ⇒ 返回**当前状态**（不是历史 ✓ —— 由调用方语义决定 ✓）
+        assert_eq!(e.delayed_attitude(0.0).yaw(), 0.0, "τ=0 ⇒ 当前状态 ✓");
+        assert_eq!(e.delayed_attitude(-1.0).yaw(), 0.0, "τ<0 ⇒ 当前状态 ✓");
+        // 往回 m 步 ⇒ 应为 (9-m)*step ✓（τ = m*dt ✓；m=0 ⇒ 最近推入者 = k=9 ✓）
+        // ⚠️从 m=1 起：m=0 ⇒ τ=0 ⇒ 语义上是"当前状态"（上面已断言 ✓），不是历史样本 ✓
+        for m in 1..6usize {
+            let tau = m as f32 * 0.004;
+            let q = e.delayed_attitude(tau);
+            let want = step * (9 - m) as f32;
+            let got = q.yaw().to_degrees();
+            assert!(
+                (got - want.to_degrees()).abs() < 1.0,
+                "m={m}: 期望 {:.2}° 实得 {:.2}° ✗",
+                want.to_degrees(), got
+            );
+        }
+        // 插值：τ = 1.5 步 ⇒ 期望 7.5*step ✓
+        let q = e.delayed_attitude(1.5 * 0.004);
+        let got = q.yaw().to_degrees();
+        let want = (step * 7.5f32).to_degrees();
+        assert!((got - want).abs() < 1.0, "插值：期望 {want:.2}° 实得 {got:.2}° ✗");
+    }
+
     #[test]
     fn c1_filter_loop_stationary_converges() {
         let g = [0.0f32, 0.0, 9.81];
