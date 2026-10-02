@@ -22,7 +22,7 @@ use flyctrl_core::controller::mpc::MpcController;
 use flyctrl_core::controller::pid::PidController;
 use flyctrl_core::controller::trait_def::{ActuatorCmd, Controller};
 use flyctrl_core::estimator::complementary::ComplementaryEstimator;
-use flyctrl_core::estimator::ekf::EkfEstimator;
+use flyctrl_core::estimator::eskf_estimator::EskfEstimator;
 use flyctrl_core::estimator::trait_def::Estimator;
 use flyctrl_core::fdir::Fdir;
 use flyctrl_core::vehicle::{Second, VehicleState};
@@ -95,7 +95,7 @@ fn run_combo(
     }
 
     let mut comp = ComplementaryEstimator::new(0.5, 0.1, 0.1);
-    let mut ekf = EkfEstimator::default_quad();
+    let mut ekf = EskfEstimator::default_quad();
     let mut pid = PidController::from_config(&cfg.ctrl_params());
     let mut lqr = LqrController::from_config(&cfg.ctrl_params());
     let mut mpc = MpcController::from_config(&cfg.ctrl_params());
@@ -484,7 +484,7 @@ fn run_combo_maxerr(
     }
 
     let mut comp = ComplementaryEstimator::new(0.5, 0.1, 0.1);
-    let mut ekf = EkfEstimator::default_quad();
+    let mut ekf = EskfEstimator::default_quad();
     let mut pid = PidController::from_config(&cfg.ctrl_params());
     let mut lqr = LqrController::from_config(&cfg.ctrl_params());
     let mut mpc = MpcController::from_config(&cfg.ctrl_params());
@@ -639,7 +639,7 @@ fn run_fixed_params(
         world.set_fault(fault, 4.0, 8.0);
     }
     let mut comp = ComplementaryEstimator::new(0.5, 0.1, 0.1);
-    let mut ekf = EkfEstimator::default_quad();
+    let mut ekf = EskfEstimator::default_quad();
     let mut pid = PidController::from_config(&VehicleConfig::default_quad().ctrl_params());
     let mut lqr = LqrController::from_config(&VehicleConfig::default_quad().ctrl_params());
     let mut mpc = MpcController::from_config(&VehicleConfig::default_quad().ctrl_params());
@@ -716,7 +716,7 @@ fn run_rtf_eval(scenario: &Scenario, seconds: f32) {
     phys.set_wind_gust(wp.wind_gust);
 
     let _comp = ComplementaryEstimator::new(0.5, 0.1, 0.1);
-    let mut ekf = EkfEstimator::default_quad();
+    let mut ekf = EskfEstimator::default_quad();
     let _lqr = LqrController::from_config(&cfg.ctrl_params());
     let mut mpc = MpcController::from_config(&cfg.ctrl_params());
 
@@ -788,7 +788,7 @@ fn run_comm_demo(scenario: &Scenario, seconds: f32) {
     phys.set_wind(wp.wind);
     phys.set_wind_gust(wp.wind_gust);
 
-    let mut ekf = EkfEstimator::default_quad();
+    let mut ekf = EskfEstimator::default_quad();
     let mut mpc = MpcController::from_config(&cfg.ctrl_params());
     let mut telem = Telemetry::new(50);
     let mut link = LoopbackLink::new();
@@ -1011,8 +1011,8 @@ fn run_indi_demo(scenario: &Scenario, seconds: f32) {
     phys_pid.set_wind(wp.wind);
     phys_indi.set_wind(wp.wind);
 
-    let mut ekf_pid = EkfEstimator::default_quad();
-    let mut ekf_indi = EkfEstimator::default_quad();
+    let mut ekf_pid = EskfEstimator::default_quad();
+    let mut ekf_indi = EskfEstimator::default_quad();
     let mut pid = PidController::from_config(&cfg.ctrl_params());
     let mut indi = IndiController::with_inertia(PidController::from_config(&cfg.ctrl_params()), cfg.inertia, dt.0, 1.0);
 
@@ -1070,7 +1070,7 @@ fn run_indi_demo(scenario: &Scenario, seconds: f32) {
 fn run_swarm_demo(seconds: f32) {
     use flyctrl_core::controller::pid::PidController as Pid;
     use flyctrl_core::controller::Controller;
-    use flyctrl_core::estimator::ekf::EkfEstimator as Ekf;
+    use flyctrl_core::estimator::eskf_estimator::EskfEstimator as Ekf;
     use flyctrl_core::estimator::Estimator;
     use flyctrl_core::swarm::{Formation, FormationController, NeighborState};
     use flyctrl_core::units::*;
@@ -1172,7 +1172,7 @@ fn run_swarm_demo(seconds: f32) {
 fn run_mission_demo(seconds: f32) {
     use flyctrl_core::controller::pid::PidController as Pid;
     use flyctrl_core::controller::Controller;
-    use flyctrl_core::estimator::ekf::EkfEstimator as Ekf;
+    use flyctrl_core::estimator::eskf_estimator::EskfEstimator as Ekf;
     use flyctrl_core::estimator::Estimator;
     use flyctrl_core::flightmode::{FlightMode, ModeContext, ModeGovernor};
     use flyctrl_core::fdir::Health;
@@ -1267,7 +1267,7 @@ fn run_mission_demo(seconds: f32) {
 ///
 /// 飞控栈拆成 8 个"节点"，彼此只通过总线通信、不互相持有引用：
 /// 1. 传感器节点：`world.sense` → `publish_imu` / `publish_gps`。
-/// 2. 估计节点：`recv_imu`+`recv_gps` → `EkfEstimator` → `publish_est`（扇出到 ctrl/fdir）。
+/// 2. 估计节点：`recv_imu`+`recv_gps` → `EskfEstimator` → `publish_est`（扇出到 ctrl/fdir）。
 /// 3. FDIR 节点：`recv_est_fdir`+`recv_imu`+GPS 可用性 → `Fdir` → `publish_health`。
 /// 4. 任务节点：`recv_est` → `MissionRunner` → `publish_setpoint`（航点完成后转悬停）。
 /// 5. 编队节点：`recv_est` → 经 `neighbor` 通道广播自身状态（多机时互为邻居）。
@@ -1280,7 +1280,7 @@ fn run_bus_demo(seconds: f32) {
     use flyctrl_core::bus::Bus;
     use flyctrl_core::controller::pid::PidController as Pid;
     use flyctrl_core::controller::Controller;
-    use flyctrl_core::estimator::ekf::EkfEstimator as Ekf;
+    use flyctrl_core::estimator::eskf_estimator::EskfEstimator as Ekf;
     use flyctrl_core::estimator::Estimator;
     use flyctrl_core::flightmode::{FlightMode, ModeContext, ModeGovernor};
     use flyctrl_core::invariants::{actuator_bounded, state_finite};

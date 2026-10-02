@@ -88,13 +88,13 @@ impl<E: Estimator, R: ResidualModel> Estimator for LearningEstimator<E, R> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::estimator::ekf::EkfEstimator;
+    use crate::estimator::eskf_estimator::EskfEstimator;
 
     #[test]
     fn null_residual_passthrough() {
         // 零补偿应完全不改基底估计。
-        let mut ekf = EkfEstimator::default_quad();
-        let mut le = LearningEstimator::new(EkfEstimator::default_quad(), NullResidual);
+        let mut ekf = EskfEstimator::default_quad();
+        let mut le = LearningEstimator::new(EskfEstimator::default_quad(), NullResidual);
         let imu = ImuSample {
             accel: [MeterPerSecondSquared(0.0), MeterPerSecondSquared(0.0), MeterPerSecondSquared(-9.81)],
             gyro: [RadianPerSecond(0.0); 3],
@@ -110,7 +110,7 @@ mod tests {
     fn bias_residual_corrects() {
         // 已知偏置应被精确加回。
         let bias = BiasResidual { pos_bias: [0.1, -0.2, 0.3], vel_bias: [0.0; 3] };
-        let mut le = LearningEstimator::new(EkfEstimator::default_quad(), bias);
+        let mut le = LearningEstimator::new(EskfEstimator::default_quad(), bias);
         let imu = ImuSample {
             accel: [MeterPerSecondSquared(0.0), MeterPerSecondSquared(0.0), MeterPerSecondSquared(-9.81)],
             gyro: [RadianPerSecond(0.0); 3],

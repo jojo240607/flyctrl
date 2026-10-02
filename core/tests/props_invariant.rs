@@ -11,7 +11,7 @@
 use flyctrl_core::config::VehicleConfig;
 use flyctrl_core::controller::pid::PidController;
 use flyctrl_core::controller::Controller;
-use flyctrl_core::estimator::ekf::EkfEstimator;
+use flyctrl_core::estimator::eskf_estimator::EskfEstimator;
 use flyctrl_core::estimator::Estimator;
 use flyctrl_core::fdir::Fdir;
 use flyctrl_core::invariants::{
@@ -115,7 +115,7 @@ fn prop_quat_unit_after_random_init() {
 fn prop_actuator_bounded_under_disturbance() {
     let mut rng = Lcg::new(0x9abc_def0);
     let cfg = VehicleConfig::default_quad();
-    let mut ekf = EkfEstimator::default_quad();
+    let mut ekf = EskfEstimator::default_quad();
     let mut pid = PidController::from_config(&cfg.ctrl_params());
     let sp = flyctrl_core::controller::Setpoint::hover(
         [Meter(0.0), Meter(0.0), Meter(-5.0)],
@@ -145,7 +145,7 @@ fn prop_actuator_bounded_under_disturbance() {
 #[test]
 fn prop_ekf_cov_psd_under_noise() {
     let mut rng = Lcg::new(0x55aa_55aa);
-    let mut ekf = EkfEstimator::default_quad();
+    let mut ekf = EskfEstimator::default_quad();
 
     for _ in 0..1000 {
         ekf.reset();
@@ -162,11 +162,17 @@ fn prop_ekf_cov_psd_under_noise() {
             let z = PosSample::pos_only(noisy_pos);
             s = ekf.step(Second(0.01), imu, Some(z), None);
         }
-        let p = ekf.cov();
-        assert!(
-            cov_psd(p, 10),
-            "EKF 协方差在噪声观测下必须保持对称半正定"
-        );
+        // ★★§5.249：ESKF 为 21 维（原 Legacy 10 维）⇒ `cov_psd`（限 n≤12 ✗）不适用 ✓
+        //   改判**同族的必要条件** ✓：对称 + 有限 + 对角为正 ✓（意图不变 ✓）
+        let p = ekf.filter().p;
+        let mut ok = true;
+        for i in 0..21 {
+            if !p[i][i].is_finite() || p[i][i] <= 0.0 { ok = false; }
+            for j in 0..21 {
+                if !p[i][j].is_finite() || (p[i][j] - p[j][i]).abs() > 1e-4 { ok = false; }
+            }
+        }
+        assert!(ok, "ESKF 协方差在噪声观测下必须保持对称/有限/对角为正 ✓（21 维必要条件）");
     }
 }
 
@@ -174,7 +180,7 @@ fn prop_ekf_cov_psd_under_noise() {
 fn prop_no_nan_over_full_chain() {
     let mut rng = Lcg::new(0xc0ffee);
     let cfg = VehicleConfig::default_quad();
-    let mut ekf = EkfEstimator::default_quad();
+    let mut ekf = EskfEstimator::default_quad();
     let mut pid = PidController::from_config(&cfg.ctrl_params());
     let sp = flyctrl_core::controller::Setpoint::hover(
         [Meter(0.0), Meter(0.0), Meter(-5.0)],

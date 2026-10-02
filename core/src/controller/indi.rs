@@ -196,7 +196,7 @@ mod tests {
     use super::*;
     use crate::config::VehicleConfig;
     use crate::controller::pid::PidController;
-    use crate::estimator::ekf::EkfEstimator;
+    use crate::estimator::eskf_estimator::EskfEstimator;
     use crate::estimator::Estimator;
     use crate::hal::sensor::{GpsSensor, ImuSensor, MockGps, MockImu};
     use crate::invariants::{actuator_bounded, state_finite};
@@ -205,7 +205,7 @@ mod tests {
     fn indi_bounded_and_no_nan() {
         // INDI 包装 PID，闭环运行：指令仍恒有界、状态无 NaN。
         let cfg = VehicleConfig::default_quad();
-        let mut ekf = EkfEstimator::default_quad();
+        let mut ekf = EskfEstimator::default_quad();
         let base = PidController::from_config(&cfg.ctrl_params());
         let mut indi =
             IndiController::with_inertia(base, cfg.inertia, 0.01, 0.8);
@@ -233,7 +233,7 @@ mod tests {
         let cfg = VehicleConfig::default_quad();
         let sp = Setpoint::hover([Meter(0.0), Meter(0.0), Meter(-5.0)], Radian(0.0));
 
-        let mut ekf = EkfEstimator::default_quad();
+        let mut ekf = EskfEstimator::default_quad();
         let mut imu = MockImu::new();
         let mut gps = MockGps::new();
 

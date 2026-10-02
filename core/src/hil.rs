@@ -256,7 +256,7 @@ where
     /// - `imu` / `gps` / `airspeed`：当拍传感器（泛型，host/mock 或 MCU/PAC 均可）。
     /// - `vio` / `rtk`：P3-B1 多源融合通道（视觉里程计 / RTK-GPS）。二者在估计步
     ///   之后经 [`Estimator::update_vio`] / [`Estimator::update_rtk`] 注入（默认 no-op，
-    ///   仅 `EkfEstimator` 实际融合）。保持 `step` 主链签名稳定，仅在尾部追加。
+    ///   仅 `EskfEstimator` 实际融合）。保持 `step` 主链签名稳定，仅在尾部追加。
     /// - `setpoint`：当前设定点（由轨迹/遥控器提供）。
     /// - `motors`：执行器（泛型）。
     ///
@@ -288,7 +288,7 @@ where
         let vio_sample = vio.read();
         let rtk_sample = rtk.read();
 
-        // 2) 估计（含 VIO/RTK 观测融合，非 EkfEstimator 实现为 no-op）。
+        // 2) 估计（含 VIO/RTK 观测融合，非 EskfEstimator 实现为 no-op）。
         let est_state = self.est.step(self.dt, sample, pos, air_sample);
         self.est.update_vio(vio_sample);
         self.est.update_rtk(rtk_sample);
@@ -354,7 +354,7 @@ where
         let vio_sample = vio.read();
         let rtk_sample = rtk.read();
 
-        // 2) 估计（含 VIO/RTK 观测融合，非 EkfEstimator 实现为 no-op）。
+        // 2) 估计（含 VIO/RTK 观测融合，非 EskfEstimator 实现为 no-op）。
         let est_state = self.est.step(self.dt, sample, pos, air_sample);
         self.est.update_vio(vio_sample);
         self.est.update_rtk(rtk_sample);
@@ -570,7 +570,7 @@ where
         }
         // VIO/RTK 多源融合（P3-B1）：与 `HilContext::step` 旧路径保持一致——SIL 注入
         // 模拟 VIO/RTK 观测（含噪声），MCU HIL 无此通道则传 None（`update_vio`/
-        // `update_rtk` 对非 EkfEstimator 实现为 no-op，EkfEstimator 仅在其可用时融合）。
+        // `update_rtk` 对非 EskfEstimator 实现为 no-op，EskfEstimator 仅在其可用时融合）。
         // 位置观测更紧（r_vio_pos/r_rtk）→ realistic 噪声下位置估计收敛更快、漂移更小。
         self.est.update_vio(vio);
         self.est.update_rtk(rtk);
@@ -696,8 +696,7 @@ mod tests {
     use crate::config::VehicleConfig;
     use crate::controller::pid::PidController;
     use crate::controller::Controller;
-    use crate::estimator::ekf::EkfEstimator;
-use crate::estimator::eskf_estimator::EskfEstimator;
+    use crate::estimator::eskf_estimator::EskfEstimator;
     use crate::hal::actuator::MockMotors;
     use crate::hal::sensor::{MockAirspeed, MockBaro, MockGps, MockImu, MockMag, MockRtk, MockVio};
     use crate::invariants::{actuator_bounded, state_finite};
@@ -711,7 +710,7 @@ use crate::estimator::eskf_estimator::EskfEstimator;
         // + GPS + 气压 → 姿态/位置初始化 → 闭环全程无 NaN、指令恒有界。
         let cfg = VehicleConfig::default_quad();
         let mut ctx = HilContext::new(
-            EkfEstimator::default_quad(),
+            EskfEstimator::default_quad(),
             PidController::from_config(&cfg.ctrl_params()),
             Second(0.004),
         );
@@ -746,7 +745,7 @@ use crate::estimator::eskf_estimator::EskfEstimator;
         // 本测试断言姿态收敛到设定点（yaw=0.7），所以按该姿态生成机体磁场。
         //
         // 历史：这里原本注入**恒定机体系** `[0.2,0,0.4]`（等价于磁场随飞行器一起转，
-        // 物理不成立）。当时 `EkfEstimator` 缺 `Estimator::update_mag` 的 trait 委托
+        // 物理不成立）。当时 `EskfEstimator` 缺 `Estimator::update_mag` 的 trait 委托
         // → 磁锚定静默失效 → 恒定场无人理会，yaw 停在设定点，“恰好”能过。
         // 修好委托后锚定生效，它忠实地把 yaw 拉向恒定场所暗示的航向(0)，断言才暴露。
         let mag_body = rotate_vec_by_quat_inverse(
@@ -788,7 +787,7 @@ use crate::estimator::eskf_estimator::EskfEstimator;
         // 滞后（那会在数百拍后积累数十度误差 → HIL 闭环姿态发散）。
         let cfg = VehicleConfig::default_quad();
         let mut ctx = HilContext::new(
-            EkfEstimator::default_quad(),
+            EskfEstimator::default_quad(),
             PidController::from_config(&cfg.ctrl_params()),
             Second(0.004),
         );
@@ -861,7 +860,7 @@ use crate::estimator::eskf_estimator::EskfEstimator;
     /// 与姿态环持续存在误差，否则稳态下输出恒为悬停油门、参数差异被掩盖。
     /// 两侧估计器输入相同 → 估计状态逐位一致，输出差异纯粹来自 PID 参数。
     ///
-    /// ★★§5.226【去 Legacy 影响 ✓】：本测例原用 `EkfEstimator`（Legacy）**复刻产品** ✗ ——
+    /// ★★§5.226【去 Legacy 影响 ✓】：本测例原用 `EskfEstimator`（Legacy）**复刻产品** ✗ ——
     ///   而产品（`app/src/flyctrl/control.rs`）用的是 `AnyEstimator::default_product()` = **ESKF** ✗
     ///   ⇒ 它复刻的是**过期配置** ✗。改为两侧都用 **ESKF**（= 产品实际 ✓）⇒ 结论才代表产品 ✓。
     #[test]
@@ -939,13 +938,13 @@ use crate::estimator::eskf_estimator::EskfEstimator;
         // ---- Part2：两侧都用 from_config（排除本身差异后），同一输入 ----
         // 逐位一致断言：证明"输入一致 + 参数一致 → 输出完全一致"（H3/编排无差异）。
         let mut cfg2 = HilContext::new(
-            EkfEstimator::default_quad(),
+            EskfEstimator::default_quad(),
             PidController::from_config(&cfg.ctrl_params()),
             Second(0.004),
         );
         let mut cfg2_sim = SimImu::new();
         let mut ref_ctx = HilContext::new(
-            EkfEstimator::default_quad(),
+            EskfEstimator::default_quad(),
             PidController::from_config(&cfg.ctrl_params()),
             Second(0.004),
         );
@@ -976,7 +975,7 @@ use crate::estimator::eskf_estimator::EskfEstimator;
         let _mag = MockMag::new();
         let mut motors = MockMotors::new(crate::hal::actuator::OutputProtocol::Pwm);
 
-        let mut ctx = HilContext::new(EkfEstimator::default_quad(), PidController::from_config(&cfg.ctrl_params()), Second(0.01));
+        let mut ctx = HilContext::new(EskfEstimator::default_quad(), PidController::from_config(&cfg.ctrl_params()), Second(0.01));
         let sp = crate::controller::Setpoint::hover([Meter(0.0), Meter(0.0), Meter(-5.0)], crate::units::Radian(0.0));
 
         for it in 0..300 {
@@ -998,7 +997,7 @@ use crate::estimator::eskf_estimator::EskfEstimator;
         let mut vio = MockVio::new();
         let mut rtk = MockRtk::new();
         let mut motors = MockMotors::new(crate::hal::actuator::OutputProtocol::Pwm);
-        let mut ctx = HilContext::new(EkfEstimator::default_quad(), PidController::from_config(&cfg.ctrl_params()), Second(0.01));
+        let mut ctx = HilContext::new(EskfEstimator::default_quad(), PidController::from_config(&cfg.ctrl_params()), Second(0.01));
         let sp = crate::controller::Setpoint::hover([Meter(0.0); 3], crate::units::Radian(0.0));
 
         // 先正常跑几拍。

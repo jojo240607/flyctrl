@@ -5,7 +5,7 @@
 //! 观察速度前馈 + 加速度前馈 + cos_tilt 倾斜补偿下的实际跟踪效果。
 
 use flyctrl_core::controller::pid::PidController;
-use flyctrl_core::estimator::ekf::EkfEstimator;
+use flyctrl_core::estimator::eskf_estimator::EskfEstimator;
 use flyctrl_core::units::Second;
 use flyctrl_sim::harness::Harness;
 use flyctrl_sim::physics::{Physics, PhysicsParams};
@@ -24,7 +24,7 @@ fn scenario_metrics_table() {
     for kind in ScenarioKind::all() {
         let phys = Physics::new(PhysicsParams::default());
         let world = World::new(WorldParams::default());
-        let est = EkfEstimator::default_quad();
+        let est = EskfEstimator::default_quad();
         let ctrl = PidController::default_quad();
         let mut h = Harness::new(phys, world, est, ctrl, dt);
         let scenario = Scenario::new(*kind);
@@ -50,7 +50,7 @@ fn vertical_osc_probe() {
     let dt = Second(0.005);
     let mut phys = Physics::new(PhysicsParams::default());
     let mut world = World::new(WorldParams::default());
-    let mut est = EkfEstimator::default_quad();
+    let mut est = EskfEstimator::default_quad();
     let mut ctrl = PidController::default_quad();
     let scenario = Scenario::new(ScenarioKind::Hover);
     let mut cmd = ActuatorCmd::zero();
@@ -113,7 +113,7 @@ fn vertical_wind_probe() {
     let dt = Second(0.005);
     let mut phys = Physics::new(PhysicsParams::default());
     let mut world = World::new(WorldParams::default());
-    let mut est = EkfEstimator::default_quad();
+    let mut est = EskfEstimator::default_quad();
     let mut ctrl = PidController::default_quad();
     let mut cmd = ActuatorCmd::zero();
     let mut sp = Setpoint::hover([Meter(0.0), Meter(0.0), Meter(-10.0)], Radian(0.0));
@@ -203,7 +203,7 @@ fn vertical_margin_probe() {
     };
     let mut phys = Physics::new(PhysicsParams::default());
     let mut world = World::new(wp);
-    let mut est = EkfEstimator::default_quad();
+    let mut est = EskfEstimator::default_quad();
     let mut ctrl = PidController::default_quad();
     let mut cmd = ActuatorCmd::zero();
     let mut sp = Setpoint::hover([Meter(0.0), Meter(0.0), Meter(-10.0)], Radian(0.0));
