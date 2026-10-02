@@ -243,6 +243,27 @@ pub const YAW_P_SCALE: f32 = 1.0;
 ///   ⇒ PX4 的 **yaw 无 D** ✓（结构差异见 `YAW_P_SCALE` 注释 ✓）；`1.0` = 逐位不变 ✓
 pub const YAW_D_SCALE: f32 = 1.0;
 
+/// ★★§5.265【PX4 一手：**偏航力矩输出低通** ✓】`MC_YAW_TQ_CUTOFF`（一手 `mc_rate_control_params.yaml` ✓）
+///   · 语义 ✓（`MulticopterRateControl.cpp:235` 原文 ✓）：
+///       "apply low-pass filtering on yaw axis to **reduce high frequency torque caused by
+///        rotor acceleration**" ⇒ `torque_setpoint(2) = _output_lpf_yaw.update(...)` ✓
+///   · 一手默认 = **2.0 Hz** ✓（range 0–10 ✓）；`0` ⇒ 关 ✓
+///   · 动机（本仓实测 ✓）：激进轨迹饱和 94~100% ✗、切向偏航族 ✗ —— 偏航与推力争权限 ✓
+///   · `0.0` ⇒ **完全旁路** ✓（逐位不变 ✓）；`>0` 为 A/B 目标值 ✓
+pub const YAW_TQ_CUTOFF_HZ: f32 = 0.0;
+// ★★§5.265【实测结论 ✓：方向已扫（4 档 ✓），当前结构下**保持关** ✓】
+//   一手 ✓：PX4 `MC_YAW_TQ_CUTOFF` 默认 **2.0 Hz** ✓（`mc_rate_control_params.yaml` ✓），
+//     语义原文 ✓（`MulticopterRateControl.cpp:235`）："apply low-pass filtering on yaw axis to
+//     reduce high frequency torque caused by **rotor acceleration**" ✓
+//   实测扫描 ✓（目标 = 套件 + 在包线内阈值 ✓、确定性测量 ✓）：
+//     0（关） **15/0 + 18/0** ✓ · 2（PX4 值）14/1 + 17/1 ✗ · 5 → 14/1 + 17/1 ✗ ·
+//     10 → 14/1 + 18/0 ✗ · 20 → 15/0 + 18/0（≈中性 ✓，几乎未滤 ✓）
+//   ⇒ ★结论 ✓：**没有收益带** ✗ —— 任何有实际滤波作用的截止频率都会弄坏测例 ✓；
+//     原因 ✓：PX4 的 2 Hz 低通作用在其**速率环的力矩输出**上（该环带宽更高、且面向
+//     旋翼动力学 ✓），而我仓是**姿态误差级联**结构 ⇒ 同一滤波引入的滞后更大 ✗
+//     ⇒ **数值不可跨结构照搬** ✓（同 §5.243/§5.257 的教训 ✓）
+//   ⇒ 保持 `0.0`（**完全旁路** ✓ 逐位不变 ✓）；机制**保留** ✓（待结构变化后可在同一目标下复测 ✓）
+
 pub struct PidController {
     // 位置外环 P：位置误差 -> 期望速度（世界系）
     kp_xy: f32,
@@ -258,6 +279,9 @@ pub struct PidController {
     // 默认 false（位置模式）；非 HIL 演示固件开启（大疆手感），HIL 保持位置模式。
     rate_mode_xy: bool,
     // 姿态内环：四元数误差 -> 机体角速度 的 P（比例）与 D（角速度阻尼）增益
+    /// ★§5.265 偏航力矩输出低通状态（PX4 `MC_YAW_TQ_CUTOFF` ✓）
+    yaw_tq_lpf: f32,
+    yaw_tq_initialized: bool,
     att_kp: f32,
     att_kd: f32,
     // 推力基值（悬停油门）与重力（用于倾角->加速度映射）
@@ -474,6 +498,8 @@ impl PidController {
             //       **速率误差增益（直接放噪）**，缺 PX4 那级"微分后再低通"✗
             //   ⇒ 前置条件 = **重构 D 项为 角加速度 + 低通**（对齐 IMU_DGYRO_CUTOFF ✓）
             //     ⇒ 在那之前 ③ 保持**默认关** ✓（`G_ESKF_GYR_LPF > 0` 可显式启用 ✓）
+            yaw_tq_lpf: 0.0,
+            yaw_tq_initialized: false,
             att_kp: 4.5,
             att_kd: 0.45,
             hover_thrust: 0.5,
@@ -1306,6 +1332,21 @@ impl PidController {
             for k in 0..3 {
                 att_out.rates[k] += self.att_kd * w_ff[k];
             }
+        }
+        // ★★§5.265【PX4 一手：偏航力矩输出低通 ✓】`MC_YAW_TQ_CUTOFF`（默认 2.0 Hz ✓）
+        //   一手语义 ✓：抑制"**旋翼加速引起的高频偏航力矩**" ✓（`MulticopterRateControl.cpp:235` ✓）
+        //   本仓实现 ✓：对 yaw 通道的**控制输出**（= 力矩量纲 ✓，送混控 ✓）做一阶低通 ✓
+        //   `YAW_TQ_CUTOFF_HZ <= 0` ⇒ **完全旁路** ✓（逐位不变 ✓）
+        if YAW_TQ_CUTOFF_HZ > 0.0 {
+            let dt_s = _dt.0.max(1e-6); // `_dt` = control 周期（Second ✓）
+            let rc = 1.0 / (2.0 * core::f32::consts::PI * YAW_TQ_CUTOFF_HZ);
+            let a = dt_s / (dt_s + rc);
+            if !self.yaw_tq_initialized {
+                self.yaw_tq_lpf = att_out.rates[2];
+                self.yaw_tq_initialized = true;
+            }
+            self.yaw_tq_lpf += a * (att_out.rates[2] - self.yaw_tq_lpf);
+            att_out.rates[2] = self.yaw_tq_lpf;
         }
         self.dbg_err = att_out.err;
         self.dbg_pqr = att_out.rates;
