@@ -145,7 +145,7 @@ impl VehicleConfig {
             dgyro_k: 0.02,
             dgyro_cutoff: 20.0,
             ki_rate: 0.5,
-            mix_mode: 2, // ★§5.216 PX4 一手同构（姿态优先 ✓）默认开
+            mix_mode: 2, // ★§5.216 PX4 一手同构（姿态优先 ✓）默认开（= PX4 `MC_AIRMODE=0` ✓ 同默认 ✓） // ★§5.216 PX4 一手同构（姿态优先 ✓）默认开
             kp_xy: 0.3,
             // ★§5.195：与 `PidController::default_quad()` 同步（0.8 → **3.0** ✓，理由见彼处注释）
             kv_xy: 3.0, // ★§5.195

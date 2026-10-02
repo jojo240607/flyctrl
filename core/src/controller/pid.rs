@@ -493,7 +493,12 @@ impl PidController {
             dgyro_k: 0.02,
             ki_rate: 0.5,
             i_rate: [0.0; 3],
-            mix_mode: 2, // ★§5.216 PX4 一手同构（姿态优先 ✓）默认开
+            // ★★§5.255【默认 = PX4 `MC_AIRMODE=0` ✓（airmode 关 ✓）—— 与 PX4 同默认 ✓】
+            //   档位 ✓：`0` 原路径 · `1` 保推力 ✗ · `2` = PX4 `mixAirmodeDisabled` ✓（默认 ✓）·
+            //   `3` = PX4 `mixAirmodeRP` ✓（airmode ✓，允许抬高推力换姿态权限 ✓）
+            //   实测 ✓（切向偏航场景）：`3` 使偏航误差 **172.1° → 66.8°** ✓、稳态 18.845 → 15.553m ✓
+            //     （PX4 亦默认关 ✓，激进飞行时由配置开启 ✓）
+            mix_mode: 2,
             dgyro_cutoff: 20.0,
             prev_omega: [0.0; 3],
             dgyro_filt: [0.0; 3],
@@ -1307,7 +1312,12 @@ impl PidController {
         // ★★§5.215：`mix_sat=true` ⇒ **推力优先**的饱和管理 ✓（差动塞不下时绕均值缩放 ⇒
         //   **均值/总推力精确保住** ✓，代价是短时牺牲姿态权限 ✓）；
         //   `false` ⇒ 原路径（四路各自 clamp ✗ ⇒ 触界时均值丢失 ⇒ 掉高 ✗）**逐位不变** ✓
-        let motors = if self.mix_mode == 2 {
+        let motors = if self.mix_mode == 3 {
+            // ★★§5.255【PX4 `mixAirmodeRP`（`MC_AIRMODE=1` ✓）】—— 允许抬高推力换姿态权限 ✓
+            //   与 `mix_mode == 2`（= PX4 `mixAirmodeDisabled` ✓ 默认 ✓）的唯一差异 ✓：
+            //     混【含 yaw】✓ + 推力去饱和**无 increase_only** ✓ + yaw 最后去饱和 ✓
+            super::attitude::x4_mix_px4_airmode(des_thrust, att_out.rates, true)
+        } else if self.mix_mode == 2 {
             // ★★§5.216：PX4 一手同构（姿态优先 ✓）
             super::attitude::x4_mix_px4(des_thrust, att_out.rates)
         } else if self.mix_mode == 1 {

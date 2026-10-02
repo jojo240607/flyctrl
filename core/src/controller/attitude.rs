@@ -121,6 +121,46 @@ fn desaturate(m: &mut [f32; 4], dv: &[f32; 4], lo: f32, hi: f32, only_reduce: bo
 /// ★★§5.216：PX4 一手同构的四旋翼控制分配（**姿态优先于推力** ✓）。
 /// `mix_sat == false` 时不必调用（原路径逐位不变 ✓）。
 pub fn x4_mix_px4(des_thrust: f32, pqr: [f32; 3]) -> [f32; 4] {
+    x4_mix_px4_airmode(des_thrust, pqr, false)
+}
+
+/// ★★§5.255【PX4 `mixAirmodeRP` ✓ = `MC_AIRMODE=1` ✓】—— airmode 开关 ✓
+///
+/// 一手依据 ✓（`ControlAllocationSequentialDesaturation.cpp` ✓ 本机已取 ✓）：
+/// ```text
+/// mixAirmodeDisabled()（=0 ✓，我仓原实现 ✓）：
+///   混【不含 yaw】→ desaturateActuators(thrust_z, **increase_only=true** ✗ 只许减推力)
+///                  → 减 roll/pitch → mixYaw()（+ MINIMUM_YAW_MARGIN ✓）
+/// mixAirmodeRP()（=1 ✓，本函数 ✓）：
+///   混【含 yaw】  → desaturateActuators(thrust_z)   ← **无 increase_only** ✓
+///                  → desaturateActuators(yaw)        （姿态优先 ✓）
+/// ```
+/// **本质差异** ✓：airmode 允许**抬高推力**去饱和 ⇒ 姿态（roll/pitch/yaw）**保住权限** ✓，
+///   代价是推力被抬升 ⇒ 正是"**姿态权限 vs 推力**"的 PX4 解法 ✓✓
+/// 动机（本仓实测 ✓）：激进轨迹下饱和 **22.7~94.4%** ✗、切向偏航场景 **99.1%** ✗
+///   ⇒ 姿态失去权限 ⇒ 若 airmode 有效则应显著改善 ✓（见台账 §5.255 的实测 ✓）
+pub fn x4_mix_px4_airmode(des_thrust: f32, pqr: [f32; 3], airmode: bool) -> [f32; 4] {
+    if airmode {
+        let (p, q, r) = (pqr[0], pqr[1], pqr[2]);
+        const THRUST_Z: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
+        const ROLL: [f32; 4] = [0.5, -0.5, -0.5, 0.5];
+        const PITCH: [f32; 4] = [0.5, -0.5, 0.5, -0.5];
+        const YAW: [f32; 4] = [0.5, 0.5, -0.5, -0.5];
+        // 一手 `mixAirmodeRP` 第 1 步：混【含 yaw】✓
+        let mut m = [0.0f32; 4];
+        for i in 0..4 {
+            m[i] = des_thrust + ROLL[i] * p + PITCH[i] * q + YAW[i] * r;
+        }
+        // 一手第 2 步：`desaturateActuators(thrust_z)` —— **无 increase_only** ✓
+        //   ⇒ 允许抬高推力以换取姿态权限 ✓（= airmode 的本质 ✓）
+        desaturate(&mut m, &THRUST_Z, 0.0, 1.0, false);
+        // 一手第 3 步：`desaturateActuators(yaw)` ⇒ **姿态优先于 yaw** ✓
+        desaturate(&mut m, &YAW, 0.0, 1.0, false);
+        for i in 0..4 {
+            m[i] = m[i].clamp(0.0, 1.0);
+        }
+        return m;
+    }
     let (p, q, r) = (pqr[0], pqr[1], pqr[2]);
     const THRUST_Z: [f32; 4] = [1.0, 1.0, 1.0, 1.0];
     const ROLL: [f32; 4] = [0.5, -0.5, -0.5, 0.5];
