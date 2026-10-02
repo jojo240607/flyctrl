@@ -25,6 +25,21 @@ pub fn attitude_rates(
     att_kd: f32,
     omega: [f32; 3],
 ) -> AttitudeOut {
+    attitude_rates_axis(est_att, q_des, att_kp, att_kd, omega, 1.0)
+}
+
+/// ★★§5.257【PX4 一手**分轴增益比** ✓】`MC_YAWRATE_P` = **0.2** vs `MC_ROLLRATE_P` = `MC_PITCHRATE_P`
+///   = **0.15**（`mc_rate_control_params.yaml` 一手 ✓，unit 无量纲 ✓）
+///   ⇒ PX4 给 **yaw 的 P 比 roll/pitch 高 1.333×** ✓（我仓三轴共用 `att_kp` ✗ ⇒ yaw 权限少 25% ✗）
+///   `kp_yaw_scale` = 1.3333 ⇒ 对齐 PX4 惯例 ✓；`1.0` ⇒ 逐位不变 ✓
+pub fn attitude_rates_axis(
+    est_att: Quaternion,
+    q_des: Quaternion,
+    att_kp: f32,
+    att_kd: f32,
+    omega: [f32; 3],
+    kp_yaw_scale: f32,
+) -> AttitudeOut {
     let q_err = crate::vehicle::quat_mul(crate::vehicle::quat_conj(est_att), q_des);
     let sgn = if q_err.w < 0.0 { -2.0 } else { 2.0 };
     let ex_b = sgn * q_err.x;
@@ -34,7 +49,7 @@ pub fn attitude_rates(
         rates: [
             att_kp * ex_b - att_kd * omega[0],
             att_kp * ey_b - att_kd * omega[1],
-            att_kp * ez_b - att_kd * omega[2],
+            att_kp * kp_yaw_scale * ez_b - att_kd * omega[2], // §5.257 yaw P × 1.333（PX4 ✓）
         ],
         err: [ex_b, ey_b, ez_b],
     }

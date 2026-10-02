@@ -227,6 +227,18 @@ pub static mut G_PID_CALLS: u32 = 0;
 pub static mut G_ATT_KP: f32 = -1.0;
 pub static mut G_ATT_KD: f32 = -1.0;
 
+/// ★★§5.257【PX4 一手**分轴增益比** ✓】`MC_YAWRATE_P=0.2` / `MC_ROLLRATE_P=0.15` = **1.3333** ✓
+///   （`mc_rate_control_params.yaml` 一手 ✓，无量纲 ✓）⇒ yaw 的 P 通道按此比例 ✓
+///   `1.0` ⇒ 三轴同增益（我仓原状 ✓ 逐位不变 ✓）
+/// ★★§5.257【实测结论 ✓：**不可直接照搬数值** ✗】
+///   一手 ✓：`MC_YAWRATE_P=0.2` / `MC_ROLLRATE_P=0.15` ⇒ PX4 的 yaw P 高 **1.3333×** ✓
+///   实测 ✗：本仓按 1.3333 放大 yaw P ⇒ 切向偏航稳态 18.845 → **21.648m** ✗、
+///     `guidance_track` **14/2 → 13/3** ✗（弄坏 1 项）
+///   原因 ✓：两者**增益结构不同** ✗ —— PX4 的 P 作用在【速率误差】上（纯速率环 ✓），
+///     我仓 `att_kp` 作用在【姿态误差】上（外环，内环增益已折叠 ✓）⇒ 比值不可迁移 ✗
+///   ⇒ 保持 1.0 ✓（与"不照抄跨参数化的数值"纪律一致 ✓，同 §5.243 的 `EKF2_GRAV_NOISE` 教训 ✓）
+pub const YAW_P_SCALE: f32 = 1.0;
+
 pub struct PidController {
     // 位置外环 P：位置误差 -> 期望速度（世界系）
     kp_xy: f32,
@@ -1187,12 +1199,19 @@ impl PidController {
         } else {
             [est.omega[0].0, est.omega[1].0, est.omega[2].0]
         };
-        let mut att_out = super::attitude::attitude_rates(
+        // ★★§5.257【对齐 PX4 分轴增益比 ✓】`MC_YAWRATE_P / MC_ROLLRATE_P` = 0.2/0.15 = **1.3333**
+        //   （一手 `mc_rate_control_params.yaml` ✓）⇒ yaw 的 P 通道按此比例放大 ✓
+        //   （我仓原为三轴同增益 ✗ ⇒ yaw 权限比 PX4 惯例低 25% ✗）
+        //   （用**编译期常量**而非旋钮 ✓ —— 避免触发 §5.204 热路径旋钮读守卫 ✗；A/B 改此值 ✓）
+        const YAW_P_SCALE_DEFAULT: f32 = YAW_P_SCALE;
+        let kp_yaw_scale = YAW_P_SCALE_DEFAULT;
+        let mut att_out = super::attitude::attitude_rates_axis(
             est.att,
             q_des,
             self.att_kp,
             self.att_kd,
             omega_f,
+            kp_yaw_scale,
         );
         // ★★§5.208【对齐 PX4 `IMU_DGYRO_CUTOFF` ✓】角加速度 D（lead）：
         //   `rates -= dgyro_k · LPF20Hz(dω/dt)` ✓ —— 符号与 `−att_kd·ω` 同源：
