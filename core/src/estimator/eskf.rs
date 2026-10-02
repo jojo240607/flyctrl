@@ -47,14 +47,8 @@ impl EskfState {
             // no_std：用 crate 的 sqrt（与其他模块一致 ✓）
             let wn = crate::math::sqrt(wn2);
             let dq = Quaternion::from_axis_angle([w[0] / wn, w[1] / wn, w[2] / wn], Radian(wn * dt));
-            // ⚠️§5.233【**已知缺陷** ✓，待整体一致化修复 ✗】：此处应为**右乘** ✓
-            //   （PX4 `ekf.cpp:253` = `quat_nominal * dq` ✓；守卫
-            //    `nominal_propagation_matches_world_frame_exponential` 实测偏差 9.6e-3 ✗）
-            //   但**单独改这一行会更糟** ✗（实测：完整 att_est ESKF 口径 57/6 → **56/7** ✗）
-            //   —— 因为 F 的姿态块（`+[ω×]` = 左乘线性化 ✗）与观测辅助也是按左乘建立的 ✓
-            //   ⇒ 必须**整体一致**改：传播 + F 姿态块 + `gravity_h`/`mag_h` + 4 处机体帧回退 ✓
-            //     （注入保持左乘 ✓ = PX4 ✓ 不动 ✓，见台账 §5.231/§5.232/§5.233 ✓）
-            self.q = (dq * self.q).normalize();
+            // ★§5.240【PX4 约定】机体帧速率 ⇒ **右乘**（真值仲裁器已证右乘物理正确）
+            self.q = (self.q * dq).normalize();
         }
         let f = [
             imu.delta_vel[0] / dt - self.ba[0],
@@ -254,13 +248,17 @@ pub fn transition_matrix(
     for i in 0..N {
         f[i][i] = 1.0;
     }
-    // 姿态自块：+[ω×]·dt ✓（[ω×] = [[0,-wz,wy],[wz,0,-wx],[-wy,wx,0]]）
-    f[I_ATT][I_ATT + 1] += -w[2] * dt;
-    f[I_ATT][I_ATT + 2] += w[1] * dt;
-    f[I_ATT + 1][I_ATT] += w[2] * dt;
-    f[I_ATT + 1][I_ATT + 2] += -w[0] * dt;
-    f[I_ATT + 2][I_ATT] += -w[1] * dt;
-    f[I_ATT + 2][I_ATT + 1] += w[0] * dt;
+    // ★★§5.240【局部（机体帧）误差 ✓】δθ̇ = δθ×ω − δb = **−[ω]×δθ − δb** ✓
+    //   推导 ✓：δq̇ = δq⊗(0,ω/2) − (0,ω/2)⊗δq − δq⊗(0,δb/2)
+    //           ⇒ δθ̇ = (δθ×ω)/1 − δb ⇒ F[att,att] = I − [ω]×·dt ✓（**不是 I ✗ 也不是 +[ω]× ✗**）
+    //   ⚠️ 此前"FD 裁判要求 I"✗ 是**旧左约定测试 setup**（左扰动 + 左提取）的产物 ✓
+    //      ⇒ 改成局部扰动后，FD 裁判立即要求 **−[ω]×** ✓（实测偏差 3.42e-1 → 0 ✓）
+    f[I_ATT][I_ATT + 1] += w[2] * dt;
+    f[I_ATT][I_ATT + 2] += -w[1] * dt;
+    f[I_ATT + 1][I_ATT] += -w[2] * dt;
+    f[I_ATT + 1][I_ATT + 2] += w[0] * dt;
+    f[I_ATT + 2][I_ATT] += w[1] * dt;
+    f[I_ATT + 2][I_ATT + 1] += -w[0] * dt;
     // 姿态×陀螺零偏：−I ✓
     for i in 0..3 {
         f[I_ATT + i][I_BG + i] += -dt;
@@ -279,24 +277,20 @@ pub fn transition_matrix(
     //   ★§5.186【已修 ✓】：改为 `−[a_world×]·dt`（FD + 物理双证 ✓，见循环内注释 ✓）。
     //   叉乘必须在【世界系】做（用 a_world = R·f ✓）——
     //   写成 R·[f×] 是【结构性错误】✗（少一个 Rᵀ 的相似变换，怎么调符号都不对 ✓）
-    let a_world = rotate_vec_by_quat(q, f_body);
-    let (ax, ay, az) = (a_world[0], a_world[1], a_world[2]);
+    // ★§5.240【局部误差 ✓】∂δv/∂δθ_local = **−R·[f_body]×·dt**
+    //   推导 ✓：q_t = q⊗δq ⇒ R_true = R(I+[δθ]×) ⇒ δ(R f) = R(δθ×f) = −R[f]×δθ ✓
+    //   等价关系 ✓：−R[f]× = −[Rf]×·R ⇒ 即“左约定值 **右乘 R**” ✓（与 gravity_h/mag_h 同步 ✓）
+    let r_f = rot_of(q);
+    let (fx, fy, fz) = (f_body[0], f_body[1], f_body[2]);
     for j in 0..3 {
-        // [a×] 的第 j 列 = a × e_j
-        let col = match j {
-            0 => [0.0, az, -ay],
-            1 => [-az, 0.0, ax],
-            _ => [ay, -ax, 0.0],
+        let cb = match j {
+            0 => [0.0, fz, -fy],
+            1 => [-fz, 0.0, fx],
+            _ => [fy, -fx, 0.0],
         };
         for i in 0..3 {
-            // ★★§5.186【符号修正 ✓✓】：`∂δv/∂δθ = **−[a_world×]·dt**`。
-            //   本仓误差为【左乘】`q ← exp(δθ)⊗q` ⇒ `R_true ≈ (I+[δθ]×)R`
-            //   ⇒ `δv̇ = [δθ]×(R f) = −[R f]× δθ` ⇒ **负号** ✓。
-            //   双证（§5.184/§5.185 ✓）：① 前向差分（与 `inject_error` 同约定）
-            //   ② 物理直推（悬停 +δ 滚转 ⇒ 机体内上轴向东倾 ⇒ 加速度 = +9.81δ **东** ✓
-            //      ⇒ 必须是 −[a×]，`+[a×]` 会给反方向 ✗）。
-            //   守卫：`f_vel_att_sign_vs_finite_difference` + `f_state_transition_blocks_match_finite_difference` ✓
-            f[I_VEL + i][I_ATT + j] += -col[i] * dt;
+            let rv = r_f[i][0] * cb[0] + r_f[i][1] * cb[1] + r_f[i][2] * cb[2];
+            f[I_VEL + i][I_ATT + j] += -rv * dt;
         }
     }
     Ok(f)
@@ -455,12 +449,14 @@ pub fn gravity_h(q: Quaternion, g_ned: [f32; 3]) -> [[f32; N]; 3] {
     let mut h = [[0.0f32; N]; 3];
     let gn = crate::math::sqrt(g_ned[0] * g_ned[0] + g_ned[1] * g_ned[1] + g_ned[2] * g_ned[2]).max(1e-6);
     let gh = [-g_ned[0] / gn, -g_ned[1] / gn, -g_ned[2] / gn]; // 世界"天" ĝ ✓
-    let basis = [[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-    for (j, e) in basis.iter().enumerate() {
+    // ★§5.240【局部误差】h_local[·][j] = Rᵀ·(ĝ × (R·e_j))（= 左约定 h 右乘 R）
+    let r = rot_of(q);
+    for j in 0..3 {
+        let re = [r[0][j], r[1][j], r[2][j]]; // R·e_j
         let c0 = [
-            gh[1] * e[2] - gh[2] * e[1],
-            gh[2] * e[0] - gh[0] * e[2],
-            gh[0] * e[1] - gh[1] * e[0],
+            gh[1] * re[2] - gh[2] * re[1],
+            gh[2] * re[0] - gh[0] * re[2],
+            gh[0] * re[1] - gh[1] * re[0],
         ];
         let c = rotate_vec_by_quat_inverse(q, c0);
         for i in 0..3 {
@@ -492,12 +488,14 @@ pub fn mag_h(q: Quaternion, mag_i: [f32; 3]) -> [[f32; N]; 3] {
     //   h_new ≈ Rᵀ(I − [δθ×])mag_I = h + Rᵀ(mag_I × δθ)
     //   ⇒ ∂h/∂δθ = **+Rᵀ·[mag_I ×]**（第 j 列 = Rᵀ·(mag_I × e_j) ✓）
     //   ⚠️ 与旧式"世界系叉乘 −[R·mag_I ×]"不同 ✗ —— 模型定义改了，H 必须跟着改 ✓✓
-    let basis = [[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
-    for (j, e) in basis.iter().enumerate() {
+    // ★§5.240【局部误差】同 gravity_h：场矢量取 R·e_j
+    let r = rot_of(q);
+    for j in 0..3 {
+        let re = [r[0][j], r[1][j], r[2][j]];
         let c0 = [
-            mag_i[1] * e[2] - mag_i[2] * e[1],
-            mag_i[2] * e[0] - mag_i[0] * e[2],
-            mag_i[0] * e[1] - mag_i[1] * e[0],
+            mag_i[1] * re[2] - mag_i[2] * re[1],
+            mag_i[2] * re[0] - mag_i[0] * re[2],
+            mag_i[0] * re[1] - mag_i[1] * re[0],
         ];
         let c = rotate_vec_by_quat_inverse(q, c0);
         for i in 0..3 {
@@ -505,6 +503,7 @@ pub fn mag_h(q: Quaternion, mag_i: [f32; 3]) -> [[f32; N]; 3] {
         }
     }
     let _ = aw;
+    let basis = [[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
     // mag_I 块 = **Rᵀ** ✓（与修正后的 h 定义一致 ✓）
     for (j, e) in basis.iter().enumerate() {
         let c = rotate_vec_by_quat_inverse(q, *e);
@@ -1118,7 +1117,7 @@ impl Eskf {
                     [w[0] / wn, w[1] / wn, w[2] / wn],
                     Radian(-wn * tau_s),
                 );
-                (dq * self.st.q).normalize()
+                (self.st.q * dq).normalize() // §5.240 机体帧回退 ⇒ 右
             } else {
                 self.st.q
             }
@@ -1544,7 +1543,7 @@ impl Eskf {
             let wn = crate::math::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
             if wn > 1e-6 {
                 let dq = Quaternion::from_axis_angle([w[0] / wn, w[1] / wn, w[2] / wn], crate::units::Radian(-wn * dt));
-                dq * self.st.q
+                self.st.q * dq // §5.240 右
             } else {
                 self.st.q
             }
@@ -1991,7 +1990,7 @@ pub fn inject_error(st: &mut EskfState, e: &ErrorState) {
         }
     };
     // ★左乘 ✓（§12.4 + 参照 153 行）
-    st.q = (dq * st.q).normalize();
+    st.q = (st.q * dq).normalize(); // §5.240 局部误差 ⇒ 右乘注入
     for i in 0..3 {
         st.v[i] += e.dv[i];
         st.p[i] += e.dp[i];
@@ -2002,9 +2001,9 @@ pub fn inject_error(st: &mut EskfState, e: &ErrorState) {
 
 /// **从物理状态差异提取误差状态**（与 `inject_error` 互为逆 ✓，用于自检 ✓）
 pub fn extract_error(q_old: Quaternion, st: &EskfState) -> ErrorState {
-    // 姿态：δq = q_new * q_old⁻¹（本项目语义下的左乘误差 ✓，与参照 189 行同构 ✓）
+    // ★§5.240【局部误差】δq = q_old⁻¹ ⊗ q_new（机体帧，与右传播/右注入同约定）
     let inv = Quaternion { w: q_old.w, x: -q_old.x, y: -q_old.y, z: -q_old.z };
-    let dq = (st.q * inv).normalize();
+    let dq = (inv * st.q).normalize();
     let s2 = dq.x * dq.x + dq.y * dq.y + dq.z * dq.z;
     let s = crate::math::sqrt(s2);
     let dtheta = if s > 1e-9 {
@@ -2140,7 +2139,8 @@ mod tests {
             // (1) F[att,att]：扰 q（左乘）⇒ 看预测后 q 的误差
             let mut e = [0.0f32; 3];
             e[j] = eps;
-            let mut st = mk((rot_eps(e) * q).normalize(), [0.0; 3], [0.0; 3], [0.0; 3], [0.0; 3]);
+            // ★§5.240：局部（机体帧）误差 ⇒ 扰动必须是**右乘** ✓（旧为左乘 ✗，与本约定不符 ✓）
+            let mut st = mk((q * rot_eps(e)).normalize(), [0.0; 3], [0.0; 3], [0.0; 3], [0.0; 3]);
             pred(&mut st);
             let fd = extract_error(s0.q, &st).dtheta;
             let fcol = [fm[I_ATT][I_ATT + j], fm[I_ATT + 1][I_ATT + j], fm[I_ATT + 2][I_ATT + j]];
@@ -2192,7 +2192,7 @@ mod tests {
         let basis = [[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
         let perturb = |q: Quaternion, e: [f32; 3]| -> Quaternion {
             let dq = Quaternion::from_axis_angle([e[0] / eps, e[1] / eps, e[2] / eps], Radian(eps));
-            (dq * q).normalize()
+            (q * dq).normalize() // §5.240 局部约定 ⇒ 右扰动
         };
         let gned = [0.0f32, 0.0, 9.81];
         let u0 = predicted_gravity_body(q, gned);
@@ -2216,7 +2216,7 @@ mod tests {
         let basis = [[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
         let perturb = |q: Quaternion, e: [f32; 3]| -> Quaternion {
             let dq = Quaternion::from_axis_angle([e[0] / eps, e[1] / eps, e[2] / eps], Radian(eps));
-            (dq * q).normalize()
+            (q * dq).normalize() // §5.240 局部约定 ⇒ 右扰动
         };
         let mag_i = [0.21f32, -0.02, 0.42];
         let mag_b = [0.01f32, 0.02, -0.03];
@@ -2248,7 +2248,7 @@ mod tests {
         let basis = [[1.0f32, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
         let perturb = |q: Quaternion, e: [f32; 3]| -> Quaternion {
             let dq = Quaternion::from_axis_angle([e[0] / eps, e[1] / eps, e[2] / eps], Radian(eps));
-            (dq * q).normalize()
+            (q * dq).normalize() // §5.240 局部约定 ⇒ 右扰动
         };
         let mut s0 = EskfState { q, v: [0.0; 3], p: [0.0; 3], bg: [0.0; 3], ba: [0.0; 3] };
         s0.predict(ImuDelta { delta_ang: [0.0; 3], delta_vel }, g, dt);
@@ -2371,7 +2371,16 @@ mod tests {
         for j in 0..3 {
             let want = cross(aw, basis[j]);
             for i in 0..3 {
-                maxdev = maxdev.max((fm[I_VEL + i][I_ATT + j] - (-want[i]) * dt).abs());
+                // ★§5.240：局部约定下 δv/δθ = −R·[f_body]×·dt（= 左约定值右乘 R）✓
+                let r_c = rot_of(q);
+                let cb = match j {
+                    0 => [0.0f32, f_body[2], -f_body[1]],
+                    1 => [-f_body[2], 0.0, f_body[0]],
+                    _ => [f_body[1], -f_body[0], 0.0],
+                };
+                let want_local =
+                    r_c[i][0] * cb[0] + r_c[i][1] * cb[1] + r_c[i][2] * cb[2];
+                maxdev = maxdev.max((fm[I_VEL + i][I_ATT + j] - (-want_local) * dt).abs());
             }
         }
         assert!(maxdev < 1e-6, "δv/δθ 块应为 −[a_world×]·dt（偏差 {maxdev:.2e}）✗");
@@ -2446,21 +2455,21 @@ mod tests {
         for i in 0..3 {
             rdev = rdev.max((back[i] - dth[i]).abs());
         }
-        assert!(rdev < 1e-5, "误差注入/提取应互为逆（偏差 {rdev:.2e}）✗ —— 左乘约定错？");
-        // 反证：若用【右乘】，往返应显著不符 ✓（确认该自检有鉴别力 ✓）
+        assert!(rdev < 1e-5, "误差注入/提取应互为逆（偏差 {rdev:.2e}）✗ —— 局部（右乘）约定错？");
+        // ★§5.240【反证镜像 ✓】局部（机体帧）约定下**右乘才是对的** ✓ ⇒ 应识别**左乘**为错 ✓
         let mut st3 = EskfState { q: q_old, v: [0.0; 3], p: [0.0; 3], bg: [0.0; 3], ba: [0.0; 3] };
         {
-            // 手工右乘（错误做法 ✗）
+            // 手工**左乘**（世界帧做法 ✗，本约定下应被识别为错 ✓）
             let n = crate::math::sqrt(dth[0] * dth[0] + dth[1] * dth[1] + dth[2] * dth[2]);
             let dq = Quaternion::from_axis_angle([dth[0] / n, dth[1] / n, dth[2] / n], Radian(n));
-            st3.q = (q_old * dq).normalize();
+            st3.q = (dq * q_old).normalize();
         }
         let back3 = extract_error(q_old, &st3).dtheta;
         let mut rdev3 = 0.0f32;
         for i in 0..3 {
             rdev3 = rdev3.max((back3[i] - dth[i]).abs());
         }
-        assert!(rdev3 > 1e-4, "右乘应【可被本自检识别】为错 ✗（实测偏差 {rdev3:.2e}）");
+        assert!(rdev3 > 1e-4, "左乘应【可被本自检识别】为错 ✗（实测偏差 {rdev3:.2e}）");
         // ⑦ 三维量测更新（GPS 速度 ✓）内点/外点
         let mut pv = [[0.0f32; N]; N];
         for (i, row) in pv.iter_mut().enumerate() {
@@ -2932,7 +2941,7 @@ mod tests {
         for k in 0..6000 {
             // 真值姿态：用【与 predict 相同的复合语义】积分 ✓（保证自洽 ✓）
             let dq = Quaternion::from_axis_angle([wv[0] / wn, wv[1] / wn, wv[2] / wn], Radian(wn * dt));
-            q_true = (dq * q_true).normalize();
+            q_true = (q_true * dq).normalize(); // §5.240 与右传播同语义
             // IMU：体速率 ✓ + 支撑比力（由【真值姿态】算 ✓，真 IMU 亦如此 ✓）
             let sup = rotate_vec_by_quat_inverse(q_true, [0.0, 0.0, -9.81]);
             f.predict(
@@ -3116,7 +3125,7 @@ mod tests {
             let mut d = [0.0f32; 3];
             d[j] = eps;
             let dq = Quaternion::from_axis_angle([d[0] / eps, d[1] / eps, d[2] / eps], Radian(eps));
-            let out = predicted_gravity_body((dq * q).normalize(), g_ned);
+            let out = predicted_gravity_body((q * dq).normalize(), g_ned);
             for i in 0..3 {
                 maxdev = maxdev.max((((out[i] - base[i]) / eps) - eng[i][I_ATT + j]).abs());
             }
@@ -3144,7 +3153,7 @@ mod tests {
             d[j] = eps;
             let n = eps;
             let dq = Quaternion::from_axis_angle([d[0] / n, d[1] / n, d[2] / n], Radian(n));
-            let out = predicted_mag_body((dq * q).normalize(), mag_i, mag_b);
+            let out = predicted_mag_body((q * dq).normalize(), mag_i, mag_b);
             for i in 0..3 {
                 maxdev = maxdev.max((((out[i] - base[i]) / eps) - eng[i][I_ATT + j]).abs());
             }
