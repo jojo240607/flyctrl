@@ -2044,7 +2044,8 @@ mod tests {
     // ⚠️§5.233：本守卫**当前红** ✗ —— 它证明的正是"传播用左乘"这一**已知缺陷** ✓。
     //   在"整体一致化修复"落地前保持 `#[ignore]` ✓（否则 H 场红 ✗），修复时**去掉 ignore** 即可 ✓。
     #[test]
-    #[ignore = "§5.233：传播用左乘（已知缺陷，待整体一致化修复）；修复时去掉本 ignore"]
+    #[ignore = "§5.234：传播用左乘（已知缺陷）；**正确的一对已定位**（右乘传播 + `−[ω×]` F ⇒ a10 通过 ✓），\
+                但配套件未完成（A1 安静悬停 5°→8° ✗）⇒ 完成后去掉本 ignore"]
     fn nominal_propagation_matches_world_frame_exponential() {
         let dt = 0.004f32;
         let q = Quaternion::from_axis_angle([0.0, 0.0, 1.0], Radian(0.7)).normalize();
