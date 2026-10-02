@@ -189,7 +189,7 @@ pub static mut ESKF_LAST_REJ: [f32; 4] = [0.0; 4];
 pub static mut ESKF_LAST_OK: [f32; 4] = [0.0; 4];
 /// ★重力辅助三分支计数 `[退化, 门关, 应用]` ✓（定位"哪一支在拒"✓）
 #[used]
-pub static mut ESKF_GRAV_BRANCH: [f32; 3] = [0.0; 3];
+pub static mut ESKF_GRAV_BRANCH: [f32; 4] = [0.0; 4]; // [3] = §5.242 滞后门控计数
 /// ★最近一次的 `dev/gn`（加速度门输入 ✓）
 #[used]
 pub static mut ESKF_LAST_DEV: [f32; 2] = [0.0; 2];
@@ -706,6 +706,14 @@ pub struct Eskf {
     pub mag_disturbed_count: u32,
     /// ★§5.136 延迟补偿用【测量机体角速度】（调用方每拍设置 = PX4 `_state.gyro` 同源 ✓）
     pub mag_delay_omega: [f32; 3],
+    /// ★★§5.242【标量滞后模型的有效性门控 ✓】上一次重力更新时的机体角速率 ✓
+    ///   机理 ✓：一阶回退 `exp(−ω·τ)` 隐含"**τ 内 ω 恒定**" ⇒ ω 快速变化时该模型**失效** ✗
+    ///   实测 ✓（`diag_conv_matrix`）：
+    ///     · A13 恒定 1500°/s（ω 缓变 ✓）⇒ 需 **~20 ms** 补偿（不补偿 39.6° ✗ → 22.3° ✓）
+    ///     · a10 30 Hz 振荡（ω 剧变 ✗）⇒ 需 **0 ms**（20 ms 会劣化到 113.5° ✗ → 0 ms 9.56° ✓）
+    ///   ⇒ 门控判据 ✓：**滞后窗内姿态变化量 `|Δω|·τ`**（量纲 = rad ✓）
+    ///     超过 2° ⇒ 认为 ω 非缓变 ⇒ 本拍**停用**该补偿 ✓（A13 ✓ 与 a10 ✓ 各自取到最优 ✓）
+    pub prev_grav_omega: [f32; 3],
     /// ★§5.187【比力低通群延迟 τ（秒）】：由宿主从**实际滤波器**自动标定后写入
     /// （`Estimator::set_accel_lag_s` ✓）；重力辅助用它把预测姿态回退一阶
     /// （`q_meas = exp(−ω·τ)⊗q` ✓）。`0` ⇒ 不补偿 ✓。
@@ -785,6 +793,7 @@ impl Eskf {
             mag_field_disturbed: false,
             mag_disturbed_count: 0,
             mag_delay_omega: [0.0; 3],
+            prev_grav_omega: [0.0; 3],
             accel_lag_s: 0.0,
             mag_delay_accel_horiz: 0.0,
             last_mag_yaw_innov: 0.0,
@@ -1109,6 +1118,27 @@ impl Eskf {
                 self.accel_lag_s
             }
         };
+        // ★★§5.242【有效性门控 ✓】：标量滞后模型隐含"τ 内 ω 恒定" ⇒ ω 快变时失效 ✗
+        //   判据 = **滞后窗内姿态变化量** `|Δω|·τ`（rad ✓）；> 2° ⇒ 本拍停用补偿 ✓
+        //   实测依据 ✓：A13（恒定 ω ✓）需 ~20ms、a10（30Hz 振荡 ✗）需 0ms ⇒ 该门控让两者
+        //   各自取到最优 ✓（见字段 `prev_grav_omega` 的注释 ✓）
+        let tau_s = {
+            let w = self.mag_delay_omega;
+            let dw = [
+                w[0] - self.prev_grav_omega[0],
+                w[1] - self.prev_grav_omega[1],
+                w[2] - self.prev_grav_omega[2],
+            ];
+            let dwn = crate::math::sqrt(dw[0] * dw[0] + dw[1] * dw[1] + dw[2] * dw[2]);
+            let max_rad = 2.0f32 * core::f32::consts::PI / 180.0; // 2° ✓
+            if dwn * tau_s > max_rad {
+                unsafe { ESKF_GRAV_BRANCH[3] += 1.0; } // 门控计数（诊断 ✓）
+                0.0
+            } else {
+                tau_s
+            }
+        };
+        self.prev_grav_omega = self.mag_delay_omega;
         let q_meas = if tau_s > 0.0 {
             let w = self.mag_delay_omega; // 当前机体角速率 ✓（`eskf_estimator` 每拍写入 ✓）
             let wn = crate::math::sqrt(w[0] * w[0] + w[1] * w[1] + w[2] * w[2]);
