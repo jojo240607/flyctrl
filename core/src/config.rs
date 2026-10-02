@@ -145,7 +145,11 @@ impl VehicleConfig {
             dgyro_k: 0.02,
             dgyro_cutoff: 20.0,
             ki_rate: 0.5,
-            mix_mode: 2, // ★§5.216 PX4 一手同构（姿态优先 ✓）默认开（= PX4 `MC_AIRMODE=0` ✓ 同默认 ✓） // ★§5.216 PX4 一手同构（姿态优先 ✓）默认开
+            mix_mode: 2, // ★§5.216 PX4 一手同构（姿态优先 ✓）默认开
+            // ★★§5.256【② airmode 决策（实测 ✓）】`3`（= PX4 `mixAirmodeRP` ✓）虽把切向偏航
+            //   yaw 误差 172°→67° ✓，但使 `guidance_track` **14/2 → 12/4** ✗
+            //   （抬高推力换取姿态权限 ⇒ 高度/位置控制劣化 ⇒ circle/figure8 被弄坏 ✗）
+            //   ⇒ **不作为默认/推荐** ✓ —— 与 PX4 默认 `MC_AIRMODE=0` **一致** ✓；保留为可选档 ✓ // ★§5.216 PX4 一手同构（姿态优先 ✓）默认开
             kp_xy: 0.3,
             // ★§5.195：与 `PidController::default_quad()` 同步（0.8 → **3.0** ✓，理由见彼处注释）
             kv_xy: 3.0, // ★§5.195
