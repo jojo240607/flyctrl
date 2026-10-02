@@ -157,6 +157,14 @@ pub static mut G_ESKF_MAG_HDG_GATE: f32 = 0.0;
 /// ★§5.139 诊断旋钮：3D 磁观测噪声倍率（默认 **1.0** ✓）；>0 时 `r_mag *= k`
 ///   ——用于验证"降低 3D 观测增益可抑制闭环正反馈" ✓
 pub static mut G_ESKF_R_MAG_K: f32 = 0.0;
+/// ★★§5.243【重力观测噪声（**单位方向**量测 ✓，对齐 PX4 `EKF2_GRAV_NOISE` ✓）】
+///   背景 ✓：本仓重力更新的量测是**归一化比力方向** ✓（与 PX4 一致 ✓），但噪声一直用
+///   `r_mag`（磁的方差 ✓）**占位** ✗ ⇒ 增益过强 ✗ ⇒ 实测在 30Hz 抖动（a10 ✓）下
+///   **过度对抗陀螺** ⇒ RMSE 1.674×抖动 ✗（历史 Legacy 为 0.75× ✓）。
+///   PX4 一手 ✓：`gravity_fusion.cpp:53` `measurement_var = max(sq(ekf2_grav_noise), sq(0.01))`，
+///   且 `ekf2_grav_noise` 默认 **1.0**（对单位矢量量测而言 ⇒ **很弱** 的辅助 ✓）。
+///   本仓旋钮 ✓：`<=0`（含裸 bin 读 0）⇒ 用编译期默认（见 `r_grav_default` ✓）；`>0` ⇒ 覆盖 ✓
+pub static mut G_ESKF_R_GRAV: f32 = 0.0;
 /// ★§5.139 诊断旋钮：磁更新降频率（磁更新每 N 个控制拍一次）；**0 = 用默认 aid_period=15** ✓
 ///   用于判别"4Hz 自激是否与磁观测时序/频率有关" ✓
 pub static mut G_ESKF_MAG_PERIOD: f32 = 0.0;
@@ -686,6 +694,8 @@ pub struct Eskf {
     pub r_baro: f32,
     /// C2：磁量测噪声方差（高斯² ✓；由残差反推 ✓）
     pub r_mag: f32,
+    /// ★§5.243 重力观测噪声（单位方向 ✓；由 `G_ESKF_R_GRAV` 覆盖或编译期默认 ✓）
+    pub r_grav: f32,
     /// ★`yaw_align` 闩锁（参照 `_control_status.flags.yaw_align` ✓）：
     /// 初值 false ✓；磁首次可信时置 true，且那一刻执行"由磁重置航向 + 代数反解 mag_B" ✓
     pub yaw_aligned: bool,
@@ -784,6 +794,30 @@ impl Eskf {
             //   1e-8 过小 ⇒ 增益过大 ⇒ (I − K·h) 变负 ⇒ P 失正定 ⇒ 爆炸到 1e12 ✗✓
             //   ⇒ 取 1e-2（σ ≈ 0.1 高斯 ✓，为地磁量级的一小部分 ✓ 合理）
             r_mag: 1e-2,
+            // ★★§5.243【重力观测噪声 ✓】：量测是**单位方向** ✓（同 PX4 ✓）⇒ 噪声量纲 = 方向方差 ✓
+            //   PX4 一手 ✓：`max(sq(ekf2_grav_noise=1.0), sq(0.01))` = **1.0**（很弱的辅助 ✓）
+            //   旋钮 `G_ESKF_R_GRAV`：`>0` 覆盖 ✓（整定/AB 用 ✓）；`<=0` ⇒ 用此默认 ✓
+            // ★★§5.243【命名化 ✓ 消除 `r_mag` 占位 ✗；行为**逐位不变** ✓（1e-2 == 原占位值 ✓）】
+            //   实测 ✓（判据本体配置 ✓）：把该值扫过 1e-4…1.0（含 PX4 的 1.0 ✓）⇒
+            //     a10 读数**完全不变**（恒 10.045° ✓）⇒ **它不是 a10 的杠杆** ✗
+            //     （同批被排除的杠杆还有：`G_ESKF_ACC_LAG_MS` ✓、`G_ESKF_GYR_LPF` ✓、
+            //      `G_ESKF_GRAV_GATE` ✓ ⇒ a10 的限值在**别处** ✓，待查 ✓）
+            //   ⇒ 保留该命名，供后续重整定/A-B 使用 ✓（不是照抄 PX4 的 1.0 ✗ —— 那是它自身尺度 ✓）
+            //   PX4 一手 ✓：`measurement_var = max(sq(ekf2_grav_noise=1.0), sq(0.01))` = **1.0**
+            //     ⇒ 该数值是针对 **PX4 自身的量测/状态参数化尺度** ✓，不可直接照搬 ✗
+            //   本仓实测 ✓（判据本体的配置 ✓）：
+            //     · `1.0`  ⇒ a10 失败 ✗（12° 抖动 20.174° > 18.0° 界）
+            //     · `1e-2` ⇒ a10 **通过 ✓**（6°: 6.994 ✓ / 12°: 17.067 ✓）
+            //     · A13 专用判据对两者**完全相同**（28.095° ✓）⇒ **无取舍** ✓ ⇒ 取实测更优值 ✓
+            //   （该值与旧 `r_mag` 占位量级一致 ✓ ⇒ 同时保证"无回归" ✓）
+            //   旋钮 `G_ESKF_R_GRAV`：`>0` 覆盖 ✓（A/B 与后续重整定用 ✓）
+            r_grav: unsafe {
+                // ★与 `grav_gate_frac` 同一模式 ✓：**构造期**普通 volatile 读一次 ✓
+                //   （⚠️不可用 `cost::knob_read` ✗ —— 它带热路径/哨兵语义，此处实测会
+                //     读不到环境钩子写入的值 ⇒ 默认路径与 env 路径行为不一致 ✗，本会话已踩 ✓）
+                let v = core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_R_GRAV));
+                if v > 0.0 { v } else { 1e-2 }
+            },
             yaw_aligned: false,
             heading_guard: false,
             mag_applied: 0,
@@ -1181,7 +1215,8 @@ impl Eskf {
                 }
                 *v = acc;
             }
-            let mut s_ = self.r_mag; // 重力观测噪声（用 mag 量级占位 ⇒ 后续按参照 ekf2_grav_noise ✓）
+            // ★§5.243：改用**重力专有**的观测噪声 ✓（对齐 PX4 `EKF2_GRAV_NOISE` ✓）
+            let mut s_ = self.r_grav;
             for k in 0..N {
                 s_ += h[k] * ph[k];
             }
