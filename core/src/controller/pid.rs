@@ -239,6 +239,10 @@ pub static mut G_ATT_KD: f32 = -1.0;
 ///   ⇒ 保持 1.0 ✓（与"不照抄跨参数化的数值"纪律一致 ✓，同 §5.243 的 `EKF2_GRAV_NOISE` 教训 ✓）
 pub const YAW_P_SCALE: f32 = 1.0;
 
+/// ★§5.257【yaw 的 D 通道比例 ✓】PX4 一手：`MC_YAWRATE_D` 默认 **0.0**（而 roll/pitch = 0.003 ✓）
+///   ⇒ PX4 的 **yaw 无 D** ✓（结构差异见 `YAW_P_SCALE` 注释 ✓）；`1.0` = 逐位不变 ✓
+pub const YAW_D_SCALE: f32 = 1.0;
+
 pub struct PidController {
     // 位置外环 P：位置误差 -> 期望速度（世界系）
     kp_xy: f32,
@@ -1205,13 +1209,14 @@ impl PidController {
         //   （用**编译期常量**而非旋钮 ✓ —— 避免触发 §5.204 热路径旋钮读守卫 ✗；A/B 改此值 ✓）
         const YAW_P_SCALE_DEFAULT: f32 = YAW_P_SCALE;
         let kp_yaw_scale = YAW_P_SCALE_DEFAULT;
-        let mut att_out = super::attitude::attitude_rates_axis(
+        let mut att_out = super::attitude::attitude_rates_axis2(
             est.att,
             q_des,
             self.att_kp,
             self.att_kd,
             omega_f,
             kp_yaw_scale,
+            YAW_D_SCALE,
         );
         // ★★§5.208【对齐 PX4 `IMU_DGYRO_CUTOFF` ✓】角加速度 D（lead）：
         //   `rates -= dgyro_k · LPF20Hz(dω/dt)` ✓ —— 符号与 `−att_kd·ω` 同源：

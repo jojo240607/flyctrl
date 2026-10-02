@@ -40,6 +40,19 @@ pub fn attitude_rates_axis(
     omega: [f32; 3],
     kp_yaw_scale: f32,
 ) -> AttitudeOut {
+    attitude_rates_axis2(est_att, q_des, att_kp, att_kd, omega, kp_yaw_scale, 1.0)
+}
+
+/// ★§5.257 再扩展：yaw 的 D 通道比例（PX4 一手 yaw D=0 ✓）
+pub fn attitude_rates_axis2(
+    est_att: Quaternion,
+    q_des: Quaternion,
+    att_kp: f32,
+    att_kd: f32,
+    omega: [f32; 3],
+    kp_yaw_scale: f32,
+    kd_yaw_scale: f32,
+) -> AttitudeOut {
     let q_err = crate::vehicle::quat_mul(crate::vehicle::quat_conj(est_att), q_des);
     let sgn = if q_err.w < 0.0 { -2.0 } else { 2.0 };
     let ex_b = sgn * q_err.x;
@@ -49,7 +62,7 @@ pub fn attitude_rates_axis(
         rates: [
             att_kp * ex_b - att_kd * omega[0],
             att_kp * ey_b - att_kd * omega[1],
-            att_kp * kp_yaw_scale * ez_b - att_kd * omega[2], // §5.257 yaw P × 1.333（PX4 ✓）
+            att_kp * kp_yaw_scale * ez_b - att_kd * kd_yaw_scale * omega[2], // §5.257 分轴（PX4 ✓）
         ],
         err: [ex_b, ey_b, ez_b],
     }
