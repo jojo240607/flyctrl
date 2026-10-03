@@ -7,7 +7,7 @@ use core::ffi::c_void;
 
 use flyctrl_core::controller::{Controller, PidController, Setpoint};
 // ★**默认估计器改为 ESKF**（迁移计划步 3 ✓；全表验收 0/10 劣于 Legacy ✓，见 docs/c1-migration-plan.md ✓）
-use flyctrl_core::estimator::select::{AnyEstimator, AnyEstimatorKind};
+use flyctrl_core::estimator::select::AnyEstimator; // ★§5.272：`AnyEstimatorKind` 已随 Legacy 删除 ✓
 use flyctrl_core::fdir::Health;
 use flyctrl_core::hil::{HilContext, SimImu};
 use flyctrl_core::units::{Meter, MeterPerSecond, MeterPerSecondSquared, Second};
@@ -340,10 +340,8 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         //   ⇒ 测得加速度被当**前馈正反馈**注入控制律（悬停时 world_accel≈0 故未暴露，
         //   但姿态估计偏差时它会直接进入倾角指令 ✗）。
         {
-            let wa = match hil.est.inner {
-                flyctrl_core::estimator::select::AnyEstimatorKind::Eskf(ref e) => e.world_accel(),
-                _ => [0.0; 3],
-            };
+            // ★§5.272：删 Legacy 后 `inner` **就是** `EskfEstimator` ✓ ⇒ 无需 match ✓
+            let wa = hil.est.inner.world_accel();
             hil.ctrl.set_world_accel([
                 MeterPerSecondSquared(wa[0]),
                 MeterPerSecondSquared(wa[1]),
@@ -514,8 +512,8 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         );
         let est = r.est;
         unsafe {
-            if let flyctrl_core::estimator::select::AnyEstimatorKind::Eskf(ref esk) = hil.est.inner {
-                let f = esk.filter();
+            {
+                let f = hil.est.inner.filter(); // ★§5.272：同上 ✓
                 let d = core::ptr::addr_of_mut!(DBG_MAGI);
                 (*d)[0] = f.mag_i[0]; (*d)[1] = f.mag_i[1]; (*d)[2] = f.mag_i[2];
                 (*d)[3] = f.mag_b[0]; (*d)[4] = f.mag_b[1]; (*d)[5] = f.mag_b[2];
