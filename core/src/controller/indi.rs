@@ -63,6 +63,11 @@ pub struct IndiController<B: Controller> {
 }
 
 impl<B: Controller> IndiController<B> {
+    /// ★§5.266【只读访问器 ✓】返回内层基础控制器（诊断探针用 ✓，不改行为 ✓）
+    pub fn base(&self) -> &B {
+        &self.base
+    }
+
     /// 取内层基础控制律（调试用）。
     pub fn inner(&self) -> &B {
         &self.base
