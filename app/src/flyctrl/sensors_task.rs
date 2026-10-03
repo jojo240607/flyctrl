@@ -70,7 +70,8 @@ pub fn imu_sample_step() {
         let raw_a = [s.accel[0].0, s.accel[1].0, s.accel[2].0];
         let raw_g = [s.gyro[0].0, s.gyro[1].0, s.gyro[2].0];
         let ts = rtos_app_sdk::rtos::cycle_now();
-        let raw_dt = (ts.wrapping_sub(SENS_IMU_PREV_TS)) as f32 / 168_000_000.0;
+        let raw_dt = (ts.wrapping_sub(SENS_IMU_PREV_TS)) as f32
+            / (crate::flyctrl::rt_stat::cycles_per_us() as f32 * 1000.0);
         // ★design.md §7：**单调性检查** —— dt≤0（戳翻转/乱序）或超阈值 ⇒ **丢弃该帧**（不夹紧 ✗）+ 计数。
         if SENS_IMU_PREV_HAS && !(raw_dt > 1e-5 && raw_dt < 0.02) {
             SENS_IMU_PREV_TS = ts; // 重同步（避免持续丢弃）
@@ -194,7 +195,8 @@ pub fn sensors_step() {
                     let l1 = unsafe { crate::flyctrl::rate_task::RATE_EXEC_CYC } as u64 * 1000
                         + unsafe { crate::flyctrl::alloc_task::ALLOC_EXEC_CYC } as u64 * 1000
                         + unsafe { crate::flyctrl::safety_task::SAFETY_EXEC_CYC } as u64 * 500;
-                    let l1_permille = (l1 * 1000 / 168_000_000) as u32;
+                    let cpu_ms = crate::flyctrl::rt_stat::cycles_per_us() as u64 * 1000;
+                    let l1_permille = (l1 * 1000 / (cpu_ms * 1000)) as u32;
                     let ovl = crate::flyctrl::safety_task::OVERLOAD_LEVEL
                         .load(core::sync::atomic::Ordering::Relaxed);
                     info!(tag: "sensor", "loop {} drdy={} wq={}/{}/{}/{}/{} l2used={} l1={}permille ovl={}",

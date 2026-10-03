@@ -290,15 +290,15 @@ pub fn setup() {
         // ★design.md §5：【周期由 WorkItem 声明】—— 队列**自带调度器**按 EDF 派发，
         //   不再用外部硬件定时器各自 submit ✗（那样等于把频率写在定时器里、且 EDF 失效）。
         //   预算/周期/截止期全部落在 item 上 ⇒ §5#1「每个 WorkItem 声明」+ §5#3「队列内 EDF」✓。
-        const CY: u32 = 84_000; // ⚠️实测校准：仿真器 DWT->CYCCNT ≈84/µs（非标称 168）——4ms 声明若用 168k cycles 实际耗 ~7.85ms ⇒ harness 锁相漂移 2×
+        // ★周期单位是 **ms**：内核用【实测 cycles/ms】换算 ⇒ App 侧不写任何频率常量 ✓
         if let Some(f) = slot().workq_add_periodic {
-            f(Q_L2, core::ptr::addr_of_mut!(ATT_ITEM), 4 * CY);      // attitude  250Hz（4ms）
-            f(Q_L2, core::ptr::addr_of_mut!(EKF_ITEM), 5 * CY);      // estimator 200Hz（5ms）
-            f(Q_L2, core::ptr::addr_of_mut!(SENSORS_ITEM), 5 * CY);  // sensors   200Hz（5ms）
-            f(Q_L3, core::ptr::addr_of_mut!(NAV_ITEM), 20 * CY);     // L3 50Hz
-            f(Q_L3, core::ptr::addr_of_mut!(TELEM_ITEM), 20 * CY);
-            f(Q_L3, core::ptr::addr_of_mut!(UPLINK_ITEM), 20 * CY);
-            f(Q_L3, core::ptr::addr_of_mut!(LOG_ITEM), 20 * CY);     // 日志（L3 事件驱动·可丢弃）
+            f(Q_L2, core::ptr::addr_of_mut!(ATT_ITEM), 4);      // attitude  250Hz
+            f(Q_L2, core::ptr::addr_of_mut!(EKF_ITEM), 5);      // estimator 200Hz
+            f(Q_L2, core::ptr::addr_of_mut!(SENSORS_ITEM), 5);  // sensors   200Hz
+            f(Q_L3, core::ptr::addr_of_mut!(NAV_ITEM), 20);     // L3 50Hz
+            f(Q_L3, core::ptr::addr_of_mut!(TELEM_ITEM), 20);
+            f(Q_L3, core::ptr::addr_of_mut!(UPLINK_ITEM), 20);
+            f(Q_L3, core::ptr::addr_of_mut!(LOG_ITEM), 20);     // 日志（L3 事件驱动·可丢弃）
         }
     }
     info!(tag: "wq", "design.md §5: L2/L3 队列自带调度器（item 声明周期 + EDF）ready");

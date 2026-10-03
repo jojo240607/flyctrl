@@ -129,7 +129,8 @@ pub extern "C" fn rate_entry(_arg: *mut c_void) {
 
         let exec = st.tick().wrapping_sub(t0);
         unsafe { RATE_EXEC_CYC = exec; }
-        st.sample(exec, period_ticks.saturating_mul(168_000), 168_000); // 1kHz 名义
+        let cpu = crate::flyctrl::rt_stat::cycles_per_us() * 1000; // 内核实测 cycles/ms
+        st.sample(exec, period_ticks.saturating_mul(cpu), cpu); // 1kHz 名义
         it = it.wrapping_add(1);
         // ★design.md §4：**L1 CPU 预算校验（≤60%）** —— rate(1kHz)+safety(500Hz) 占用
         {
@@ -137,7 +138,8 @@ pub extern "C" fn rate_entry(_arg: *mut c_void) {
             let a_cyc = unsafe { crate::flyctrl::alloc_task::ALLOC_EXEC_CYC } as u64;
             let s_cyc = unsafe { crate::flyctrl::safety_task::SAFETY_EXEC_CYC } as u64;
             // design.md §4：L1 = rate(1kHz) + control_allocator(1kHz) + safety(500Hz)
-            let l1_permille = ((r_cyc * 1000 + a_cyc * 1000 + s_cyc * 500) * 1000 / 168_000_000) as u32;
+            let cpu_ms = crate::flyctrl::rt_stat::cycles_per_us() as u64 * 1000;
+            let l1_permille = ((r_cyc * 1000 + a_cyc * 1000 + s_cyc * 500) * 1000 / (cpu_ms * 1000)) as u32;
             if it % 1000 == 0 && l1_permille > 600 {
                 info!(tag: "rate", "L1 CPU budget exceeded: {}permille (>600, design.md §4)", l1_permille);
             }

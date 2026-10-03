@@ -53,8 +53,9 @@ pub extern "C" fn safety_entry(_arg: *mut c_void) {
         //   预算取 design.md §4 表：rate_ctrl 80µs、safety_monitor 20µs（@168MHz）。
         //   连续超预算计数；未超则清零（"连续"语义 ✓）。
         {
-            const RATE_BUDGET_CYC: u32 = 80 * 168; // 80µs @168MHz
-            const SAFETY_BUDGET_CYC: u32 = 20 * 168; // 20µs @168MHz
+            let cpu_us = crate::flyctrl::rt_stat::cycles_per_us(); // 内核实测，勿硬编码 ✗
+            let rate_budget = 80 * cpu_us;
+            let safety_budget = 20 * cpu_us;
             static mut L1_STRIKES: u32 = 0;
             let r = unsafe { crate::flyctrl::rate_task::RATE_EXEC_CYC };
             let s = unsafe { SAFETY_EXEC_CYC };
@@ -62,8 +63,8 @@ pub extern "C" fn safety_entry(_arg: *mut c_void) {
             //   20.2µs（含日志打包）⇒ 用 >1.5× 预算才算"超预算"，避免 1% 抖动即触发安全模式 ✗。
             const OVER_K_NUM: u32 = 3;   // 1.5×
             const OVER_K_DEN: u32 = 2;
-            let over = r * OVER_K_DEN > RATE_BUDGET_CYC * OVER_K_NUM
-                || s * OVER_K_DEN > SAFETY_BUDGET_CYC * OVER_K_NUM;
+            let over = r * OVER_K_DEN > rate_budget * OVER_K_NUM
+                || s * OVER_K_DEN > safety_budget * OVER_K_NUM;
             let strikes = unsafe {
                 if over { L1_STRIKES = L1_STRIKES.saturating_add(1); } else { L1_STRIKES = 0; }
                 L1_STRIKES
@@ -90,7 +91,8 @@ pub extern "C" fn safety_entry(_arg: *mut c_void) {
             let r = unsafe { crate::flyctrl::rate_task::RATE_EXEC_CYC } as u64;
             let a = unsafe { crate::flyctrl::alloc_task::ALLOC_EXEC_CYC } as u64;
             let s = unsafe { SAFETY_EXEC_CYC } as u64;
-            let l1_permille = ((r * 1000 + a * 1000 + s * 500) * 1000 / 168_000_000) as u32;
+            let cpu_ms = crate::flyctrl::rt_stat::cycles_per_us() as u64 * 1000;
+            let l1_permille = ((r * 1000 + a * 1000 + s * 500) * 1000 / (cpu_ms * 1000)) as u32;
             let mut wq = [0u32; 5];
             if let Some(f) = rtos_app_sdk::abi::slot().work_stats { f(wq.as_mut_ptr()); }
             let mut vio = [0u32; 3];
