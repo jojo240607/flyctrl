@@ -422,6 +422,16 @@ pub struct PidController {
     world_accel_meas: [f32; 3],
 }
 
+/// ★design.md §4：`rate_ctrl` → `control_allocator` 的接口。
+/// PX4 同构：`vehicle_torque_setpoint`（三轴力矩）+ `vehicle_thrust_setpoint`（归一推力）。
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TorqueThrust {
+    pub torque: [f32; 3],
+    pub thrust: f32,
+    /// false ⇒ `rate_ctrl` 判定应零输出（健康闸/未解锁）⇒ 分配器同样零输出 ✓。
+    pub valid: bool,
+}
+
 impl PidController {
     /// 读取最近一次内环调试快照（误差向量、期望机体角速度、机体角速度）。
     pub fn dbg_last(&self) -> ([f32; 3], [f32; 3], [f32; 3]) {
@@ -1240,7 +1250,9 @@ impl PidController {
     ///
     /// `omega` = 本拍实测机体角速率（rad/s）。高频路径由高频任务喂入**新鲜陀螺**；
     /// 单拍回退路径由 [`control`](Controller::control) 喂入 EKF 估计值。`dt` = 本层周期。
-    pub fn rate_step(&mut self, dt: Second, rsp: &RateSetpoint, omega: [f32; 3]) -> ActuatorCmd {
+    /// ★design.md §4：**`rate_ctrl` 只算力矩/推力**（不再直接出电机）——
+    ///   交出 `control_allocator` 做分配（两条 L1 线程职责单一 ✓）。
+    pub fn rate_step_torque(&mut self, dt: Second, rsp: &RateSetpoint, omega: [f32; 3]) -> TorqueThrust {
         let dt_s = dt.0;
         // 速率低通（一阶，rate_lpf_tau；0=不过滤）：噪声直达 D 项会自激
         let omega_f = if self.rate_lpf_tau > 0.0 {
@@ -1304,12 +1316,22 @@ impl PidController {
         unsafe {
             (*core::ptr::addr_of_mut!(G_PID_ATT_DBG))[6] = rsp.thrust;
         }
-        // 健康闸/未解锁 ⇒ 零输出（宿主置 `valid=false` ✓）
+        // 健康闸/未解锁 ⇒ 无效输出（宿主置 `valid=false` ✓）
         if !rsp.valid {
+            return TorqueThrust { torque: [0.0; 3], thrust: 0.0, valid: false };
+        }
+        TorqueThrust { torque, thrust: rsp.thrust, valid: true }
+    }
+
+    /// ★design.md §4：**`control_allocator`** —— 力矩/推力 → 电机（逐优先级去饱和 ✓）。
+    ///   独立 L1 线程消费 `rate_ctrl` 输出的 [`TorqueThrust`]（PX4 `vehicle_torque_setpoint`
+    ///   + `vehicle_thrust_setpoint` → `control_allocator` 同构 ✓）。
+    pub fn allocate(&self, tt: &TorqueThrust) -> ActuatorCmd {
+        if !tt.valid {
             return ActuatorCmd::zero();
         }
-        // --- 混控：X 型四旋翼（与旧实现一致 ✓）---
-        let des_thrust = rsp.thrust;
+        let torque = tt.torque;
+        let des_thrust = tt.thrust;
         let motors = if self.mix_mode == 4 {
             super::attitude::x4_mix_att_scale(des_thrust, torque)
         } else if self.mix_mode == 3 {
@@ -1328,6 +1350,12 @@ impl PidController {
             ]
         };
         ActuatorCmd { motor: motors }
+    }
+
+    /// 兼容入口：一步到位（= `rate_step_torque` + `allocate`，语义与旧 `rate_step` 逐位一致 ✓）。
+    pub fn rate_step(&mut self, dt: Second, rsp: &RateSetpoint, omega: [f32; 3]) -> ActuatorCmd {
+        let tt = self.rate_step_torque(dt, rsp, omega);
+        self.allocate(&tt)
     }
 
     /// ★C3 **姿态层 P**：四元数姿态误差 → 速率设定值（rad/s，已按 `RATE_MAX_DPS` 限幅）。

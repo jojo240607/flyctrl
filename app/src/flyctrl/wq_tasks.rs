@@ -256,7 +256,7 @@ pub fn setup() {
     crate::flyctrl::uplink::uplink_init();
 
     if let Some(f) = slot().workq_create {
-        f(Q_L2, b"wql2\0".as_ptr() as *const _, 3,
+        f(Q_L2, b"wql2\0".as_ptr() as *const _, 5, // ★design.md §4：L2 必须低于全部 L1（rate2/alloc3/safety4）
           unsafe { core::ptr::addr_of_mut!(L2_WQ_STACK).cast::<u8>() }, 12288);
         f(Q_L3, b"wql3\0".as_ptr() as *const _, 10,
           unsafe { core::ptr::addr_of_mut!(L3_WQ_STACK).cast::<u8>() }, 2048);

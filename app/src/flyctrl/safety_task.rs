@@ -81,8 +81,9 @@ pub extern "C" fn safety_entry(_arg: *mut c_void) {
         // ★design.md §8：过载逐级降级 —— 由 L1 CPU 负载 + 队列硬超时 + 截止期违约 判定
         {
             let r = unsafe { crate::flyctrl::rate_task::RATE_EXEC_CYC } as u64;
+            let a = unsafe { crate::flyctrl::alloc_task::ALLOC_EXEC_CYC } as u64;
             let s = unsafe { SAFETY_EXEC_CYC } as u64;
-            let l1_permille = ((r * 1000 + s * 500) * 1000 / 168_000_000) as u32;
+            let l1_permille = ((r * 1000 + a * 1000 + s * 500) * 1000 / 168_000_000) as u32;
             let mut wq = [0u32; 5];
             if let Some(f) = rtos_app_sdk::abi::slot().work_stats { f(wq.as_mut_ptr()); }
             let mut vio = [0u32; 3];

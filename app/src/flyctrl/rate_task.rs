@@ -108,32 +108,24 @@ pub extern "C" fn rate_entry(_arg: *mut c_void) {
         // 地面站参数即时生效（速率层增益 ✓）。
         crate::flyctrl::uplink::sync_gains_to_pid(&mut pid);
 
-        // ★L1：速率层（PX4 `mc_rate_control`）→ 混控（`control_allocator`）→ 执行器。
-        let cmd = if crate::flyctrl::safety_task::SAFETY_KILL
+        // ★design.md §4：`rate_ctrl` **只算力矩/推力**（不再直接出电机）——
+        //   经 `RATE_TT` 交独立 L1 线程 `control_allocator` 做分配+PWM ✓（职责单一）。
+        let tt = if crate::flyctrl::safety_task::SAFETY_KILL
             .load(core::sync::atomic::Ordering::Relaxed)
         {
-            ActuatorCmd::zero() // safety_monitor: control stuck / Critical => kill
+            flyctrl_core::controller::TorqueThrust::default() // valid=false ⇒ 分配器零输出
         } else {
-            pid.rate_step(dt, &rsp, gyro)
+            pid.rate_step_torque(dt, &rsp, gyro)
         };
-
-        // 限幅 + 输出 PWM。
-        let mut motors = [0.0f32; 4];
-        for i in 0..4 {
-            motors[i] = clamp_thrust(cmd.motor[i]);
-            if let Some(d) = &pwm_dev[i] {
-                let us = 1000.0 + 1000.0 * motors[i];
-                let ticks = (us * pwm_period[i] as f32 / 2500.0) as u32;
-                let mut t = ticks;
-                let _ = d.ioctl(ioctl::PWM_IOCTL_SET_DUTY_TICKS, &mut t as *mut u32 as *mut c_void);
-            }
-        }
         unsafe {
-            (*core::ptr::addr_of_mut!(HIL_DIAG)).motor = motors;
+            let t = &mut *core::ptr::addr_of_mut!(crate::flyctrl::RATE_TT);
+            t.torque = tt.torque;
+            t.thrust = tt.thrust;
+            t.valid = tt.valid as u32;
+            t.seq = t.seq.wrapping_add(1);
         }
-        // HIL：回传执行器（HIL_ACTUATOR_CONTROLS）。
-        #[cfg(feature = "hil")]
-        crate::flyctrl::uplink::set_actuator_cmd(&motors);
+
+        // 执行器输出/PWM 已迁至 L1 `alloc`（`control_allocator`）✓。
 
         let exec = st.tick().wrapping_sub(t0);
         unsafe { RATE_EXEC_CYC = exec; }
@@ -142,8 +134,10 @@ pub extern "C" fn rate_entry(_arg: *mut c_void) {
         // ★design.md §4：**L1 CPU 预算校验（≤60%）** —— rate(1kHz)+safety(500Hz) 占用
         {
             let r_cyc = st.last_exec() as u64;
+            let a_cyc = unsafe { crate::flyctrl::alloc_task::ALLOC_EXEC_CYC } as u64;
             let s_cyc = unsafe { crate::flyctrl::safety_task::SAFETY_EXEC_CYC } as u64;
-            let l1_permille = ((r_cyc * 1000 + s_cyc * 500) * 1000 / 168_000_000) as u32;
+            // design.md §4：L1 = rate(1kHz) + control_allocator(1kHz) + safety(500Hz)
+            let l1_permille = ((r_cyc * 1000 + a_cyc * 1000 + s_cyc * 500) * 1000 / 168_000_000) as u32;
             if it % 1000 == 0 && l1_permille > 600 {
                 info!(tag: "rate", "L1 CPU budget exceeded: {}permille (>600, design.md §4)", l1_permille);
             }

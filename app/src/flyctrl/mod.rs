@@ -24,6 +24,7 @@
 //! 不实际发起读事务，避免拖垮采样线程。
 
 pub mod control;
+pub mod alloc_task;
 pub mod rate_task;
 pub mod nav_task;
 pub mod wq_tasks;
@@ -223,6 +224,22 @@ pub struct RateCmd {
 #[link_section = ".rust_bss"]
 pub static mut RATE_CMD: RateCmd = unsafe { core::mem::zeroed() };
 
+/// ★design.md §4：**`rate_ctrl` → `control_allocator`** 的交接 topic。
+/// PX4 同构：`vehicle_torque_setpoint`（三轴力矩）+ `vehicle_thrust_setpoint`（归一推力）。
+/// 优先级：写者 `rate`(prio=2) 高于读者 `alloc`(prio=3) ⇒ 读必为完整写 ✓。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RateTt {
+    pub torque: [f32; 3],
+    pub thrust: f32,
+    /// 非 0 = 有效（健康/解锁闸全开）；0 ⇒ 分配器零输出 ✓。
+    pub valid: u32,
+    /// 发布序号（诊断：确认分配器每拍都拿到新值 ✓）。
+    pub seq: u32,
+}
+#[link_section = ".rust_bss"]
+pub static mut RATE_TT: RateTt = unsafe { core::mem::zeroed() };
+
 /// ★C1 共享设定点（姿态层 `control` 写、EKF 层 `rate_task` 读）。
 /// 优先级：写者 control(4) 高于读者 rate(5) ⇒ 读必为完整写 ✓（同 SENSOR_FRAME 论证 ✓）。
 #[repr(C)]
@@ -277,6 +294,7 @@ const STACK_CTRL: usize = 8192; // ★C1：控制任务已不再运行 EKF（迁
 const STACK_TELEM: usize = 4096; // 遥测 encode 3 个 MAVLink 帧(heartbeat/local_pos/sys_status)栈使用大，1024 疑似栈溢出导致 telem 卡住不写 usb0，提到 4096
 const STACK_UPLINK: usize = 4096; // 上行 poll_read+feed+decode 栈使用大，实测 1024 栈溢出导致系统 fault，提到 4096
 const STACK_SAFETY: usize = 2048; // L1 safety_monitor (tiny stack)
+const STACK_ALLOC: usize = 4096; // ★design.md §4：L1 control_allocator（仅分配+PWM）
 const STACK_RATE: usize = 4096; // ★P0-3：L1 薄速率环（仅 rate_step+混控+PWM，无 EKF）⇒ 4KB 充足 ✓
 const STACK_EKF: usize = 14336; // ★P0-3：L2 EKF 任务（大矩阵：propagate 1.2KB + update 1.6KB + 调用链）⇒ 留足余量 ✓
 
@@ -285,6 +303,7 @@ static mut STACK_TELEM_BUF: [u8; STACK_TELEM] = [0u8; STACK_TELEM];
 #[link_section = ".app_stacks"]
 static mut STACK_UPLINK_BUF: [u8; STACK_UPLINK] = [0u8; STACK_UPLINK];
 #[link_section = ".app_stacks"]
+static mut STACK_ALLOC_BUF: [u8; STACK_ALLOC] = [0u8; STACK_ALLOC];
 static mut STACK_RATE_BUF: [u8; STACK_RATE] = [0u8; STACK_RATE];
 #[link_section = ".app_stacks"]
 static mut STACK_SAFETY_BUF: [u8; STACK_SAFETY] = [0u8; STACK_SAFETY];
@@ -390,6 +409,19 @@ pub fn spawn_flyctrl() {
         1,
         RTOS_RT_HARD,
         2,
+        1,
+    );
+    // ★design.md §4 L1 `control_allocator`：独立硬实时线程（1kHz, prio 3, HARD）。
+    //   prio 3 位于 rate(2) 之下、safety(4) 之上 ⇒ 三条 L1 线程均**高于** L2 worker(5) ✓。
+    spawn_rt(
+        "alloc",
+        alloc_task::alloc_entry,
+        3,
+        unsafe { STACK_ALLOC_BUF.as_mut_ptr() },
+        STACK_ALLOC,
+        1,
+        RTOS_RT_HARD,
+        1, // deadline：1kHz ⇒ 1ms
         1,
     );
     spawn_rt(

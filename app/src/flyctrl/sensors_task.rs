@@ -192,6 +192,7 @@ pub fn sensors_step() {
                     }
                     // ★design.md §9：可观测性 —— 队列统计 + **队列利用率(L2 已用 cycles)**
                     let l1 = unsafe { crate::flyctrl::rate_task::RATE_EXEC_CYC } as u64 * 1000
+                        + unsafe { crate::flyctrl::alloc_task::ALLOC_EXEC_CYC } as u64 * 1000
                         + unsafe { crate::flyctrl::safety_task::SAFETY_EXEC_CYC } as u64 * 500;
                     let l1_permille = (l1 * 1000 / 168_000_000) as u32;
                     let ovl = crate::flyctrl::safety_task::OVERLOAD_LEVEL

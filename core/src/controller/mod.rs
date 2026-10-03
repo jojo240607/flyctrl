@@ -13,6 +13,7 @@ pub mod tecs;
 pub mod manual;
 
 pub use trait_def::{Controller, RateSetpoint, Setpoint};
+pub use pid::{TorqueThrust};
 pub use pid::PidController;
 pub use lqr::LqrController;
 pub use mpc::MpcController;
