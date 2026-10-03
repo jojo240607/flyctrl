@@ -290,7 +290,7 @@ pub fn setup() {
         // ★design.md §5：【周期由 WorkItem 声明】—— 队列**自带调度器**按 EDF 派发，
         //   不再用外部硬件定时器各自 submit ✗（那样等于把频率写在定时器里、且 EDF 失效）。
         //   预算/周期/截止期全部落在 item 上 ⇒ §5#1「每个 WorkItem 声明」+ §5#3「队列内 EDF」✓。
-        const CY: u32 = 168_000; // 1ms @168MHz
+        const CY: u32 = 84_000; // ⚠️实测校准：仿真器 DWT->CYCCNT ≈84/µs（非标称 168）——4ms 声明若用 168k cycles 实际耗 ~7.85ms ⇒ harness 锁相漂移 2×
         if let Some(f) = slot().workq_add_periodic {
             f(Q_L2, core::ptr::addr_of_mut!(ATT_ITEM), 4 * CY);      // attitude  250Hz（4ms）
             f(Q_L2, core::ptr::addr_of_mut!(EKF_ITEM), 5 * CY);      // estimator 200Hz（5ms）
