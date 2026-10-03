@@ -148,6 +148,61 @@ fn desaturate(m: &mut [f32; 4], dv: &[f32; 4], lo: f32, hi: f32, only_reduce: bo
 
 /// ★★§5.216：PX4 一手同构的四旋翼控制分配（**姿态优先于推力** ✓）。
 /// `mix_sat == false` 时不必调用（原路径逐位不变 ✓）。
+/// ★★§5.268【PX4 有效性矩阵架构 ✓（完整 `ControlAllocation` 的核心）】
+///
+/// 一手依据 ✓（`ActuatorEffectivenessRotors.cpp:174-206` ✓）：
+/// ```cpp
+/// float ct = geometry.rotors[i].thrust_coef;      // 推力系数
+/// float km = geometry.rotors[i].moment_ratio;     // yaw 反扭矩比
+/// Vector3f thrust = ct * axis;                                   // → 行 3
+/// Vector3f moment = ct * position.cross(axis) - ct * km * axis;  // → 行 0..2（roll/pitch/yaw）
+/// effectiveness(j, i) = moment(j);  effectiveness(j+3, i) = thrust(j);
+/// ```
+/// ⇒ **混控系数由几何导出** ✓（旋翼位置 `position` × 推力轴 `axis` ✓ + yaw 反扭矩 `km` ✓）
+///   —— 而非硬编码表 ✓（这才使"动态重分配"成为可能 ✓，如故障/倾转 ✓）
+///
+/// 本仓 X 型实例化 ✓（归一化后 ⇒ 与既有 `x4_mix_px4` 系数**逐位等价** ✓，由自检断言 ✓）：
+///   · 4 旋翼位于 ±ℓ/√2(±1,±1,0) ✓（X 型 ✓）、推力轴 `axis = (0,0,-1)`（机体 −Z ✓）
+///   · ct 相同 ✓（归一 1 ✓）、km 取 CW/CCW 反号 ✓（反扭矩 ⇒ yaw 有效性 ∓0.5 ✓）
+///   · 行 0..2 = (roll, pitch, yaw) ✓、行 3 = thrust ✓ ⇒ 每列 = 该电机对四轴的贡献 ✓
+/// ⚠️本仓取**归一化**形式 ✓（各轴除以自身峰值 ⇒ 系数 ∈ {±0.5, 1.0} ✓）：
+///   PX4 侧亦做归一（`setEffectivenessMatrix` 的 `normalize` 参数 ✓）⇒ 二者同构 ✓
+pub fn x4_effectiveness() -> [[f32; 4]; 4] {
+    // 电机顺序（与 `x4_mix` 一致 ✓）：0=前右 1=后左 2=前左 3=后右
+    // 位置（机体 FRD：前 +X、右 +Y ✓）单位化 ⇒ 取 ±1 分量 ✓
+    let pos: [[f32; 2]; 4] = [[1.0, 1.0], [-1.0, -1.0], [1.0, -1.0], [-1.0, 1.0]];
+    let km = [1.0f32, 1.0, -1.0, -1.0]; // 反扭矩符号（CW/CCW 交替 ✓，与 `YAW` 系数同源 ✓）
+    const MOMENT_SCALE: f32 = 0.5; // ★归一化 ✓：力矩行相对推力行的比例（= 我仓混控系数 ✓）
+    let mut eff = [[0.0f32; 4]; 4];
+    for i in 0..4 {
+        let (px, py) = (pos[i][0], pos[i][1]);
+        // ★逐行推导 ✓（一手 `moment = ct·(position × axis) − ct·km·axis`，axis = 机体 −Z ✓；
+        //   本仓约定映射 ✓ —— roll 取反、thrust 取反 ✓，见 §5.268 注释 ✓）：
+        //   roll  = −(position × axis)_x  = **+pos_y**  ✓（一手为 −pos_y ⇒ 取反 ✓）
+        //   pitch = +(position × axis)_y  = **+pos_x**  ✓（一致 ✓）
+        //   yaw   = −km·axis_z            = **+km**     ✓（一致 ✓）
+        //   thrust= −(ct·axis)_z          = **+1**      ✓（一手为 −1 ⇒ 取反 ✓）
+        eff[0][i] = MOMENT_SCALE * py;      // roll
+        eff[1][i] = MOMENT_SCALE * px;      // pitch
+        eff[2][i] = MOMENT_SCALE * km[i];   // yaw（反扭矩）
+        eff[3][i] = 1.0;                    // thrust（正 = 上升 ✓）
+    }
+    eff
+}
+
+/// ★§5.268【矩阵驱动的分配 ✓】`actuator[i] = Σ_axis effectiveness[axis][i] · control[axis]` ✓
+///   `control = [roll, pitch, yaw, thrust]` ✓ —— 与 `x4_mix_px4` 逐位等价（自检断言 ✓）
+pub fn x4_mix_matrix(control: [f32; 4]) -> [f32; 4] {
+    let eff = x4_effectiveness();
+    let mut a = [0.0f32; 4];
+    for i in 0..4 {
+        for j in 0..4 {
+            a[i] += eff[j][i] * control[j];
+        }
+    }
+    a
+}
+
 pub fn x4_mix_px4(des_thrust: f32, pqr: [f32; 3]) -> [f32; 4] {
     x4_mix_px4_airmode(des_thrust, pqr, false)
 }
@@ -223,6 +278,29 @@ pub fn x4_mix_px4_airmode(des_thrust: f32, pqr: [f32; 3], airmode: bool) -> [f32
         m[i] = m[i].clamp(0.0, 1.0);
     }
     m
+}
+
+/// ★★§5.268【等价性自检 ✓】矩阵驱动分配必须与既有 `x4_mix_px4` 系数**逐位等价** ✓
+///   （本仓头号纪律：机制必须在运行 ✓ + 等价性必须可验 ✓）
+///   ⚠️若此测试失败 ⇒ 有效性矩阵的几何/符号与混控系数不一致 ✗ ⇒ 必须先修一致性 ✓
+#[test]
+fn x4_effectiveness_matches_fixed_mixer() {
+    for &(t, p, q, r) in &[
+        (0.5f32, 0.0f32, 0.0f32, 0.0f32),
+        (0.5, 0.1, -0.2, 0.05),
+        (0.3, -0.3, 0.25, -0.15),
+        (0.8, 0.02, 0.03, -0.01),
+    ] {
+        let fixed = x4_mix_px4(t, [p, q, r]);
+        let mat = x4_mix_matrix([p, q, r, t]);
+        for i in 0..4 {
+            assert!(
+                (fixed[i] - mat[i]).abs() < 1e-6,
+                "矩阵分配应等于固定混控（电机{i}：fixed={} mat={}）✗（t={t} p={p} q={q} r={r}）",
+                fixed[i], mat[i]
+            );
+        }
+    }
 }
 
 pub fn x4_mix_sat(des_thrust: f32, pqr: [f32; 3]) -> [f32; 4] {
