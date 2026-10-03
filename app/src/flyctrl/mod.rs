@@ -358,7 +358,9 @@ pub fn spawn_flyctrl() {
 
     // 日志消费者任务（低优先，drain 日志 ring → uart0）。必须最先创建，确保后续
     // 业务任务的 info! 日志能及时被输出（只写 ring，绝不阻塞业务任务）。
-    rtos_app_sdk::log::spawn_log_task();
+    // ★design.md §6：日志消费归 **L3 WorkItem**（"日志 事件驱动·可丢弃"）——
+    //   不再创建独立 log 线程 ✓；改为打开 ring 并由 L3 `wq:log` item 周期 drain。
+    rtos_app_sdk::log::activate_ring_consumer();
 
     // ★★§5.220：把"栈竞技场"范围交给 MAVLink 编码器的**悬垂缓冲守卫** ✓
     //   只按"地址 < SP"判会误伤静态/.bss 缓冲 ✗（它们天生在栈下方 ✓）⇒ 必须显式给范围 ✓

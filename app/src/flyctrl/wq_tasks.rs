@@ -50,6 +50,8 @@ static mut SENSORS_ITEM: rtos_work_t = unsafe { core::mem::zeroed() };
 static mut NAV_ITEM: rtos_work_t = unsafe { core::mem::zeroed() };
 static mut TELEM_ITEM: rtos_work_t = unsafe { core::mem::zeroed() };
 static mut UPLINK_ITEM: rtos_work_t = unsafe { core::mem::zeroed() };
+/// ★design.md §6：日志 WorkItem（L3「事件驱动·可丢弃」）—— 取代独立 log 线程 ✓。
+static mut LOG_ITEM: rtos_work_t = unsafe { core::mem::zeroed() };
 static mut WQ_TIMER: MaybeUninit<rtos_timer_t> = MaybeUninit::uninit();
 static mut L3_TIMER: MaybeUninit<rtos_timer_t> = MaybeUninit::uninit();
 
@@ -140,6 +142,11 @@ extern "C" fn telem_work(_arg: *mut c_void) {
     crate::flyctrl::telemetry::telemetry_step();
 }
 
+/// ★design.md §6 L3 WorkItem：日志 drain（一轮排空 + uart0 DMA TX ✓）。
+extern "C" fn log_work(_arg: *mut c_void) {
+    rtos_app_sdk::log::drain_once();
+}
+
 /// L3 WorkItem：uplink（MAVLink 上行/解析）。
 extern "C" fn uplink_work(_arg: *mut c_void) {
     crate::flyctrl::uplink::uplink_step();
@@ -151,6 +158,8 @@ extern "C" fn uplink_work(_arg: *mut c_void) {
 /// L3 50Hz 定时器回调：提交 nav item。
 extern "C" fn tick_l3_cb(_t: *mut rtos_timer_t, _arg: *mut c_void) {
     if let Some(f) = slot().work_submit_q {
+        // ★design.md §6：日志归 L3（"事件驱动·可丢弃"，不占独立线程 ✓）
+        f(Q_L3, unsafe { core::ptr::addr_of_mut!(LOG_ITEM) });
         f(Q_L3, unsafe { core::ptr::addr_of_mut!(NAV_ITEM) });
         f(Q_L3, unsafe { core::ptr::addr_of_mut!(TELEM_ITEM) });
         f(Q_L3, unsafe { core::ptr::addr_of_mut!(UPLINK_ITEM) });
@@ -217,6 +226,15 @@ pub fn setup() {
             fn_: Some(nav_work),
             arg: core::ptr::null_mut(),
             budget_cycles: 200_000,
+            deadline_cycles: 0,
+            miss_count: 0,
+            degraded: 0,
+        };
+        LOG_ITEM = rtos_work_t {
+            next: core::ptr::null_mut(),
+            fn_: Some(log_work),
+            arg: core::ptr::null_mut(),
+            budget_cycles: 168_000, // ~1ms
             deadline_cycles: 0,
             miss_count: 0,
             degraded: 0,
