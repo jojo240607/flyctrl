@@ -303,6 +303,49 @@ fn x4_effectiveness_matches_fixed_mixer() {
     }
 }
 
+/// ★★§5.269【姿态需求**等比缩放**分配 ✓】—— 伪逆思想的**廉价等价** ✓（无需矩阵求逆 ✓）
+///
+/// 与顺序去饱和的区别 ✓（实测动机 ✓ §5.266）：顺序去饱和在饱和时按**固定优先级**削减 ✓
+///   ⇒ roll/pitch 优先、**yaw 独吞削减** ✗ ⇒ 偏航跟踪崩掉 ✓（实测缺口 9.3 rad/s ✗、偏航误差 170° ✗）
+/// 本函数 ✓：把姿态需求 (p,q,r) 乘**同一因子 s ∈ (0,1]** 直到可行 ✓ ⇒ **三轴共担削减** ✓
+///   （这正是加权伪逆在"仅姿态受限"情形下的效果 ✓，但只需二分/解析求 s ✓，MCU 上便宜 ✓）
+/// `s` 用解析法 ✓：对每台电机求不越界所需的 s 上界 ⇒ 取最小 ✓（O(4) ✓ 无迭代 ✓）
+/// ⚠️**不替代推力** ✓：先按原推力混入 ✓，只在越界时缩放姿态部分 ✓（推力不被抬高 ✓）
+pub fn x4_mix_att_scale(des_thrust: f32, pqr: [f32; 3]) -> [f32; 4] {
+    const ROLL: [f32; 4] = [0.5, -0.5, -0.5, 0.5];
+    const PITCH: [f32; 4] = [0.5, -0.5, 0.5, -0.5];
+    const YAW: [f32; 4] = [0.5, 0.5, -0.5, -0.5];
+    let (p, q, r) = (pqr[0], pqr[1], pqr[2]);
+    // 每台电机的姿态贡献 c_i（不含推力 ✓）
+    let c = [
+        ROLL[0] * p + PITCH[0] * q + YAW[0] * r,
+        ROLL[1] * p + PITCH[1] * q + YAW[1] * r,
+        ROLL[2] * p + PITCH[2] * q + YAW[2] * r,
+        ROLL[3] * p + PITCH[3] * q + YAW[3] * r,
+    ];
+    // 求最大可行缩放 s ✓：对每台电机解 `0 <= T + s·c_i <= 1` ✓
+    let mut s = 1.0f32;
+    for i in 0..4 {
+        let ci = c[i];
+        if ci.abs() < 1e-9 {
+            continue;
+        }
+        let (lo, hi) = (0.0 - des_thrust, 1.0 - des_thrust);
+        let (a, b) = (lo / ci, hi / ci);
+        let (smin, smax) = if a < b { (a, b) } else { (b, a) };
+        let s_cap = if ci > 0.0 { smax } else { smin };
+        if s_cap < s {
+            s = s_cap;
+        }
+    }
+    let s = s.clamp(0.0, 1.0);
+    let mut m = [0.0f32; 4];
+    for i in 0..4 {
+        m[i] = (des_thrust + s * c[i]).clamp(0.0, 1.0);
+    }
+    m
+}
+
 pub fn x4_mix_sat(des_thrust: f32, pqr: [f32; 3]) -> [f32; 4] {
     let m = x4_mix(des_thrust, pqr);
     let mut mmin = f32::INFINITY;

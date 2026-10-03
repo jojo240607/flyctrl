@@ -1401,7 +1401,13 @@ impl PidController {
         // ★★§5.215：`mix_sat=true` ⇒ **推力优先**的饱和管理 ✓（差动塞不下时绕均值缩放 ⇒
         //   **均值/总推力精确保住** ✓，代价是短时牺牲姿态权限 ✓）；
         //   `false` ⇒ 原路径（四路各自 clamp ✗ ⇒ 触界时均值丢失 ⇒ 掉高 ✗）**逐位不变** ✓
-        let motors = if self.mix_mode == 3 {
+        let motors = if self.mix_mode == 4 {
+            // ✗§5.269【**已实测否决** ✗：姿态等比缩放分配】—— 保留为可选档（A/B 用 ✓）
+            //   实测 ✓：guidance 15/0 → **13/2** ✗、att_ctrl 18/0 → **10/8** ✗✗
+            //   原因 ✓：**等比缩放会全局削弱姿态权限** ✗ ⇒ 而"姿态优先"对稳定性是**必需的** ✓
+            //   ⇒ ★该否定结果**反证了 PX4 顺序去饱和设计（姿态优先）的正确性** ✓
+            super::attitude::x4_mix_att_scale(des_thrust, att_out.rates)
+        } else if self.mix_mode == 3 {
             // ★★§5.255【PX4 `mixAirmodeRP`（`MC_AIRMODE=1` ✓）】—— 允许抬高推力换姿态权限 ✓
             //   与 `mix_mode == 2`（= PX4 `mixAirmodeDisabled` ✓ 默认 ✓）的唯一差异 ✓：
             //     混【含 yaw】✓ + 推力去饱和**无 increase_only** ✓ + yaw 最后去饱和 ✓

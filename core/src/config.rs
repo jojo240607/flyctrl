@@ -145,7 +145,7 @@ impl VehicleConfig {
             dgyro_k: 0.02,
             dgyro_cutoff: 20.0,
             ki_rate: 0.5,
-            mix_mode: 2, // ★§5.216 PX4 一手同构（姿态优先 ✓）默认开
+            mix_mode: 2, // ★§5.216 PX4 一手同构（姿态优先 ✓）默认开 // ★§5.216 PX4 一手同构（姿态优先 ✓）默认开
             // ★★§5.256【② airmode 决策（实测 ✓）】`3`（= PX4 `mixAirmodeRP` ✓）虽把切向偏航
             //   yaw 误差 172°→67° ✓，但使 `guidance_track` **14/2 → 12/4** ✗
             //   （抬高推力换取姿态权限 ⇒ 高度/位置控制劣化 ⇒ circle/figure8 被弄坏 ✗）
