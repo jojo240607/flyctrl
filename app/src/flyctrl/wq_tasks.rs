@@ -54,6 +54,7 @@ static mut UPLINK_ITEM: rtos_work_t = unsafe { core::mem::zeroed() };
 static mut LOG_ITEM: rtos_work_t = unsafe { core::mem::zeroed() };
 static mut WQ_TIMER: MaybeUninit<rtos_timer_t> = MaybeUninit::uninit();
 static mut L3_TIMER: MaybeUninit<rtos_timer_t> = MaybeUninit::uninit();
+static mut EST_TIMER: MaybeUninit<rtos_timer_t> = MaybeUninit::uninit();
 
 /// L2 WorkItem：estimator（EKF/FDIR 一拍）。
 extern "C" fn estimator_work(_arg: *mut c_void) {
@@ -166,12 +167,17 @@ extern "C" fn tick_l3_cb(_t: *mut rtos_timer_t, _arg: *mut c_void) {
     }
 }
 
-/// 250Hz 定时器回调（定时器任务上下文）：把 L2 的 estimator + attitude 提交到**同一条 L2 队列**。
+/// ★design.md §5：**attitude 250Hz** 定时器 —— 只提交姿态 item（200µs 预算）。
 extern "C" fn tick_cb(_t: *mut rtos_timer_t, _arg: *mut c_void) {
     if let Some(f) = slot().work_submit_q {
-        f(Q_L2, unsafe { core::ptr::addr_of_mut!(EKF_ITEM) });
         f(Q_L2, unsafe { core::ptr::addr_of_mut!(ATT_ITEM) });
-        // ★过渡：DRDY 未启用时由 250Hz 定时器驱动 sensors item（修好 DRDY 后改由 ISR 提交）
+    }
+}
+
+/// ★design.md §5：**estimator 200Hz + sensors 200Hz** 定时器 —— 提交 EKF 与慢传感器 item。
+extern "C" fn tick_est_cb(_t: *mut rtos_timer_t, _arg: *mut c_void) {
+    if let Some(f) = slot().work_submit_q {
+        f(Q_L2, unsafe { core::ptr::addr_of_mut!(EKF_ITEM) });
         f(Q_L2, unsafe { core::ptr::addr_of_mut!(SENSORS_ITEM) });
     }
 }
@@ -284,7 +290,13 @@ pub fn setup() {
             f(WQ_TIMER.as_mut_ptr(), b"wq250\0".as_ptr() as *const _, Some(tick_cb), core::ptr::null_mut());
         }
         if let Some(f) = slot().timer_start_ticks {
-            f(WQ_TIMER.as_mut_ptr(), 1 /*periodic*/, 5); // ★design.md §5: L2 200Hz（原 250Hz）
+            f(WQ_TIMER.as_mut_ptr(), 1 /*periodic*/, 4); // ★design.md §5: attitude 250Hz
+        }
+        if let Some(f) = slot().timer_init {
+            f(EST_TIMER.as_mut_ptr(), b"wq200\0".as_ptr() as *const _, Some(tick_est_cb), core::ptr::null_mut());
+        }
+        if let Some(f) = slot().timer_start_ticks {
+            f(EST_TIMER.as_mut_ptr(), 1 /*periodic*/, 5); // ★design.md §5: estimator/sensors 200Hz
         }
         // ★L3 50Hz 定时器 → 提交 nav item
         if let Some(f) = slot().timer_init {
