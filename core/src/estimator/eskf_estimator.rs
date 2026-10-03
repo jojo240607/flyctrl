@@ -165,25 +165,20 @@ impl EskfEstimator {
     }
 }
 
-impl Estimator for EskfEstimator {
-    /// ★§5.187：比力低通群延迟 τ（秒）——由 `HilContext` 从实际滤波器自动标定后写入。
-    fn set_accel_lag_s(&mut self, tau_s: f32) {
-        self.f.accel_lag_s = tau_s;
-    }
 
-    fn step(
-        &mut self,
-        dt: Second,
-        imu: ImuSample,
-        pos: Option<PosSample>,
-        airspeed: Option<AirspeedSample>,
-    ) -> VehicleState {
-        let dtf = dt.0;
+
+impl Estimator for EskfEstimator {
+
+    /// ★design.md §7 + PX4 同构（`ekf.cpp:183-184`）：**逐样本 predict** ——
+    ///   直接吃 `sensors` 的 `delta_ang/delta_vel` + 实测 dt ⇒ 1kHz IMU 不丢样本 ✓。
+    fn predict_delta(&mut self, delta_ang: [f32; 3], delta_vel: [f32; 3], dtf: f32) {
+
         self.n_step = self.n_step.wrapping_add(1);
         bump(0);
 
-        let gyr = [imu.gyro[0].0, imu.gyro[1].0, imu.gyro[2].0];
-        let acc = [imu.accel[0].0, imu.accel[1].0, imu.accel[2].0];
+        let inv = if dtf > 1e-9 { 1.0 / dtf } else { 0.0 };
+        let gyr = [delta_ang[0] * inv, delta_ang[1] * inv, delta_ang[2] * inv];
+        let acc = [delta_vel[0] * inv, delta_vel[1] * inv, delta_vel[2] * inv];
         self.omega_body = gyr;
         // ★§5.186：当前机体角速率也供【重力辅助的比力低通延迟补偿】用（`update_gravity`
         //   在 `update_mag` **之前**调用 ⇒ 原先 `mag_delay_omega` 在重力步里是**上一拍**的值）；
@@ -224,24 +219,27 @@ impl Estimator for EskfEstimator {
                     (*d)[slot * 16 + 7] = self.f.st.q.x;
                     (*d)[slot * 16 + 8] = self.f.st.q.y;
                     (*d)[slot * 16 + 9] = self.f.st.q.z;
-                    (*d)[slot * 16 + 13] = if let Some(pp) = pos { pp.pos[2].0 } else { -999.0 };
-                    (*d)[slot * 16 + 14] = if let Some(pp) = pos { pp.pos[0].0 } else { -999.0 };
+                    (*d)[slot * 16 + 13] = self.f.st.p[2];
+                    (*d)[slot * 16 + 14] = self.f.st.p[0];
                     (*d)[slot * 16 + 15] = self.n_step as f32;
                 }
             }
         }
 
         // 1) 标称态 + 协方差推进 ✓（速率×dt ✓）
-        let d_ang = [gyr[0] * dtf, gyr[1] * dtf, gyr[2] * dtf];
-        let d_vel = [acc[0] * dtf, acc[1] * dtf, acc[2] * dtf];
         crate::perf::probe(8); // ESKF: step 进入
-        self.f.predict(d_ang, d_vel, dtf, self.g_ned);
+        self.f.predict(delta_ang, delta_vel, dtf, self.g_ned);
         crate::perf::probe(9); // ESKF: predict 完成
 
+    }
+
+    /// 融合更新（按各自率）：重力辅助 + GPS 位置/速度 + 空速拒绝；
+    ///   气压/磁由 `update_alt`/`update_mag` 单独提供 ✓。
+    fn update_fusion(&mut self, pos: Option<PosSample>, airspeed: Option<AirspeedSample>) -> VehicleState {
         // 2) 重力辅助 ✓（★降频：每 aid_period 拍融合一次 ✓）
         self.aid_div = self.aid_div.wrapping_add(1);
         if self.aid_div % self.aid_period.max(1) == 0 {
-        match self.f.update_gravity(acc, self.g_ned) {
+        match self.f.update_gravity(self.last_accel, self.g_ned) {
             Ok(n) if n > 0 => { self.n_grav_applied = self.n_grav_applied.wrapping_add(1); bump(1); }
             Ok(_) => {}
             Err(_) => { self.n_grav_gated = self.n_grav_gated.wrapping_add(1); bump(2); } // ★门关闭 ✓
@@ -285,7 +283,32 @@ impl Estimator for EskfEstimator {
         crate::perf::probe(14); // ESKF: 空速检查后
         crate::perf::probe(15); // ESKF: state() 组装前（单调 ✓：18→19→20→22..25→29）
         self.state()
+        }
+
+    /// ★§5.187：比力低通群延迟 τ（秒）——由 `HilContext` 从实际滤波器自动标定后写入。
+    fn set_accel_lag_s(&mut self, tau_s: f32) {
+        self.f.accel_lag_s = tau_s;
     }
+
+    fn step(
+        &mut self,
+        dt: Second,
+        imu: ImuSample,
+        pos: Option<PosSample>,
+        airspeed: Option<AirspeedSample>,
+    ) -> VehicleState {
+        let dtf = dt.0;
+        let gyr = [imu.gyro[0].0, imu.gyro[1].0, imu.gyro[2].0];
+        let acc = [imu.accel[0].0, imu.accel[1].0, imu.accel[2].0];
+        self.predict_delta(
+            [gyr[0] * dtf, gyr[1] * dtf, gyr[2] * dtf],
+            [acc[0] * dtf, acc[1] * dtf, acc[2] * dtf],
+            dtf,
+        );
+        self.update_fusion(pos, airspeed)
+    }
+
+
 
     fn update_alt(&mut self, alt: f32) {
         if self.f.update_baro(alt).is_ok() {

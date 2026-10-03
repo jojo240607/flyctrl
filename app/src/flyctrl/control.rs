@@ -5,18 +5,17 @@
 
 use core::ffi::c_void;
 
+use flyctrl_core::config::VehicleConfig;
 use flyctrl_core::controller::{Controller, PidController, Setpoint};
 // ★**默认估计器改为 ESKF**（迁移计划步 3 ✓；全表验收 0/10 劣于 Legacy ✓，见 docs/c1-migration-plan.md ✓）
 use flyctrl_core::estimator::select::AnyEstimator; // ★§5.272：`AnyEstimatorKind` 已随 Legacy 删除 ✓
 use flyctrl_core::fdir::Health;
 use flyctrl_core::hil::{HilContext, SimImu};
 use flyctrl_core::units::{Meter, MeterPerSecond, MeterPerSecondSquared, Second};
-use flyctrl_core::vehicle::{RcInput, VehicleState};
+use flyctrl_core::vehicle::{Quaternion, RcInput, VehicleState};
 
 use rtos_app_sdk::abi::RTOS_PRIO_BH_HIGH;
-use rtos_app_sdk::device::Device;
-use rtos_app_sdk::ioctl;
-use rtos_app_sdk::{info, warn};
+use rtos_app_sdk::info;
 #[cfg(not(feature = "hil"))]
 use rtos_app_sdk::rtos::delay_until;
 // 控制循环用 tick_count 量实测周期（HIL/非 HIL 都要）
@@ -52,7 +51,7 @@ const LOITER_NUDGE_GAIN: f32 = 0.3;
 const CONTROL_PERIOD_TICKS: u32 = 4;
 #[cfg(feature = "hil")]
 use crate::flyctrl::HIL_EVT;
-use crate::flyctrl::{make_name, EST_MTX, EST_STATE, SENSOR_FRAME, SENSOR_SEQ};
+use crate::flyctrl::{ATT_SP, EST_MTX, EST_STATE, HIL_DIAG, RATE_CMD, SENSOR_FRAME, SENSOR_SEQ, SETPOINT};
 
 /// 上行指令解锁：地面站经 COMMAND_LONG(ARM/DISARM) 设置。
 /// 与控制律内部 RC 解锁做逻辑或（任一为真即解锁）。
@@ -67,151 +66,56 @@ pub fn set_cmd_mode(mode: u16) {
 }
 
 /// 控制律硬实时任务入口。
-pub extern "C" fn control_entry(_arg: *mut c_void) {
-    info!(tag: "ctrl", "task started; period=4ms prio={}", RTOS_PRIO_BH_HIGH);
+/* ===================== ★design.md L2 `wq:attitude` WorkItem =====================
+ * `control` 已从"独立线程"改为"L2 工作队列里的 WorkItem"：本文件导出
+ * `ctrl_init()`（装配）+ `control_step()`（**一拍**，由队列 worker 调用）。
+ * 持久状态放模块级静态（C-ABI 回调无法访问栈变量）。节拍由定时器提交驱动。
+ * ============================================================================== */
+use core::mem::MaybeUninit;
+static mut CTRL_PID: MaybeUninit<PidController> = MaybeUninit::uninit();
+// ⚠️本仓铁律：raw-bin 加载下 `.data` 初值不生效 ⇒ 含非零初值的静态必须进 `.rust_bss`
+//   并在 `ctrl_init()` 里**运行期写入**（`name` 是 &str 指针、`first=true` 都非零 ✗）。
+#[link_section = ".rust_bss"]
+static mut CTRL_STAT: MaybeUninit<crate::flyctrl::rt_stat::RtStat> = MaybeUninit::uninit();
+struct CtrlState {
+    hold_alt: Meter,
+    alt_locked: bool,
+    last_est: Option<VehicleState>,
+    seq: u32,
+    first: bool,
+    last_ticks: u32,
+}
+static mut CTRL_ST: CtrlState = unsafe { core::mem::zeroed() };
+#[used]
+static mut DBG_MOTOR: [f32; 4] = [0.0; 4];
+#[used]
+static mut DBG_MAGI: [f32; 16] = [0.0; 16];
+#[used]
+pub static mut DBG_RC: [f32; 10] = [0.0; 10];
 
-    // 控制律对象（共享单步：SIL/HIL 同一份编排，见 `flyctrl_core::hil::step_hil`）。
-    // 姿态/位置初始化门控、SimImu 回退、EKF + 气压观测、FDIR、控制环健康闸、
-    // 执行器限幅全部由 `step_hil` 完成，与 SIL（fly-sim-core）完全一致。
-    let mut hil = HilContext::new(
-        AnyEstimator::default_product(), // ★默认 = ESKF ✓（Legacy 仍可经 AnyEstimator::legacy() 回退 ✓）
-        PidController::default_quad(),
-        Second(4.0 / 1000.0),
-    );
-    // ★§5.132：真传感器路径的观测噪声按【实际传感器噪声】配置。
-    //   ⚠️§5.137 修正（机械性 ✓）：`set_observation_noise` 的三参量是**方差 R**（不是 σ）——
-    //   一手依据在仓内即有：`eskf.rs:670 r_gps_v: 0.25, // (0.5 m/s)² ✓ 即方差 ✓`。
-    //   此前传 (0.25, 0.25, 0.09) 与本注释所写的 σ(P 0.5m / V 0.1m/s / baro 0.3m) **不符** ✗：
-    //     · GPS 位置：0.25 = σ²(0.5m) ✓ 正确
-    //     · GPS 速度：0.25 = σ²(0.5m/s) ✗ ⇒ **高估 25 倍**（实际注入/注释均为 σ=0.1 ⇒ R=0.01）
-    //     · 气压：0.09 = σ²(0.3m) ✓ 正确
-    //   后果（实测 ✓）：速度观测增益过小 ⇒ 速度估计过度依赖加速度积分 ⇒ 噪声被双重积分
-    //   ⇒ 估计速度漂大（噪声场景实测 3.78 m/s ✗，界 1.0）✓ —— 即 §5.136 补遗 30 记的
-    //   "x_env_noise_perturb 先存退化"的**直接成因** ✓
-    hil.est.set_observation_noise(0.25, 0.01, 0.09);
-    // ★★§5.136【真机路径 ⇒ mag 默认 heading（yaw-only）——按路径择默认 ✓】：
-    //   机理（实测确证 ✓）：真机链下 **3D 融合对姿态的修正方向不可观测**——磁场沿场方向
-    //   与垂向是弱可观测的，无 NE 外部辅助时，三轴同时观测会与航向残差耦合 ⇒ 闭环正反馈
-    //   ⇒ 60s 发散（tilt 49.4°、漂移 23.8m ✗；冻结磁两态/冻结零偏/reanchor 均无效 ✗）。
-    //   PX4 一手同样依赖 `isNorthEastAidingActive()` 才能在 3D 下自洽（`mag_control.cpp:505` ✓）；
-    //   本仓**无 NE 辅助**（GPS 位置/速度不作航向源）⇒ 真机取 heading 回退 ✓（实测完美：
-    //   60s tilt 0.0° / 漂移 0.02m ✓）。**SIL/H 场保持 3D**（验收表口径 ✓ att_est 63/0 ✓）。
+/// design.md 4: CTRL_HEARTBEAT (increment each tick) -- for L1 safety_monitor.
+pub static mut CTRL_HEARTBEAT: u32 = 0;
+
+pub fn ctrl_init() {
     unsafe {
-        // ★★§5.139【真机恢复 **AUTO**（PX4 一手默认 ✓）——3D 由"航向一致性"安全门控 ✓】：
-        //   机理（最小复现判定 + 一手对齐 ✓）：真机链 3D 失稳是**估计↔控制闭环正反馈**；
-        //   加入一手 `mag_heading_consistent`（|航向新息低通|<0.3rad ∧ |瞬时新息|<0.3rad ✓
-        //   `mag_control.cpp:502-511`）后 ⇒ 悬停 60s **完美**（tilt 0.0°/漂移 0.01m ✓✓）。
-        //   ⇒ 不再需要"真机强制 heading"的回退（此前为绕开失稳而设 ✗）⇒ 回归一手 AUTO ✓
-        // ★★§5.141【真机恢复 **AUTO** + 一手"航向一致性"门控（严格对齐 PX4 ✓✓）】：
-        //   一手精读更正（关键）：`isNorthEastAidingActive()` = `gnss_pos || gnss_vel || ...`
-        //   （`estimator_interface.cpp` ✓）⇒ **本仓有 GPS ⇒ 该条件为 TRUE**（此前误判为"无
-        //   NE 辅助"✗）。故一手语义下：
-        //     `mag_3D` 需要 `mag_heading_consistent` = (航向新息一致) ∧ **NE 辅助 ∧ 水平
-        //     加速度低通 > mag_acclim(0.5 m/s²)** ✓
-        //   ⇒ **悬停时水平加速度≈0 ⇒ 不满足 ⇒ 自动回退 heading** ✓✓（这正是 PX4 的行为 ✓，
-        //     也解释了"悬停 3D 自激"：本仓此前违背一手、在不该用 3D 时用了 3D ✗）
-        //   ⇒ 真机回归 AUTO：机动时用 3D（航向可观测 ✓）、悬停/低速时用 heading ✓
-        flyctrl_core::estimator::eskf::G_ESKF_MAG_HDG_GATE = 2.0;
-        flyctrl_core::estimator::eskf::G_ESKF_MAG_YAW_ON = 0.0; // 0.0 = AUTO（一手默认 ✓）
+        CTRL_PID.write(PidController::from_config(&VehicleConfig::default_quad().ctrl_params()));
+        CTRL_STAT.write(crate::flyctrl::rt_stat::RtStat::new("ctrl"));
+        let s = &mut *core::ptr::addr_of_mut!(CTRL_ST);
+        s.first = true;
+        s.last_est = None;
     }
-    // ★★§5.156【真机启动显式初始化控制器标定旋钮（关键 ✓✓）】：
-    //   旋钮用**负哨兵**（`-1.0` = "用编译期默认" ✓；`0` 是有效取值 ⇒ 不能当哨兵 ✓
-    //   见 `pid.rs:36-39` ✓）。⚠️**裸 bin 加载时 `.data` 初值不生效**（本仓既有坑 ✓
-    //   §5.136 同族）⇒ 实际读到 **0** ⇒ `if v >= 0.0 { v }` 把 0 当有效值 ✗✓
-    //   实测后果（本轮 ✓）：`G_KV_XY` 读 0 ⇒ **水平速度环增益 = 0** ⇒
-    //   `acc_n = kv·(des_v − v) = 0` ⇒ 速度指令进不了姿态环（`des_vx=0.3` 却 `acc_n=0` ✗）
-    //   ⇒ **机体不动** —— 这正是 LOITER 摇杆微调"位移恒 0"的**真根因** ✓✓
-    //   ⇒ 修法 ✓（与 `G_ESKF_MAG_DELAY_MS` 同法）：启动时**显式写入哨兵** ✓
-    // ★§5.157 排查结论 ✓（重要 ✓）：`G_KV_XY` 等旋钮在 `.data` ⇒ 裸 bin 读到 **0** ✗
-    //   ⇒ `kv_xy` 实际为 **0**（速度环增益=0）⇒ 速度指令进不了姿态环（§5.156 ✓）。
-    //   但**恢复设计值 0.8 会使 `x_hover_demo` 发散**（roll 19.5° ✗，滚转界 5° ✓）
-    //   —— 且 `kv` 降到 0.03 仍 ~19° ✗ ⇒ 属**姿态环/外环响应**的真实缺陷（另有原因 ✓）。
-    //   ⇒ 在整定完成前**不启用**该初始化（保持既有可用行为 ✓，避免引入回归 ✗）✓
-    // ★§5.174【整定成果应用（验收导向 ✓）】：启用 §5.168 的两级手段（D 项 + 速率整形 ✓）
-    //   `KVD=0.8`（速度环 D 项，用 ESKF 平滑加速度 ✓ PX4 同源 ✓）
-    //   `SLEW=2.0`（期望速度速率整形 ✓ m/s²）
-    //   + `init_runtime_knobs()`（§5.156 的 `.data` 坑修复 ✓ 使设计增益真正生效）
-    // ⚠️§5.174 验收结果（诚实 ✓）：启用两级手段（`KVD=0.8` + `SLEW=2.0` + `.data` 坑修复 ✓）后
-    //   `x_hover_demo` **仍发散**（末态 (−61, −72)m ✗；但**显著优于**未启用时的 164°/131m ✓）
-    //   ⇒ 两级手段**方向正确但不足以**让 demo 通过 ⇒ **暂不启用**（保持既有可用行为 ✓），
-    //     待整定完成后启用 ✓（旋钮保留 ✓ 可用环境变量 A/B ✓）
-    // ★§5.176【整定成果（双满足点 ✓ 来自 10s 复现器两臂验证 ✓）】旋钮保留可用环境变量 A/B
-    // ★§5.183【保守收口（用户裁定 ✓）：**不启用**】：本轮已证明整定复现器的发散**根因在估计器**
-    //   （ESKF 姿态估计丢失，见 §5.183）——外环整定是在**症状**上做文章 ⇒ 在根因修复前启用
-    //   整定只会引入未验证的固件行为变化 ✗ ⇒ 回到既有可用基线（旋钮保留，可用环境变量 A/B ✓）。
-    //   待 ESKF 姿态修复 + M 场验收后再评估启用。
-    //   `KVD=0.8`（速度环 D 项 ✓）+ `SLEW=2.0`（速率整形 ✓）+ `vel_lpf_h_tau=0.1`（水平速度低通 ✓）
-    //   复现器实测：无风 −0.54 ✓ / 风 5.4m/s −7.90 ✓（两臂均有界接近收敛 ✓✓）
-    let _ = ();
-    // ★§5.158/§5.160 排查中（见台账）：恢复设计增益后 demo 发散；探针排查中发现
-    //   **`PidController` 的 `control_attitude` 路径在 demo 场景下未被观测到执行**
-    //   （`G_PID_ATT_DBG` 恒 0，而 `m_permille` 却出现极端值 ✗）⇒ 需先确认**实际生效的
-    //   控制路径**（本仓存在多条：`hil` 分支 / `PidController` / SIL 控制器 ✓）。
-    //   ⇒ 暂不启用（保持既有可用行为 ✓，避免引入回归 ✗）
-    // flyctrl_core::controller::pid::init_runtime_knobs();
-    // ★§5.136 诊断旋钮：G_ESKF_FREEZE_BIAS=1 ⇒ 冻结零偏修正（定位"加计零偏慢漂"假设）
-    //   （裸 bin 的 .data 未初始化 ⇒ 默认读到 0 = 正常 ✓；测试用 poke 置 1）
-    {
-        let k = unsafe {
-            core::ptr::read_volatile(core::ptr::addr_of!(flyctrl_core::estimator::eskf::G_ESKF_FREEZE_BIAS))
-        };
-        if k >= 0.5 {
-            hil.est.set_freeze_bias(true);
-        }
-    } // r_gps_v 保持原 0.25（σ=0.5m/s，族基线口径）
-    // 非 HIL 飞行模式：rate_mode_xy 按模式每拍设置（见循环内 setpoint 构造），
-    // 速率模式（STABILIZE/ALT_HOLD）旁路位置外环，位置模式（LOITER/GUIDED/RTL/LAND）
-    // 启用位置跟踪。HIL 保持位置模式（setpoint 来自 PC 轨迹）。
-    // 共享单步回退 IMU（与 SIL 同源实现，保证注入饥饿时回退数据完全一致）。
-    let mut sim_imu = SimImu::new();
-    let mut hold_alt = Meter(0.0);
-    let mut alt_locked = false;
-    // 上一拍估计状态（供非 HIL 设定点高度基准 / HIL 链路未建立时定高；
-    // EKF 位置 4ms 内变化远小于 1mm，用上一拍等价）。
-    let mut last_est: Option<VehicleState> = None;
-    let mut seq: u32 = 0;
+}
 
-    // [联调诊断] 最近一拍执行器指令（静态，测试直读；定位后移除）
-    #[used]
-    static mut DBG_MOTOR: [f32; 4] = [0.0; 4];
-    // ★§5.136 临时诊断：[0..3)=mag_i [3..6)=mag_b [6]=yaw_aligned [7]=disturbed [8]=mag_applied [9]=mag_skipped
-    #[used]
-    static mut DBG_MAGI: [f32; 16] = [0.0; 16];
-    // ★§5.145 诊断：[0]=armed [1]=fresh [2]=mode档 [3]=throttle [4]=pitch [5]=roll
-    //            [6]=cmd_mode [7]=des_vx [8]=des_vy [9]=use_rc_vel
-    #[used]
-    pub static mut DBG_RC: [f32; 10] = [0.0; 10];
-    // PWM 设备（4 路，control 专用）
-    let mut pwm_dev: [Option<Device>; 4] = [None, None, None, None];
-    let mut pwm_period: [u32; 4] = [0; 4];
-    for i in 0..4 {
-        let name = make_name(i as u8);
-        if let Some(d) = Device::open(name) {
-            // 设 400Hz（2500us 周期），取回 period_ticks 供占空比换算
-            let mut freq = 400u32;
-            let _ = d.ioctl(ioctl::PWM_IOCTL_SET_FREQ, &mut freq as *mut u32 as *mut c_void);
-            let mut ticks = 0u32;
-            let _ = d.ioctl(ioctl::PWM_IOCTL_GET_PERIOD_TICKS, &mut ticks as *mut u32 as *mut c_void);
-            pwm_period[i] = ticks;
-            pwm_dev[i] = Some(d);
-        } else {
-            warn!(tag: "ctrl", "pwm{} not available -> actuator disabled", i);
-        }
-    }
-
-    let mut first = true;
-    let mut last_ticks = tick_count();
-    // 绝对节拍基准（仅非 HIL；HIL 由 HIL_EVT 事件驱动，不用节拍）。
-    #[cfg(not(feature = "hil"))]
-    let mut wake_tick = last_ticks;
-    // ★控制节拍源（§5.91–5.94）：非 HIL 下由【硬件定时器 timer3/TIM7 + ISR + 信号量】
-    //   给出 **4.000ms 精确**节拍（84MHz 时钟域 ⇒ 不受 1ms 系统 tick 网格限制 ✗）；
-    //   初始化失败则**回退** delay_until（反静默降级 ✓）。HIL 仍由 HIL_EVT 事件驱动 ✓。
-    #[cfg(not(feature = "hil"))]
-    let paced = crate::flyctrl::pace::control::init();
-    #[cfg(not(feature = "hil"))]
-    info!(tag: "ctrl", "pace: {}", if paced { "timer3/TIM7 4.000ms 精确节拍 ✓" } else { "回退 delay_until(4 tick) ✗" });
-    loop {
+/// ★L2 `wq:attitude`：**一拍**（由工作队列 worker 调用）。
+pub fn control_step() {
+    unsafe { CTRL_HEARTBEAT = CTRL_HEARTBEAT.wrapping_add(1); }
+    let ctrl = unsafe { CTRL_PID.assume_init_mut() };
+    let st = unsafe { CTRL_STAT.assume_init_mut() };
+    let (mut hold_alt, mut alt_locked, mut last_est, mut seq, mut first, mut last_ticks) = unsafe {
+        let s = &*core::ptr::addr_of!(CTRL_ST);
+        (s.hold_alt, s.alt_locked, s.last_est, s.seq, s.first, s.last_ticks)
+    };
+        let t0 = st.tick();
         // 实测控制周期（RTOS tick = 1ms）：取「本轮与上轮的 tick 差」作真实 dt，
         // 拍率变化时估计/积分仍正确 ✓。
         //
@@ -226,11 +130,11 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         let dt_ms = now_ticks.wrapping_sub(last_ticks).clamp(1, 50) as f32;
         last_ticks = now_ticks;
         let dt = Second(dt_ms / 1000.0);
-        hil.dt = dt;
+        // ★C1：dt 已随 EKF 迁至 rate_task；本任务仅用 _dt 供姿态层 dt ✓。
         let _dt = dt;
         // 应用地面站参数（每周期原子读 G_PARAM_VALS -> pid 增益；PARAM_SET 即时生效）。
         flyctrl_core::perf::probe(41); // 段41 起：参数同步后
-        crate::flyctrl::uplink::sync_gains_to_pid(&mut hil.ctrl);
+        crate::flyctrl::uplink::sync_gains_to_pid(ctrl);
         flyctrl_core::perf::probe(42); // 段42 起：sync_gains 完（含读帧前 ✓）
         if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: loop enter"); }
 
@@ -269,15 +173,9 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
             baro_alt = f.baro_alt;
             mag = f.mag;
             armed = f.armed;
-            // 【HIL 关键】IMU 单次消费：PC 每 ~32ms 才注入一帧 HIL_SENSOR，而本任务 4ms 一拍，
-            // 若读后不清空，同一陀螺样本会被连续积分 8 拍（重复积分同一角速度 → 姿态过积分发散）。
-            // 安全前提：control(prio=4) 高于所有写者(uplink prio=10 / sensors prio=5)，本拍读写之间
-            // 不可能被写者抢占，因此可就地清空、不会误清新注入帧；清空后下一拍无新 IMU 时，
-            // 自然回退 SimImu（零角速度 → 不漂移、不触发 FDIR 冻结误判）。
-            #[cfg(feature = "hil")]
-            {
-                f.imu = None;
-            }
+            // ★C1：IMU 单次消费已移至 `rate_task`（按 `SENSOR_SEQ` 新帧判定 ✓）——
+            //   本任务（姿态层）不再消费 IMU ✓。
+            let _ = imu;
             core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
         }
         // ★§5.136 临时诊断
@@ -340,9 +238,9 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         //   ⇒ 测得加速度被当**前馈正反馈**注入控制律（悬停时 world_accel≈0 故未暴露，
         //   但姿态估计偏差时它会直接进入倾角指令 ✗）。
         {
-            // ★§5.272：删 Legacy 后 `inner` **就是** `EskfEstimator` ✓ ⇒ 无需 match ✓
-            let wa = hil.est.inner.world_accel();
-            hil.ctrl.set_world_accel([
+            // ★C1：world_accel（速度环 D 项）自 rate_task 的 EKF 共享诊断读回 ✓。
+            let wa = unsafe { (*core::ptr::addr_of!(HIL_DIAG)).world_accel };
+            ctrl.set_world_accel([
                 MeterPerSecondSquared(wa[0]),
                 MeterPerSecondSquared(wa[1]),
                 MeterPerSecondSquared(wa[2]),
@@ -403,7 +301,7 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
                 // 位置外环（期望速度=摇杆直通），位置模式（LOITER/GUIDED/RTL/LAND）
                 // 启用位置跟踪（位置 P + 速度前馈）。
                 let rate_mode = matches!(cmd_mode, COPTER_MODE_STABILIZE | COPTER_MODE_ALT_HOLD);
-                hil.ctrl.set_rate_mode_xy(rate_mode);
+                ctrl.set_rate_mode_xy(rate_mode);
                 let thr_off = (rc.throttle - 0.5) * 2.0;
                 unsafe {
                     let d = core::ptr::addr_of_mut!(DBG_RC);
@@ -502,33 +400,52 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
         };
 
         unsafe { crate::flyctrl::CTRL_PHASE = 1; }
-        // --- 共享单步（SIL/HIL 同一份编排，见 `flyctrl_core::hil::step_hil`） ---
-        // IMU 单次消费已在上方 SENSOR_FRAME 读取时完成（HIL 下 `f.imu = None`）；
-        // SimImu 回退、姿态/位置初始化门控、EKF 估计 + 气压观测、FDIR、控制环健康闸、
-        // 执行器限幅全部在 `step_hil` 内部完成，与 SIL（fly-sim-core）完全一致。
-        flyctrl_core::perf::probe(43); // 段43 起：读帧+设定点完，进 step_hil
-        let r = hil.step_hil(
-            imu, gps, baro_alt, None, None, mag, &setpoint, setpoint_valid, armed_eff, rc.fresh, &mut sim_imu,
-        );
-        let est = r.est;
+        // ★C1：本任务 = 姿态层（PX4 `mc_pos_control` + `mc_att_control`）。
+        //   EKF/FDIR/初始化门控/速率层/混控/PWM 已迁至 1kHz `rate_task` ✓。
+        //   本拍：读 rate_task 的估计 → 发布设定点 → 姿态 P → 发布速率设定值。
+        flyctrl_core::perf::probe(43); // 段43 起：读帧+设定点完，进姿态层
+        // 1) 读 1kHz rate_task 发布的估计状态（EKF 在 IMU 率更新 ✓）。
+        //    优先级：写者 rate(5) 低于读者 control(4) ⇒ 读期间写者不运行 ✓
+        //    （同 SENSOR_FRAME 论证；不加锁以避免与高频任务争用 EST_MTX ✓）。
+        let (est, health) = unsafe {
+            let s = &*core::ptr::addr_of!(EST_STATE);
+            (s.est, s.health)
+        };
+        // 2) 发布设定点（供 rate_task 的 `ekf_hil` 初始化/门控 ✓）。
         unsafe {
-            {
-                let f = hil.est.inner.filter(); // ★§5.272：同上 ✓
-                let d = core::ptr::addr_of_mut!(DBG_MAGI);
-                (*d)[0] = f.mag_i[0]; (*d)[1] = f.mag_i[1]; (*d)[2] = f.mag_i[2];
-                (*d)[3] = f.mag_b[0]; (*d)[4] = f.mag_b[1]; (*d)[5] = f.mag_b[2];
-                (*d)[6] = if f.yaw_aligned { 1.0 } else { 0.0 };
-                (*d)[7] = if f.mag_field_disturbed { 1.0 } else { 0.0 };
-                (*d)[8] = f.mag_applied as f32; (*d)[9] = f.mag_skipped as f32;
-                (*d)[10] = f.mag_hdg_innov_lpf; (*d)[11] = f.last_mag_yaw_innov;
-                if let Some(mm) = mag {
-                    (*d)[12] = mm[0]; (*d)[13] = mm[1]; (*d)[14] = mm[2];
-                }
-                (*d)[15] = f.st.q.yaw();
-            }
+            let s = &mut *core::ptr::addr_of_mut!(SETPOINT);
+            s.sp = setpoint;
+            s.valid = if setpoint_valid { 1 } else { 0 };
         }
-        let health = r.health;
-        let cmd = r.cmd;
+        // 3) 姿态层（PX4 `mc_att_control`）：位置/速度外环 + 姿态 P → 速率设定值。
+        // ★P0-3b：L2 姿态层只做**姿态 P**；期望姿态（q_des+thrust）由 L3 `nav` 外环产出 ✓。
+        let rsp = unsafe {
+            let a = &*core::ptr::addr_of!(ATT_SP);
+            if a.valid != 0 {
+                let q_des = Quaternion { w: a.q[0], x: a.q[1], y: a.q[2], z: a.q[3] };
+                let rates = ctrl.attitude_rates_sp(q_des, &est, _dt);
+                flyctrl_core::controller::RateSetpoint::new(rates, a.thrust)
+            } else {
+                flyctrl_core::controller::RateSetpoint::INVALID
+            }
+        };
+        // 4) EKF 诊断（mag 内部量）自 rate_task 的共享区读回（遥测 DBG_MAGI ✓）。
+        unsafe {
+            let hd = &*core::ptr::addr_of!(HIL_DIAG);
+            let d = core::ptr::addr_of_mut!(DBG_MAGI);
+            (*d)[0] = hd.mag_i[0]; (*d)[1] = hd.mag_i[1]; (*d)[2] = hd.mag_i[2];
+            (*d)[3] = hd.mag_b[0]; (*d)[4] = hd.mag_b[1]; (*d)[5] = hd.mag_b[2];
+            (*d)[6] = hd.yaw_aligned as f32;
+            (*d)[7] = hd.mag_disturbed as f32;
+            (*d)[8] = hd.mag_applied as f32; (*d)[9] = hd.mag_skipped as f32;
+            (*d)[10] = hd.mag_hdg_innov_lpf; (*d)[11] = hd.last_mag_yaw_innov;
+            if let Some(mm) = mag {
+                (*d)[12] = mm[0]; (*d)[13] = mm[1]; (*d)[14] = mm[2];
+            }
+            (*d)[15] = hd.yaw_rad;
+        }
+        // 5) 执行器指令（rate_task 产出，仅用于遥测/诊断回读 ✓）。
+        let cmd_motor = unsafe { (*core::ptr::addr_of!(HIL_DIAG)).motor };
         last_est = Some(est);
         unsafe { crate::flyctrl::CTRL_PHASE = 2; }
 
@@ -540,55 +457,41 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
             alt_locked = false;
         }
 
-        flyctrl_core::perf::probe(44); // 段44 起：step_hil 完（★放属性之前 ✓）
-        // HIL：回传执行器指令供 telemetry 组 HIL_ACTUATOR_CONTROLS（PC 端注入 plant）。
-        #[cfg(feature = "hil")]
-        crate::flyctrl::uplink::set_actuator_cmd(&cmd.motor);
-
+        flyctrl_core::perf::probe(44); // 段44 起：姿态层完成
+        // HIL：执行器回传已由 rate_task 完成（`set_actuator_cmd` ✓）。
         if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: pid ok"); }
 
-        // --- 输出 PWM（4 路 ioctl 设占空比 ticks） ---
-        if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: before pwm"); }
         // 指令观测（静态，无栈开销；虚拟外设测试定位"无推力来源"用）
         unsafe {
-            DBG_MOTOR = cmd.motor;
+            DBG_MOTOR = cmd_motor;
         }
-        flyctrl_core::perf::probe(45); // 段45 起：set_actuator_cmd 完，PWM 前
-        for i in 0..4 {
-            if let Some(d) = &pwm_dev[i] {
-                let m = cmd.motor[i].clamp(0.0, 1.0);
-                let us = 1000.0 + 1000.0 * m;
-                let ticks = (us * pwm_period[i] as f32 / 2500.0) as u32;
-                let mut t = ticks;
-                let rc = d.ioctl(ioctl::PWM_IOCTL_SET_DUTY_TICKS, &mut t as *mut u32 as *mut c_void);
-                if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: pwm{} rc={} ticks={}", i, rc, ticks); }
-            }
+        flyctrl_core::perf::probe(45); // 段45 起：发布速率设定值前
+        // ★C3：发布**速率设定值**（PX4 `vehicle_rates_setpoint` 同构 ✓）——
+        //   独立 `rate_task`(1kHz) 消费它 + 控制器侧陀螺跑速率层并驱动 PWM ✓。
+        unsafe {
+            let rcmd = &mut *core::ptr::addr_of_mut!(RATE_CMD);
+            rcmd.rates = rsp.rates;
+            rcmd.thrust = rsp.thrust;
+            rcmd.valid = if health != Health::Critical && armed_eff { 1 } else { 0 };
         }
         unsafe { crate::flyctrl::CTRL_PHASE = 3; }
-        if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: after pwm"); }
+        if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: after publish"); }
         if VERBOSE && seq == 0 {
             let ec = unsafe { EST_MTX.debug_count() };
             info!(tag: "ctrl", "dbg: est-mtx count={} sensor-seq={}", ec, unsafe { SENSOR_SEQ });
         }
 
-        flyctrl_core::perf::probe(46); // 段46 起：PWM 完（此后为遥测/发布 + delay ✓）
-        // --- 发布估计状态（telemetry/monitor 读） ---
+        flyctrl_core::perf::probe(46); // 段46 起：发布完（此后为遥测 + delay ✓）
+        // --- 遥测诊断（`EST_STATE` 由 rate_task 写 ✓，本任务**不再写**） ---
         {
-            let _g = unsafe { EST_MTX.guard() };
-            if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: in est-guard"); }
-            let s = unsafe { &mut *core::ptr::addr_of_mut!(EST_STATE) };
-            if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: est-addr got"); }
-            s.armed = armed_eff;
-            if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: est-armed written"); }
-            s.est = est;
-            s.health = health;
-            if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: est-written"); }
             // 油门百分比(0..100) 供 telemetry 经 VFR_HUD 下发。
-            let throttle_avg = (cmd.motor[0] + cmd.motor[1] + cmd.motor[2] + cmd.motor[3]) / 4.0;
+            let throttle_avg = (cmd_motor[0] + cmd_motor[1] + cmd_motor[2] + cmd_motor[3]) / 4.0;
             crate::flyctrl::uplink::G_THROTTLE.store((throttle_avg.clamp(0.0, 1.0) * 100.0) as u8, Ordering::Relaxed);
         }
         if VERBOSE && seq == 0 { info!(tag: "ctrl", "dbg: est-mtx got"); }
 
+        st.sample(st.tick().wrapping_sub(t0), 672_000, 672_000); // 250Hz 名义
+        if seq % 250 == 0 { st.report_and_reset(); } // ★P1-2 可观测
         seq = seq.wrapping_add(1);
         if first {
             first = false;
@@ -629,25 +532,22 @@ pub extern "C" fn control_entry(_arg: *mut c_void) {
                   baro_alt.is_some(),
                   (gps.map(|g| g.pos[2].0).unwrap_or(0.0) * 1000.0) as i32,
                   (est.vel[2].0 * 100.0) as i32,
-                  (cmd.motor[0] * 1000.0) as i32, (cmd.motor[1] * 1000.0) as i32,
-                  (cmd.motor[2] * 1000.0) as i32, (cmd.motor[3] * 1000.0) as i32);
+                  (cmd_motor[0] * 1000.0) as i32, (cmd_motor[1] * 1000.0) as i32,
+                  (cmd_motor[2] * 1000.0) as i32, (cmd_motor[3] * 1000.0) as i32);
+        }
+        // ★design.md P0-2：每 2s 打印 RT 违约计数（deadline/wcet/sched）——
+        //   让 P0-1 声明的 deadline/wcet 违约**可见**（不改变行为，只观测 ✓）。
+        if seq % 500 == 0 {
+            let mut v = [0u32; 3];
+            if let Some(f) = rtos_app_sdk::abi::slot().rt_violation {
+                f(v.as_mut_ptr());
+            }
+            info!(tag: "ctrl", "rtviol dl={} wcet={} sched={}", v[0], v[1], v[2]);
         }
 
-        // 【HIL 事件驱动】不依赖 control 自身 4ms 时钟：阻塞等待下一帧 HIL_SENSOR
-        // 注入（uplink 写完真值即 `give()`），收到一帧执行一拍 `step_hil`——与 SIL
-        // 的"每物理步一拍、读最新样本"推模式 1:1 对齐，消除双时钟失配导致的输入流
-        // 差异（93.2% 控制拍缺 IMU 回退陈旧数据 → 姿态发散）。非 HIL 保持 4ms 周期轮询。
-        #[cfg(feature = "hil")]
-        unsafe { HIL_EVT.wait(); }
-        unsafe { crate::flyctrl::CTRL_PHASE = 4; }
-        #[cfg(not(feature = "hil"))]
-        if paced {
-            crate::flyctrl::pace::control::wait_tick();   // ★硬件定时器节拍：4.000ms 精确 ✓
-        } else {
-            delay_until(&mut wake_tick, CONTROL_PERIOD_TICKS);
-        }
-        if VERBOSE && seq < 5 {
-            info!(tag: "ctrl", "dbg: after sleep seq={}", seq);
-        }
+    unsafe {
+        let s = &mut *core::ptr::addr_of_mut!(CTRL_ST);
+        s.hold_alt = hold_alt; s.alt_locked = alt_locked; s.last_est = last_est;
+        s.seq = seq; s.first = first; s.last_ticks = last_ticks;
     }
 }

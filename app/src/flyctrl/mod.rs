@@ -24,6 +24,11 @@
 //! 不实际发起读事务，避免拖垮采样线程。
 
 pub mod control;
+pub mod rate_task;
+pub mod nav_task;
+pub mod wq_tasks;
+pub mod safety_task;
+pub mod rt_stat;
 #[cfg(feature = "hil")]
 pub mod hil_shmem;
 pub mod pace;
@@ -36,7 +41,7 @@ use flyctrl_core::fdir::Health;
 use flyctrl_core::units::{Meter, MeterPerSecond, RadianPerSecond};
 
 use rtos_app_sdk::abi::RTOS_PRIO_BH_HIGH;
-use rtos_app_sdk::rtos::{spawn_rt, Mutex, Semaphore, RTOS_RT_HARD, RTOS_RT_NONE};
+use rtos_app_sdk::rtos::{spawn_rt, Mutex, Semaphore, RTOS_RT_HARD, RTOS_RT_NONE, RTOS_RT_SOFT};
 
 /// [性能测量] 控制拍计数器（固定 VMA 0x2000F000，测试直读）。见 linker/app.ld。
 #[link_section = ".app_ctrltick"]
@@ -57,6 +62,15 @@ pub struct SensorFrame {
     pub baro_alt: Option<f32>,
     /// 机体系三轴磁场（QMC5883L 读数；缺失降级为 None）。
     pub mag: Option<[f32; 3]>,
+    /// ★design.md §5：`wq:sensors` 发布的 **IMU topic**（带时间戳），供 ekf/attitude/rate 消费：
+    ///   · `gyro_vel`  = `vehicle_angular_velocity`（**控制器侧**：陷波→低通）→ 速率环用 ✓
+    ///   · `accel_filt`= `vehicle_acceleration`（陷波→低通）→ 估计器用 ✓
+    ///   · `gyro_raw`  = 未滤波陀螺（PX4：EKF2 用未滤波陀螺）→ 估计器用 ✓
+    ///   · `ts_cyc`    = 采样**硬件时间戳**（DWT CYCCNT，design.md §7）
+    pub gyro_vel: [f32; 3],
+    pub accel_filt: [f32; 3],
+    pub gyro_raw: [f32; 3],
+    pub ts_cyc: u32,
     pub imu_ok: bool,
     pub gps_ok: bool,
     pub baro_ok: bool,
@@ -72,6 +86,10 @@ impl SensorFrame {
             gps: None,
             baro_alt: None,
             mag: None,
+            gyro_vel: [0.0; 3],
+            accel_filt: [0.0; 3],
+            gyro_raw: [0.0; 3],
+            ts_cyc: 0,
             imu_ok: false,
             gps_ok: false,
             baro_ok: false,
@@ -136,6 +154,43 @@ pub static mut SENSOR_FRAME: SensorFrame = unsafe { core::mem::zeroed() };
 /// 与 sensors(相邻更低优先级) 临界区被抢占的场景下争用不安全，会导致调度器损坏。
 #[link_section = ".rust_bss"]
 pub static mut SENSOR_SEQ: u32 = 0;
+/// ★design.md §7：**IMU 1kHz 样本环形**（生产者=采样，消费者=`rate`(latest)/`ekf`(排空)）。
+#[link_section = ".rust_bss"]
+pub static mut IMU_RING: flyctrl_core::imu_ring::ImuRing = flyctrl_core::imu_ring::ImuRing::new();
+
+/// ★design.md §3：BMI088 **data-ready INT**（ISR → 任务）节拍事件 + 计数（诊断）。
+#[link_section = ".rust_bss"]
+pub static mut IMU_DRDY_SEM: rtos_app_sdk::abi::rtos_sem_t =
+    rtos_app_sdk::abi::rtos_sem_t { count: 0, limit: 0, waitq: core::ptr::null_mut() };
+#[link_section = ".rust_bss"]
+pub static mut IMU_DRDY_CNT: u32 = 0;
+
+/// DRDY ISR（EXTI line4 / IRQ10）：**只 `sem_give`**（绝不做阻塞 SPI ✗）。
+extern "C" fn imu_drdy_isr(_ctx: *mut core::ffi::c_void) {
+    unsafe {
+        IMU_DRDY_CNT = IMU_DRDY_CNT.wrapping_add(1);
+        // ★design.md §3：DRDY → L0 内采样 IMU（读→ImuRing+topic）
+        crate::flyctrl::sensors_task::imu_sample_step();
+    }
+}
+
+/// 装配 DRDY：打开 `exti_imu`（配 SYSCFG/EXTI）+ 挂 IRQ10 ISR（design.md §3）。
+pub fn init_imu_drdy() {
+    unsafe {
+        if let Some(f) = rtos_app_sdk::abi::slot().sem_init {
+            f(core::ptr::addr_of_mut!(IMU_DRDY_SEM), 0, 1);
+        }
+        IMU_DRDY_CNT = 0;
+    }
+    if let Some(mut d) = rtos_app_sdk::device::Device::open("exti_imu") {
+        let _ = d.open_dev();
+    } else {
+        rtos_app_sdk::warn!(tag: "flyctrl", "exti_imu not available -> DRDY INT disabled");
+        return;
+    }
+    let _ = rtos_app_sdk::irq::attach_and_enable(10, imu_drdy_isr, core::ptr::null_mut());
+    rtos_app_sdk::info!(tag: "flyctrl", "IMU DRDY INT armed (GPIOE4/EXTI4/IRQ10)");
+}
 #[link_section = ".rust_bss"]
 pub static mut EST_MTX: Mutex = Mutex::uninit();
 /// usb0 下行写互斥：telemetry(prio12) 与 uplink(prio10) 共用同一 usb0 TX ring，
@@ -151,24 +206,90 @@ pub static mut USB_TX_MTX: Mutex = Mutex::uninit();
 #[link_section = ".rust_bss"]
 pub static mut HIL_EVT: Semaphore = Semaphore::uninit();
 
+/// ★C3 速率设定值共享（姿态层 control 写、速率层 rate_task 读）。
+///
+/// 优先级论证（同 SENSOR_FRAME ✓）：写者 control(prio=4) **高于**读者 rate_task(prio=5)
+/// ⇒ 读者运行期间写者不会运行 ⇒ 读必为**完整写**，无需 seqlock 重试 ✓。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RateCmd {
+    /// 期望机体角速率 (p, q, r)，rad/s（姿态层已按 `RATE_MAX_DPS` 限幅 ✓）。
+    pub rates: [f32; 3],
+    /// 集体推力（悬停油门基值）。
+    pub thrust: f32,
+    /// 非 0 = 有效（健康/解锁/初始化闸全开 ⟺ true ✓）；0 ⇒ 速率层零输出 ✓。
+    pub valid: u32,
+}
+#[link_section = ".rust_bss"]
+pub static mut RATE_CMD: RateCmd = unsafe { core::mem::zeroed() };
+
+/// ★C1 共享设定点（姿态层 `control` 写、EKF 层 `rate_task` 读）。
+/// 优先级：写者 control(4) 高于读者 rate(5) ⇒ 读必为完整写 ✓（同 SENSOR_FRAME 论证 ✓）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SetpointShared {
+    pub sp: flyctrl_core::controller::Setpoint,
+    /// 非 0 = 有效。
+    pub valid: u32,
+}
+#[link_section = ".rust_bss"]
+pub static mut SETPOINT: SetpointShared = unsafe { core::mem::zeroed() };
+
+/// ★C1 共享 EKF 诊断（`rate_task` 写、`control` 读）：速度环 D 项 world_accel + mag 滤波器内部量。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct HilDiag {
+    /// 估计世界系加速度（NED，m/s²）—— 姿态层速度环 D 项（PX4 `states.acceleration` ✓）。
+    pub world_accel: [f32; 3],
+    /// mag 滤波器内部量（`mag_i`/`mag_b`/标志/计数）—— 遥测诊断 DBG_MAGI ✓。
+    pub mag_i: [f32; 3],
+    pub mag_b: [f32; 3],
+    pub yaw_aligned: u32,
+    pub mag_disturbed: u32,
+    pub mag_applied: u32,
+    pub mag_skipped: u32,
+    pub mag_hdg_innov_lpf: f32,
+    pub last_mag_yaw_innov: f32,
+    /// 估计偏航（rad，诊断 ✓）。
+    pub yaw_rad: f32,
+    /// 本拍 motor 指令（rate_task 写，供遥测 `set_actuator_cmd` / throttle ✓）。
+    pub motor: [f32; 4],
+    /// 本拍是否有效（门控 ✓）。
+    pub gated: u32,
+}
+#[link_section = ".rust_bss"]
+pub static mut HIL_DIAG: HilDiag = unsafe { core::mem::zeroed() };
+
+/// ★P0-3b 共享**姿态设定点**（L3 `nav` 写、L2 `control` 读）。
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct AttSp {
+    pub q: [f32; 4],
+    pub thrust: f32,
+    pub valid: u32,
+}
+#[link_section = ".rust_bss"]
+pub static mut ATT_SP: AttSp = unsafe { core::mem::zeroed() };
+
 /* ===================== 任务栈 ===================== */
 
-const STACK_CTRL: usize = 20480; // 控制律含 EKF+PID：EKF step 各更新函数有 4x400B 局部矩阵（a/ap/apat/krkt=1.6KB）
-                               // + propagate 1.2KB + 对象本身与调用链，峰值实测 >3KB；3072 时栈溢出→返回地址
-                               // 被数据覆盖→UsageFault(UNDEFINSTR/INVSTATE)→USB EP0 失服→HIL 端口 SetCommState 超时。
-                               // 8KB 含 GPS 更新路径余量充足（APP_RAM 余 ~103KB）。
-const STACK_SENS: usize = 5120; // 采样含回放+帧拷贝：实测峰值 > 3072（原靠 monitor 缓冲垫着才不崩），提到 3584 自洽
+const STACK_CTRL: usize = 8192; // ★C1：控制任务已不再运行 EKF（迁至 1kHz rate_task）⇒ 仅姿态/速度外环 + 设定点构造，回降至 8KB（原 20KB 为 EKF 大矩阵；现释放给 rate_task ✓）。原注：控制律含 EKF+PID：EKF step 各更新函数有 4x400B 局部矩阵（a/ap/apat/krkt=1.6KB）+ propagate 1.2KB + 对象本身与调用链，峰值实测 >3KB。
 const STACK_TELEM: usize = 4096; // 遥测 encode 3 个 MAVLink 帧(heartbeat/local_pos/sys_status)栈使用大，1024 疑似栈溢出导致 telem 卡住不写 usb0，提到 4096
 const STACK_UPLINK: usize = 4096; // 上行 poll_read+feed+decode 栈使用大，实测 1024 栈溢出导致系统 fault，提到 4096
+const STACK_SAFETY: usize = 2048; // L1 safety_monitor (tiny stack)
+const STACK_RATE: usize = 4096; // ★P0-3：L1 薄速率环（仅 rate_step+混控+PWM，无 EKF）⇒ 4KB 充足 ✓
+const STACK_EKF: usize = 14336; // ★P0-3：L2 EKF 任务（大矩阵：propagate 1.2KB + update 1.6KB + 调用链）⇒ 留足余量 ✓
 
-#[link_section = ".app_stacks"]
-static mut STACK_CTRL_BUF: [u8; STACK_CTRL] = [0u8; STACK_CTRL];
-#[link_section = ".app_stacks"]
-static mut STACK_SENS_BUF: [u8; STACK_SENS] = [0u8; STACK_SENS];
 #[link_section = ".app_stacks"]
 static mut STACK_TELEM_BUF: [u8; STACK_TELEM] = [0u8; STACK_TELEM];
 #[link_section = ".app_stacks"]
 static mut STACK_UPLINK_BUF: [u8; STACK_UPLINK] = [0u8; STACK_UPLINK];
+#[link_section = ".app_stacks"]
+static mut STACK_RATE_BUF: [u8; STACK_RATE] = [0u8; STACK_RATE];
+#[link_section = ".app_stacks"]
+static mut STACK_SAFETY_BUF: [u8; STACK_SAFETY] = [0u8; STACK_SAFETY];
+#[link_section = ".app_stacks"]
+static mut STACK_EKF_BUF: [u8; STACK_EKF] = [0u8; STACK_EKF];
 
 /* ===================== 启动 ===================== */
 
@@ -226,7 +347,7 @@ pub fn spawn_flyctrl() {
     #[cfg(feature = "buf-guard")]
     {
         unsafe {
-            let lo = STACK_CTRL_BUF.as_ptr() as usize;
+            let lo = STACK_RATE_BUF.as_ptr() as usize;
             let hi = STACK_UPLINK_BUF.as_ptr() as usize + STACK_UPLINK;
             flyctrl_core::comm::mavlink::GUARD_LO = lo;
             flyctrl_core::comm::mavlink::GUARD_HI = hi;
@@ -234,53 +355,59 @@ pub fn spawn_flyctrl() {
     }
 
     // control：硬实时 prio=4, priv=1, RTOS_RT_HARD
-    spawn_rt(
-        "control",
-        control::control_entry,
-        RTOS_PRIO_BH_HIGH,
-        unsafe { STACK_CTRL_BUF.as_mut_ptr() },
-        STACK_CTRL,
-        1,
-        RTOS_RT_HARD,
-        0,
-        0,
-    );
+    // ★design.md L2：`control` 已改为**工作队列 WorkItem**（见 `wq_tasks`）——不再建线程 ✓。
     // sensors：软实时 prio=5, priv=1
-    spawn_rt(
-        "sensors",
-        sensors_task::sensors_entry,
-        5,
-        unsafe { STACK_SENS_BUF.as_mut_ptr() },
-        STACK_SENS,
-        1,
-        RTOS_RT_NONE,
-        0,
-        0,
-    );
+    // ★design.md：`sensors` 不再是线程 —— IMU 采样归 L0 ISR（#2c）、融合归 L2 WorkItem
+    //   `wq:sensors`（见 `wq_tasks`）✓。
     // telemetry：prio=12, priv=1
-    spawn_rt(
-        "telem",
-        telemetry::telemetry_entry,
-        rtos_app_sdk::abi::RTOS_PRIO_MAIN,
-        unsafe { STACK_TELEM_BUF.as_mut_ptr() },
-        STACK_TELEM,
-        1,
-        RTOS_RT_NONE,
-        0,
-        0,
-    );
+    // telemetry：prio=12, priv=1
+    // ★design.md：`telem` 不再是线程 —— 归 L3 WorkItem `wq:l3`（见 `wq_tasks`）✓。
     // uplink：prio=10, priv=1（轮询 usb0.read，低于 sensors 不挤占采样，高于 telemetry 优先处理命令）
+    // uplink：prio=10, priv=1（轮询 usb0.read，低于 sensors 不挤占采样，高于 telemetry 优先处理命令）
+    // ★design.md：`uplink` 不再是线程 —— 归 L3 WorkItem `wq:l3`（见 `wq_tasks`）✓。
+    // ★design.md P2-3：EKF 改为**定时器驱动的队列项**（不再用线程）——见 `wq_tasks`。
+    //   本任务仅做一次性装配（静态 `HilContext` + 建 `wq:ekf`/`wq:att` + 250Hz 定时器）后常驻。
     spawn_rt(
-        "uplink",
-        uplink::uplink_task,
-        10,
-        unsafe { STACK_UPLINK_BUF.as_mut_ptr() },
-        STACK_UPLINK,
+        "wqsetup",
+        wq_tasks::setup_entry,
+        5,
+        unsafe { STACK_EKF_BUF.as_mut_ptr() },
+        STACK_EKF,
         1,
         RTOS_RT_NONE,
         0,
         0,
     );
 
-    rtos_app_sdk::info!(tag: "flyctrl", "spawned 4 tasks: control/sensors/telem/uplink (monitor merged into telem)");
+    // ★design.md L1 `rate`：**薄硬实时线程**（1kHz, prio 4 ≤ BH_HIGH ⇒ HARD ✓）
+    //   速率环 + 控制分配 + PWM；EKF 已剥离到 L2 `ekf` ✓ ⇒ wcet 应≈0 违约 ✓。
+    spawn_rt(
+        "safety",
+        safety_task::safety_entry,
+        4,
+        unsafe { STACK_SAFETY_BUF.as_mut_ptr() },
+        STACK_SAFETY,
+        1,
+        RTOS_RT_HARD,
+        2,
+        1,
+    );
+    spawn_rt(
+        "rate",
+        rate_task::rate_entry,
+        2, // ★修正：L1 最高（< ekf=3 ✓）
+        unsafe { STACK_RATE_BUF.as_mut_ptr() },
+        STACK_RATE,
+        1,
+        RTOS_RT_HARD,
+        1, // deadline：1kHz ⇒ 1ms
+        1, // wcet：1ms 预算
+    );
+
+    // ★design.md L3 `nav`：位置/速度外环（50Hz, prio 8, 非实时）—— 产出**姿态设定点** `ATT_SP` ✓
+    // ★design.md：`nav` 不再是线程 —— 归 L3 WorkItem `wq:l3`（见 `wq_tasks`）✓。
+
+    // ★design.md §3：DRDY INT 的 arm 移入 `wq_tasks::setup()`（须在 `sensors_init()` **之后**，
+    //   否则 ISR 早期触发时静态未初始化 ⇒ 崩 ✗）。
+    rtos_app_sdk::info!(tag: "flyctrl", "spawned 5 tasks: control/sensors/telem/uplink/rate (1kHz 速率环)");
 }

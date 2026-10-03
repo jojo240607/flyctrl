@@ -1,0 +1,296 @@
+//! ★design.md **L2 软实时工作队列**（**1 个 worker 线程**承载多个 WorkItem）。
+//!
+//! 对齐 design.md / PX4：**一条队列 = 一个 worker 线程**，多个逻辑任务作为
+//! WorkItem 挂进去（不是"每任务一个 worker"）。本文件承载：
+//!   · `estimator`（EKF/FDIR，250Hz）
+//!   · `attitude` （姿态层 `control`，250Hz）
+//! 由 **250Hz 软件定时器** 把两个 item 提交到 **L2 队列**（`wq:l2`），
+//! worker 按 EDF 取出、逐项测执行时间（`budget_cycles`）。
+//!
+//! L1 `rate`（1kHz）保持**独立硬实时线程**（design.md L1，不进队列）。
+//! 状态放静态区（C-ABI 回调拿不到栈变量），由一次性 setup 任务原地初始化。
+
+use core::ffi::c_void;
+use core::mem::MaybeUninit;
+
+use flyctrl_core::config::VehicleConfig;
+use flyctrl_core::controller::PidController;
+use flyctrl_core::estimator::select::AnyEstimator;
+use flyctrl_core::hil::{HilContext, SimImu};
+use flyctrl_core::units::Second;
+
+use rtos_app_sdk::abi::{rtos_timer_t, rtos_work_t, slot};
+use rtos_app_sdk::info;
+use rtos_app_sdk::rtos::msleep;
+
+use crate::flyctrl::{EST_STATE, HIL_DIAG, SENSOR_FRAME, SENSOR_SEQ, SETPOINT};
+
+/// 队列：L2 一条（承载 estimator+attitude）；L3 一条（承载 nav/pos/comm/log）。
+pub const Q_L2: u8 = 1;
+pub const Q_L3: u8 = 2;
+
+/// worker 栈（App 提供）。L2 需容纳 EKF（~4KB）⇒ 8KB；L3 轻量 ⇒ 2KB。
+#[repr(C, align(8))]
+struct WqStack<const N: usize>([u8; N]);
+#[link_section = ".app_stacks"]
+static mut L2_WQ_STACK: WqStack<12288> = WqStack([0; 12288]);
+#[link_section = ".app_stacks"]
+static mut L3_WQ_STACK: WqStack<2048> = WqStack([0; 2048]);
+
+// ---- estimator item 状态 ----
+static mut EKF_HIL: MaybeUninit<HilContext<AnyEstimator, PidController>> = MaybeUninit::uninit();
+static mut EKF_IMU: MaybeUninit<SimImu> = MaybeUninit::uninit();
+static mut EKF_LAST_SEQ: u32 = 0;
+static mut EKF_LAST_TICKS: u32 = 0;
+static mut EKF_ITEM: rtos_work_t = unsafe { core::mem::zeroed() };
+// ---- attitude item ----
+static mut ATT_ITEM: rtos_work_t = unsafe { core::mem::zeroed() };
+static mut SENSORS_ITEM: rtos_work_t = unsafe { core::mem::zeroed() };
+// ★L3
+static mut NAV_ITEM: rtos_work_t = unsafe { core::mem::zeroed() };
+static mut TELEM_ITEM: rtos_work_t = unsafe { core::mem::zeroed() };
+static mut UPLINK_ITEM: rtos_work_t = unsafe { core::mem::zeroed() };
+static mut WQ_TIMER: MaybeUninit<rtos_timer_t> = MaybeUninit::uninit();
+static mut L3_TIMER: MaybeUninit<rtos_timer_t> = MaybeUninit::uninit();
+
+/// L2 WorkItem：estimator（EKF/FDIR 一拍）。
+extern "C" fn estimator_work(_arg: *mut c_void) {
+    let hil = unsafe { EKF_HIL.assume_init_mut() };
+    let sim_imu = unsafe { EKF_IMU.assume_init_mut() };
+    // ★design.md §7：排空 `IMU_RING`（1kHz 样本）→ 逐样本 `predict_delta`（不丢样本）。
+    unsafe {
+        let r = &mut *core::ptr::addr_of_mut!(crate::flyctrl::IMU_RING);
+        let mut n = 0usize;
+        while let Some(d) = r.pop() {
+            if n < hil.imu_deltas.len() { hil.imu_deltas[n] = d; n += 1; }
+        }
+        hil.imu_deltas_len = n;
+    }
+    // ★design.md §7：积分用**实际 dt**（本拍与上拍 tick 差），不用名义 4ms——
+    //   否则 worker 被延后时 item 成批补跑、EKF 每拍仍积 4ms ⇒ **过积分** ⇒ 漂移。
+    let now = rtos_app_sdk::rtos::tick_count();
+    let dt_ms = unsafe {
+        let last = EKF_LAST_TICKS;
+        EKF_LAST_TICKS = now;
+        now.wrapping_sub(last)
+    }.clamp(1, 50) as f32;
+    hil.dt = Second(dt_ms / 1000.0);
+    let (imu, gps, baro_alt, mag, rc, armed, seq_now) = unsafe {
+        let f = &*core::ptr::addr_of!(SENSOR_FRAME);
+        (f.imu, f.gps, f.baro_alt, f.mag, f.rc, f.armed, SENSOR_SEQ)
+    };
+    // ★无自旋 seqlock 校验：读后再读一次 `SENSOR_SEQ`；若写者中途写过（值变）⇒
+    //   本帧可能是撕裂的 ⇒ 当作无新帧（sample-and-hold），**不自旋**（避免把低优先写者饿死 ✗）。
+    let seq_after = unsafe { SENSOR_SEQ };
+    let fresh = unsafe {
+        let last = EKF_LAST_SEQ;
+        EKF_LAST_SEQ = seq_now;
+        seq_now == seq_after && seq_now != last && (seq_now & 1) == 0
+    };
+    let imu_in = if fresh { imu } else { None };
+    let (sp, sp_valid) = unsafe {
+        let s = &*core::ptr::addr_of!(SETPOINT);
+        (s.sp, s.valid != 0)
+    };
+    let (est, health, gated) = hil.ekf_hil(
+        imu_in, gps, baro_alt, None, None, mag, &sp, sp_valid, armed, rc.fresh, sim_imu,
+    );
+    unsafe {
+        let s = &mut *core::ptr::addr_of_mut!(EST_STATE);
+        s.est = est;
+        s.health = health;
+        s.armed = armed;
+    }
+    unsafe {
+        let fl = hil.est.inner.filter();
+        let wa = hil.est.inner.world_accel();
+        let d = &mut *core::ptr::addr_of_mut!(HIL_DIAG);
+        d.world_accel = wa;
+        d.mag_i = fl.mag_i;
+        d.mag_b = fl.mag_b;
+        d.yaw_aligned = fl.yaw_aligned as u32;
+        d.mag_disturbed = fl.mag_field_disturbed as u32;
+        d.mag_applied = fl.mag_applied;
+        d.mag_skipped = fl.mag_skipped;
+        d.mag_hdg_innov_lpf = fl.mag_hdg_innov_lpf;
+        d.last_mag_yaw_innov = fl.last_mag_yaw_innov;
+        d.yaw_rad = fl.st.q.yaw();
+        d.gated = gated as u32;
+    }
+}
+
+/// L2 WorkItem：attitude（姿态层一拍 = 原 `control` 的一次循环体）。
+extern "C" fn attitude_work(_arg: *mut c_void) {
+    crate::flyctrl::control::control_step();
+}
+
+/// L2 WorkItem：sensors（慢传感器 + IMU 采样；design.md §5 `wq:sensors`）。
+extern "C" fn sensors_work(_arg: *mut c_void) {
+    // IMU 采样已迁 L0 ISR；本 item 只读慢传感器（气压/磁/GPS）+ 组装帧
+    crate::flyctrl::sensors_task::sensors_step();
+}
+
+/// ★L3 WorkItem：nav/pos（位置/速度外环，50Hz）→ ATT_SP。
+extern "C" fn nav_work(_arg: *mut c_void) {
+    crate::flyctrl::nav_task::nav_step();
+}
+
+/// L3 WorkItem：telemetry（MAVLink 下行，20ms）。
+extern "C" fn telem_work(_arg: *mut c_void) {
+    crate::flyctrl::telemetry::telemetry_step();
+}
+
+/// L3 WorkItem：uplink（MAVLink 上行/解析）。
+extern "C" fn uplink_work(_arg: *mut c_void) {
+    crate::flyctrl::uplink::uplink_step();
+}
+
+/// L3 WorkItem：uplink（usb0 非阻塞轮询 + MAVLink 上行）。
+
+
+/// L3 50Hz 定时器回调：提交 nav item。
+extern "C" fn tick_l3_cb(_t: *mut rtos_timer_t, _arg: *mut c_void) {
+    if let Some(f) = slot().work_submit_q {
+        f(Q_L3, unsafe { core::ptr::addr_of_mut!(NAV_ITEM) });
+        f(Q_L3, unsafe { core::ptr::addr_of_mut!(TELEM_ITEM) });
+        f(Q_L3, unsafe { core::ptr::addr_of_mut!(UPLINK_ITEM) });
+    }
+}
+
+/// 250Hz 定时器回调（定时器任务上下文）：把 L2 的 estimator + attitude 提交到**同一条 L2 队列**。
+extern "C" fn tick_cb(_t: *mut rtos_timer_t, _arg: *mut c_void) {
+    if let Some(f) = slot().work_submit_q {
+        f(Q_L2, unsafe { core::ptr::addr_of_mut!(EKF_ITEM) });
+        f(Q_L2, unsafe { core::ptr::addr_of_mut!(ATT_ITEM) });
+        // ★过渡：DRDY 未启用时由 250Hz 定时器驱动 sensors item（修好 DRDY 后改由 ISR 提交）
+        f(Q_L2, unsafe { core::ptr::addr_of_mut!(SENSORS_ITEM) });
+    }
+}
+
+/// ★装配（在**大栈 setup 任务**里调用：构造 `HilContext` 瞬时值需要栈）。
+pub fn setup() {
+    unsafe {
+        // estimator 静态状态
+        let mut hil = HilContext::new(
+            AnyEstimator::default_product(),
+            PidController::default_quad(),
+            Second(4.0 / 1000.0),
+        );
+        hil.est.set_observation_noise(0.25, 0.01, 0.09);
+        flyctrl_core::estimator::eskf::G_ESKF_MAG_HDG_GATE = 2.0;
+        flyctrl_core::estimator::eskf::G_ESKF_MAG_YAW_ON = 0.0;
+        let k = core::ptr::read_volatile(core::ptr::addr_of!(flyctrl_core::estimator::eskf::G_ESKF_FREEZE_BIAS));
+        if k >= 0.5 {
+            hil.est.set_freeze_bias(true);
+        }
+        EKF_HIL.write(hil);
+        EKF_IMU.write(SimImu::new());
+        EKF_ITEM = rtos_work_t {
+            next: core::ptr::null_mut(),
+            fn_: Some(estimator_work),
+            arg: core::ptr::null_mut(),
+            budget_cycles: 504_000, // ~3ms @168MHz
+            deadline_cycles: 0,
+            miss_count: 0,
+            degraded: 0,
+        };
+        UPLINK_ITEM = rtos_work_t {
+            next: core::ptr::null_mut(),
+            fn_: Some(uplink_work),
+            arg: core::ptr::null_mut(),
+            budget_cycles: 0,
+            deadline_cycles: 0,
+            miss_count: 0,
+            degraded: 0,
+        };
+        TELEM_ITEM = rtos_work_t {
+            next: core::ptr::null_mut(),
+            fn_: Some(telem_work),
+            arg: core::ptr::null_mut(),
+            budget_cycles: 0,
+            deadline_cycles: 0,
+            miss_count: 0,
+            degraded: 0,
+        };
+        NAV_ITEM = rtos_work_t {
+            next: core::ptr::null_mut(),
+            fn_: Some(nav_work),
+            arg: core::ptr::null_mut(),
+            budget_cycles: 200_000,
+            deadline_cycles: 0,
+            miss_count: 0,
+            degraded: 0,
+        };
+        SENSORS_ITEM = rtos_work_t {
+            next: core::ptr::null_mut(),
+            fn_: Some(sensors_work),
+            arg: core::ptr::null_mut(),
+            budget_cycles: 100_000,
+            deadline_cycles: 0,
+            miss_count: 0,
+            degraded: 0,
+        };
+        ATT_ITEM = rtos_work_t {
+            next: core::ptr::null_mut(),
+            fn_: Some(attitude_work),
+            arg: core::ptr::null_mut(),
+            budget_cycles: 84_000, // ~0.5ms
+            deadline_cycles: 0,
+            miss_count: 0,
+            degraded: 0,
+        };
+    }
+    // attitude item 的控制器静态态 + sensors item 的静态态
+    crate::flyctrl::control::ctrl_init();
+    crate::flyctrl::sensors_task::sensors_init();
+    // ★须在 sensors_init 之后才 arm EXTI（否则 ISR 提前触发 → 静态未初始化 ✗）
+    crate::flyctrl::init_imu_drdy();
+    // ★design.md §5#4：**队列间带宽隔离** —— 给每条队列设 CPU 配额（cycles/突发）。
+    //   L2(estimator+attitude+sensors) 上限 ~4ms；L3(nav/telem/uplink) 上限 ~1ms。
+    if let Some(f) = slot().workq_set_quota {
+        f(Q_L2, 672_000);  // ~4ms @168MHz
+        f(Q_L3, 168_000);  // ~1ms
+    }
+    crate::flyctrl::nav_task::nav_init();
+    crate::flyctrl::telemetry::telemetry_init();
+    crate::flyctrl::uplink::uplink_init();
+
+    if let Some(f) = slot().workq_create {
+        f(Q_L2, b"wql2\0".as_ptr() as *const _, 3,
+          unsafe { core::ptr::addr_of_mut!(L2_WQ_STACK).cast::<u8>() }, 12288);
+        f(Q_L3, b"wql3\0".as_ptr() as *const _, 10,
+          unsafe { core::ptr::addr_of_mut!(L3_WQ_STACK).cast::<u8>() }, 2048);
+    }
+    unsafe {
+        if let Some(f) = slot().timer_init {
+            f(WQ_TIMER.as_mut_ptr(), b"wq250\0".as_ptr() as *const _, Some(tick_cb), core::ptr::null_mut());
+        }
+        if let Some(f) = slot().timer_start_ticks {
+            f(WQ_TIMER.as_mut_ptr(), 1 /*periodic*/, 4); // L2 250Hz
+        }
+        // ★L3 50Hz 定时器 → 提交 nav item
+        if let Some(f) = slot().timer_init {
+            f(L3_TIMER.as_mut_ptr(), b"wq50\0".as_ptr() as *const _, Some(tick_l3_cb), core::ptr::null_mut());
+        }
+        if let Some(f) = slot().timer_start_ticks {
+            f(L3_TIMER.as_mut_ptr(), 1 /*periodic*/, 20); // 20ms = 50Hz
+        }
+    }
+    info!(tag: "wq", "P2-3: L2 queue(estimator+attitude) + 250Hz timer ready");
+}
+
+/// ★design.md §3：DRDY 到（ISR）。
+/// ⚠️**当前不在此提交 `sensors` item** —— 1kHz 提交会把 L2 worker（单线程）压垮 ⇒
+///   estimator/attitude 饿死 ✗。正确形态：**IMU 采样直接在 L0 ISR 内完成**（读→`ImuRing`），
+///   `sensors` item（慢传感器）仍由 250Hz 定时器提交。该迁移为下一步（需拆 SENSOR_FRAME 写者）。
+pub fn on_imu_drdy() {
+    // 占位：IMU 采样迁入 ISR 后在此调用（见上）。
+}
+
+/// setup 任务入口：装配后常驻。
+pub extern "C" fn setup_entry(_arg: *mut c_void) {
+    setup();
+    loop {
+        msleep(1000);
+    }
+}

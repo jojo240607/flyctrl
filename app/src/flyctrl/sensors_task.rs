@@ -1,17 +1,14 @@
-//! 传感器采集任务：周期性读取 IMU / 气压 / GPS / RC，写入 `SENSOR_FRAME`（经 seqlock，见 `SENSOR_SEQ`）。
+//! ★design.md：**传感器 WorkItem**（L2 `wq:sensors`）+ IMU 采样（§3/§7，过渡：仍在此采样，
+//! 目标迁 L0 data-ready ISR）。
 //!
-//! 数据源由 `sensors::stack::SensorStack` 统一封装，底层是虚拟回放（`VirtualXxx`）
-//! 还是真实驱动（`ImuMpu6050` / `BaroBmp280` / `GpsUblox` / `RcSbus`）由编译期
-//! `cfg(feature = "real-sensors")` 决定，本任务**不感知**差异，只调用 trait 方法。
-//! 调试用虚拟源（默认），接真实硬件时只需开启 feature，算法/控制/遥测层零改动。
+//! 本文件导出的 `sensors_init()`（装配）+ `sensors_step()`（**一拍**，由 L2 队列 worker 调用）；
+//! 状态放模块级静态（WorkItem 无自己的栈）。**不再有独立 sensors 线程** ✓。
 
 use core::ffi::c_void;
+use core::mem::MaybeUninit;
 
 use rtos_app_sdk::info;
-use rtos_app_sdk::abi::g_app_slot;
 
-// 采样路径仅在非 HIL 模式编译（HIL 模式下仿真真值由 uplink 任务注入，
-// 见 uplink.rs 的 HIL_SENSOR / SET_POSITION_TARGET_LOCAL_NED 处理）。
 #[cfg(not(feature = "hil"))]
 use crate::flyctrl::{SENSOR_FRAME, SENSOR_SEQ};
 #[cfg(not(feature = "hil"))]
@@ -19,58 +16,95 @@ use crate::sensors::stack::SensorStack;
 #[cfg(not(feature = "hil"))]
 use flyctrl_core::vehicle::{ImuSample, PosSample, RcInput};
 
-/// 诊断：是否把采集数据写入共享 SENSOR_FRAME。false 时控制环回退到内部虚拟源，
-/// 用于区分“写入共享帧后被控制环处理”与“传感器任务自身”两类问题。
 const WRITE_FRAME: bool = true;
+/// 采样周期（IMU 1kHz；design.md §3/§7）。
+pub const SAMPLE_DT: f32 = 0.001;
+const GPS_VALID_STEPS: u32 = 500; // 500 × 1ms = 500ms
 
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub struct Sensors;
+#[cfg(not(feature = "hil"))]
+static mut SENS_STACK: MaybeUninit<SensorStack> = MaybeUninit::uninit();
+static mut SENS_FILTERS: MaybeUninit<flyctrl_core::imu_filters::ImuFilters> = MaybeUninit::uninit();
+static mut SENS_FIRST: bool = false;
+static mut SENS_LOOP_CNT: u32 = 0;
+static mut SENS_IMU_PREV_TS: u32 = 0;
+static mut SENS_IMU_PREV_HAS: bool = false;
+static mut SENS_TOPIC_AF: [f32; 3] = [0.0; 3];
+static mut SENS_TOPIC_GV: [f32; 3] = [0.0; 3];
+static mut SENS_TOPIC_RG: [f32; 3] = [0.0; 3];
+static mut SENS_TOPIC_TS: u32 = 0;
+static mut SENS_GPS_STALE: u32 = 0;
+#[cfg(not(feature = "hil"))]
+static mut SENS_LAST_IMU: ImuSample = ImuSample { accel: [flyctrl_core::units::MeterPerSecondSquared(0.0); 3], gyro: [flyctrl_core::units::RadianPerSecond(0.0); 3] };
+static mut SENS_HAVE_IMU: bool = false;
+/// ★design.md §7：单调性检查丢弃的异常帧计数（诊断）。
+static mut SENS_IMU_DROP: u32 = 0;
 
-impl Sensors {
-    pub fn new(_name: &[u8]) -> Option<Self> {
-        Some(Self)
+/// ★装配（在 setup 任务里调用一次）。
+pub fn sensors_init() {
+    #[cfg(not(feature = "hil"))]
+    unsafe {
+        SENS_STACK.write(SensorStack::new());
+        SENS_FILTERS.write(flyctrl_core::imu_filters::ImuFilters::new(1.0 / SAMPLE_DT));
+        SENS_FIRST = true;
+        SENS_LOOP_CNT = 0;
+        SENS_IMU_PREV_HAS = false;
+        SENS_GPS_STALE = 0;
     }
+    info!(tag: "sensor", "sensors item init (real={}, hil={})",
+          cfg!(feature = "real-sensors") as u32, cfg!(feature = "hil") as u32);
+}
 
-    pub extern "C" fn entry(_arg: *mut c_void) {
-        info!(tag: "sensor", "task started (WRITE_FRAME={}, real={}, hil={})",
-              WRITE_FRAME as u32, cfg!(feature = "real-sensors") as u32, cfg!(feature = "hil") as u32);
 
-        // 采样周期（秒），与回放推进一致。
-        let sample_dt: f32 = 0.002; // 500Hz 采样
+/// ★design.md §3 **L0**：data-ready ISR 内调 —— 读 IMU → 预处理 → `ImuRing` + IMU topic。
+/// ⚠️在 ISR 上下文执行（只做一次 SPI 事务；不阻塞）。
+pub fn imu_sample_step() {
+    #[cfg(not(feature = "hil"))]
+    unsafe {
+        let stack = SENS_STACK.assume_init_mut();
+        let imu_filters = SENS_FILTERS.assume_init_mut();
+        let s = stack.read_imu();
+        let raw_a = [s.accel[0].0, s.accel[1].0, s.accel[2].0];
+        let raw_g = [s.gyro[0].0, s.gyro[1].0, s.gyro[2].0];
+        let ts = rtos_app_sdk::rtos::cycle_now();
+        let raw_dt = (ts.wrapping_sub(SENS_IMU_PREV_TS)) as f32 / 168_000_000.0;
+        // ★design.md §7：**单调性检查** —— dt≤0（戳翻转/乱序）或超阈值 ⇒ **丢弃该帧**（不夹紧 ✗）+ 计数。
+        if SENS_IMU_PREV_HAS && !(raw_dt > 1e-5 && raw_dt < 0.02) {
+            SENS_IMU_PREV_TS = ts; // 重同步（避免持续丢弃）
+            SENS_IMU_DROP = SENS_IMU_DROP.wrapping_add(1);
+            return;
+        }
+        let dt = if SENS_IMU_PREV_HAS { raw_dt } else { 0.001 };
+        SENS_IMU_PREV_HAS = true;
+        SENS_IMU_PREV_TS = ts;
+        // ★design.md §3：ISR **只做搬运+打戳**（滤波是"复杂计算" ⇒ 移到 L2 `sensors` item ✗）
+        let _ = (raw_a, raw_g, imu_filters);
+        SENS_LAST_IMU = s;
+        SENS_TOPIC_TS = ts;
+        SENS_HAVE_IMU = true;
+        let r = &mut *core::ptr::addr_of_mut!(crate::flyctrl::IMU_RING);
+        r.push(flyctrl_core::imu_ring::ImuDelta {
+            delta_ang: [s.gyro[0].0 * dt, s.gyro[1].0 * dt, s.gyro[2].0 * dt],
+            delta_vel: [s.accel[0].0 * dt, s.accel[1].0 * dt, s.accel[2].0 * dt],
+            dt,
+            ts_cyc: ts,
+        });
+    }
+}
 
-        // ---- 统一数据源：虚拟或真实由编译期 feature 决定 ----
-        // HIL 模式下真值由 uplink 任务（usb0 唯一读者）经 HIL_SENSOR /
-        // SET_POSITION_TARGET_LOCAL_NED 注入 SENSOR_FRAME，本任务不再采样，
-        // 避免与 uplink 双写 SENSOR_FRAME 破坏 seqlock 单写者不变式。
-        #[cfg(not(feature = "hil"))]
-        let mut stack = SensorStack::new();
-        #[cfg(not(feature = "hil"))]
-        let h = stack.health();
-        #[cfg(not(feature = "hil"))]
-        info!(tag: "sensor", "stack init imu={} baro={} gps={} rc={} mag={}",
-              h.imu, h.baro, h.gps, h.rc, h.mag);
+/// ★L2 `wq:sensors` **WorkItem**：**一拍**（由工作队列 worker 调用）。
+pub fn sensors_step() {
+    #[cfg(not(feature = "hil"))]
+    {
+        let stack = unsafe { SENS_STACK.assume_init_mut() };
+        let imu_filters = unsafe { SENS_FILTERS.assume_init_mut() };
+        let sample_dt = SAMPLE_DT;
+        let (mut first, mut loop_cnt, mut imu_prev_ts, mut imu_prev_has) = unsafe {
+            (SENS_FIRST, SENS_LOOP_CNT, SENS_IMU_PREV_TS, SENS_IMU_PREV_HAS)
+        };
+        let (mut topic_af, mut topic_gv, mut topic_rg, mut topic_ts) =
+            unsafe { (SENS_TOPIC_AF, SENS_TOPIC_GV, SENS_TOPIC_RG, SENS_TOPIC_TS) };
+        let mut gps_stale = unsafe { SENS_GPS_STALE };
 
-        let mut first = true;
-        let mut loop_cnt: u32 = 0;
-        // 绝对节拍基准：周期恒为 sample_dt，不被 control 抢占"吸附"。
-        let mut wake_tick = rtos_app_sdk::rtos::tick_count();
-        // ★§5.118 回退（诚实登记 ✓）：传感器侧的硬件定时器节拍（timer5/TIM9 @500Hz）
-        //   在 M 场实测 **产出 0 帧** ✗ —— `init()` 报成功（设备 open + ioctl=0 ✓）
-        //   但 **TIM9(IRQ24) 中断从未到达** ✗ ⇒ `sem_wait()` 永久阻塞 ✗ ⇒ 传感器任务停摆
-        //   ⇒ 控制环吃陈旧样本 ⇒ 连带 x_env_faults 三项与多处时序窗失败 ✗（单一根 ✓）。
-        //   按"不留未经验证的改动"铁律 ⇒ **先回退到 delay_until** ✓（恢复现场 ✓）；
-        //   控制侧的 timer3/TIM7 节拍**已验证**（4.000ms/250.0Hz ✓）**保留** ✓。
-        //   TIM9/IRQ24 的中断交付问题另立条目排查 ✓（疑与 IRQ24 共享 TIM1_BRK 有关 ✓）。
-        // GPS 样本保持：真实 GPS 20Hz 帧，两次帧之间 read_gps 返回 None；若每拍
-        // 直接把 None 写进 SENSOR_FRAME，control(4ms) 只在 2ms Some 窗口内读到样本
-        // （约一半拍），FDIR 的 pos_available 大面积 false → gps_lost_steps 累积
-        // → 误判 GPS 丢失降级（虚拟时钟校准后实测 baro_step health=1）。
-        // 修复：无新帧时保持最近有效样本，超过 GPS_VALID_STEPS（500ms）无新帧才
-        // 置 None（真实飞控 GPS 短暂丢帧不降级语义）。
-        const GPS_VALID_STEPS: u32 = 250; // 250 × 2ms = 500ms
-        let mut gps_stale: u32 = 0;
-        loop {
             // 非 HIL：采样 + 写共享帧（seqlock：sensors 单写、control 单读，control 优先级更高）。
             #[cfg(not(feature = "hil"))]
             {
@@ -80,8 +114,19 @@ impl Sensors {
                     crate::sensors::sim::dataset::PLAYBACK.advance(sample_dt);
                 }
 
-                // ---- 读取各类传感器（统一 trait 接口，不区分虚拟/真实）----
-                let imu_sample: Option<ImuSample> = Some(stack.read_imu());
+                // ---- IMU 采样已在 L0 ISR；**滤波在此（L2 `sensors`，design.md §5）** ----
+                let imu_sample: Option<ImuSample> =
+                    if unsafe { SENS_HAVE_IMU } { Some(unsafe { SENS_LAST_IMU }) } else { None };
+                if let Some(s) = imu_sample.as_ref() {
+                    let (af, gv) = imu_filters.process(
+                        [s.accel[0].0, s.accel[1].0, s.accel[2].0],
+                        [s.gyro[0].0, s.gyro[1].0, s.gyro[2].0],
+                    );
+                    topic_af = af; topic_gv = gv;
+                    topic_rg = [s.gyro[0].0, s.gyro[1].0, s.gyro[2].0];
+                }
+                let _ = &stack; // 慢传感器由本 item 读；IMU 不在此
+                // ★design.md §7：逐样本**打硬件时间戳**并入 `IMU_RING`（后续 `rate`/`ekf` 消费）。
                 let baro_sample: Option<f32> = Some(stack.read_altitude());
                 let gps_sample: Option<PosSample> = stack.read_gps();
                 // GPS 样本保持（见循环外注释）：无新帧时保持最近有效样本
@@ -102,6 +147,11 @@ impl Sensors {
                         SENSOR_SEQ = SENSOR_SEQ.wrapping_add(1); // 奇：写入中
                         let f = &mut *core::ptr::addr_of_mut!(SENSOR_FRAME);
                         f.imu = imu_sample;
+                        // ★design.md §5：发布的 IMU topic（带硬件戳）
+                        f.accel_filt = topic_af;
+                        f.gyro_vel = topic_gv;
+                        f.gyro_raw = topic_rg;
+                        f.ts_cyc = topic_ts;
                         f.baro_alt = baro_sample;
                         // GPS 样本保持：有新帧更新；无新帧且未超时保持旧样本
                         // （避免 control 拍错过 2ms 窗口导致 pos_available 大面积
@@ -127,8 +177,20 @@ impl Sensors {
                 }
 
                 if loop_cnt % 500 == 0 {
-                    info!(tag: "sensor", "loop {} gps_w={} imu_w={} baro_w={} mag_w={}",
-                          loop_cnt, gps_sample.is_some(), imu_sample.is_some(), baro_sample.is_some(), mag_ok);
+                    // ★design.md §9：暴露工作队列统计（提交/软超时/硬超时）
+                    let mut w = [0u32; 6];
+                    if let Some(f) = rtos_app_sdk::abi::slot().work_stats {
+                        f(w.as_mut_ptr());
+                    }
+                    // ★design.md §9：可观测性 —— 队列统计 + **队列利用率(L2 已用 cycles)**
+                    let l1 = unsafe { crate::flyctrl::rate_task::RATE_EXEC_CYC } as u64 * 1000
+                        + unsafe { crate::flyctrl::safety_task::SAFETY_EXEC_CYC } as u64 * 500;
+                    let l1_permille = (l1 * 1000 / 168_000_000) as u32;
+                    let ovl = crate::flyctrl::safety_task::OVERLOAD_LEVEL
+                        .load(core::sync::atomic::Ordering::Relaxed);
+                    info!(tag: "sensor", "loop {} drdy={} wq={}/{}/{}/{}/{} l2used={} l1={}permille ovl={}",
+                          loop_cnt, unsafe { crate::flyctrl::IMU_DRDY_CNT },
+                          w[0], w[1], w[2], w[3], w[4], w[5], l1_permille, ovl);
                 }
             }
 
@@ -138,12 +200,14 @@ impl Sensors {
             }
             loop_cnt += 1;
 
-            rtos_app_sdk::rtos::delay_until(&mut wake_tick, (sample_dt * 1000.0) as u32);
+        unsafe {
+            SENS_FIRST = first; SENS_LOOP_CNT = loop_cnt;
+            SENS_IMU_PREV_TS = imu_prev_ts; SENS_IMU_PREV_HAS = imu_prev_has;
+            SENS_TOPIC_AF = topic_af; SENS_TOPIC_GV = topic_gv;
+            SENS_TOPIC_RG = topic_rg; SENS_TOPIC_TS = topic_ts;
+            SENS_GPS_STALE = gps_stale;
         }
     }
-}
-
-/// 模块级入口（供 `mod.rs::spawn_flyctrl` 经 `spawn_rt` 注册）。
-pub extern "C" fn sensors_entry(arg: *mut c_void) {
-    Sensors::entry(arg);
+    #[cfg(feature = "hil")]
+    { let _ = WRITE_FRAME; }
 }

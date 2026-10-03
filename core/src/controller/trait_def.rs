@@ -50,4 +50,35 @@ pub trait Controller {
 
     /// 复位内环积分器等状态。
     fn reset(&mut self);
+
+    /// ★C3：最近一次由控制律产出的**速率设定值**（PX4 `vehicle_rates_setpoint` 同构 ✓）。
+    ///
+    /// 默认 `INVALID`（非串级控制器不暴露 ✓）；`PidController` 返回姿态层输出 ✓。
+    /// app 侧独立高频 `rate_task` 在 1kHz 消费它 + **新鲜陀螺**跑速率层 ✓。
+    fn rate_setpoint(&self) -> RateSetpoint {
+        RateSetpoint::INVALID
+    }
+}
+
+/// 速率层设定值：**姿态层 → 速率层**的接口（PX4 `vehicle_rates_setpoint` 同构 ✓）。
+///
+/// ★C3 串级：姿态层（`mc_att_control` 同构）产出本结构；速率层（`mc_rate_control` 同构）
+/// 按**自身周期**（可远高于姿态层）消费它，与实测陀螺一起算力矩→混控。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RateSetpoint {
+    /// 期望机体角速率 (p, q, r)，rad/s（姿态层已按 `RATE_MAX_DPS` 限幅 ✓）。
+    pub rates: [f32; 3],
+    /// 集体推力（悬停油门基值；量纲同 `ActuatorCmd` 之前的 `des_thrust` ✓）。
+    pub thrust: f32,
+    /// 是否有效：false ⇒ 速率层输出零（健康/解锁闸由宿主置 false ✓）。
+    pub valid: bool,
+}
+
+impl RateSetpoint {
+    /// 无效设定值（速率层据 `valid` 输出零 ✓）。
+    pub const INVALID: Self = Self { rates: [0.0; 3], thrust: 0.0, valid: false };
+    /// 由姿态层产出：有效设定值 ✓。
+    pub fn new(rates: [f32; 3], thrust: f32) -> Self {
+        Self { rates, thrust, valid: true }
+    }
 }

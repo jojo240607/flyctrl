@@ -12,7 +12,7 @@ pub mod attitude;
 pub mod tecs;
 pub mod manual;
 
-pub use trait_def::{Controller, Setpoint};
+pub use trait_def::{Controller, RateSetpoint, Setpoint};
 pub use pid::PidController;
 pub use lqr::LqrController;
 pub use mpc::MpcController;

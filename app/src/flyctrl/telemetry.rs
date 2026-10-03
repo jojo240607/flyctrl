@@ -35,21 +35,32 @@ static mut FRAME_BUF: [u8; flyctrl_core::comm::link::MAX_FRAME_LEN] =
 ///
 /// uart3(USART6) 未接到 PC，无法闭环验证，下行暂不挂 uart3（其 IRQ 引擎 write 为阻塞式，
 /// 一旦唤醒中断异常会永久卡死 telem；而 usb0 的非阻塞 staged 写天然满足"host 不连不卡死"）。
-pub extern "C" fn telemetry_entry(_arg: *mut c_void) {
-    info!(tag: "telem", "task started; period=20ms prio={} downlink=usb0", RTOS_PRIO_MAIN);
+use core::mem::MaybeUninit;
 
-    // usb0 复用系统层已在 boot 阶段 open 的句柄（Device::get），
-    // 切勿二次 Device::open —— 二次 open 会再次 USBD_Init + 重绑 ISR，
-    // 重置 USB TX 状态机导致后续 write 阻塞/卡死（已实测复现）。
-    let usb_dev = Device::get("usb0\0");
-    if usb_dev.is_none() {
-        warn!(tag: "telem", "usb0 (USB CDC) not available -> no downlink");
+static mut TELEM_USB: MaybeUninit<Option<Device>> = MaybeUninit::uninit();
+static mut TELEM_SEQ: u8 = 0;
+static mut TELEM_BOOT_MS: u32 = 0;
+
+/// ★装配（在 setup 任务里调用一次）。
+pub fn telemetry_init() {
+    unsafe {
+        TELEM_USB.write(Device::get("usb0\0"));
+        if (*core::ptr::addr_of!(TELEM_USB)).assume_init_ref().is_none() {
+            warn!(tag: "telem", "usb0 (USB CDC) not available -> no downlink");
+        }
+        TELEM_SEQ = 0;
+        TELEM_BOOT_MS = 0;
     }
+    info!(tag: "telem", "telemetry item init (L3 wq:l3, 20ms)");
+}
 
+/// ★design.md L3 WorkItem：**一拍**（下行走 usb0）。
+pub fn telemetry_step() {
+    // ★design.md §8：过载等级 ≥ 2 ⇒ 降级本项
+    if crate::flyctrl::safety_task::OVERLOAD_LEVEL.load(core::sync::atomic::Ordering::Relaxed) >= 2 { return; }
+    let usb_dev = unsafe { (*core::ptr::addr_of!(TELEM_USB)).assume_init() };
     let frame_buf = unsafe { &mut FRAME_BUF };
-    let mut seq: u8 = 0;
-    let mut boot_ms: u32 = 0; // 下行 time_boot_ms 累加（20ms/周期）
-    loop {
+    let (mut seq, mut boot_ms) = unsafe { (TELEM_SEQ, TELEM_BOOT_MS) };
         // 读最新估计（短临界区）
         let (mut est, health, armed);
         {
@@ -159,6 +170,6 @@ pub extern "C" fn telemetry_entry(_arg: *mut c_void) {
         // 共享控制台打周期日志。需要诊断时用 GDB 直接读任务状态/EST_MTX。
 
         boot_ms = boot_ms.wrapping_add(20);
-        msleep(20);
-    }
+
+    unsafe { TELEM_SEQ = seq; TELEM_BOOT_MS = boot_ms; }
 }

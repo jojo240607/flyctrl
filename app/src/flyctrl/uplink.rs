@@ -15,6 +15,7 @@
 //! - 解锁/模式等"持久影响控制律"的状态，经 `core::G_*` 原子共享给 control 任务，
 //!   避免 uplink 直接调用控制律（保持任务边界清晰、零竞争）。
 
+use core::mem::MaybeUninit;
 use rtos_app_sdk::info;
 use rtos_app_sdk::device::Device;
 use crate::flyctrl::control;
@@ -833,27 +834,43 @@ pub fn sync_gains_to_pid(pid: &mut flyctrl_core::controller::PidController) {
 }
 
 // ── uplink 任务入口 ───────────────────────────────────────────────────
-pub extern "C" fn uplink_task(_arg: *mut c_void) {
-    info!(tag: "uplink", "task started; poll usb0.read, prio={}", RTOS_PRIO_MAIN);
+static mut UP_TX: MaybeUninit<UplinkTx> = MaybeUninit::uninit();
+static mut UP_RX_BUF: [u8; 64] = [0u8; 64];
+static mut UP_LOOPS: u32 = 0;
+static mut UP_ACTIVE: bool = false;
 
-    // 复用 boot 已打开的 usb0（见 telemetry 的 Device::get 约定，避免二次 open 重置 USB 状态机）。
+/// ★装配（在 setup 任务里调用一次）。
+pub fn uplink_init() {
+    info!(tag: "uplink", "uplink item init (L3 wq:l3)");
     let usb_dev = match Device::get("usb0\0") {
         Some(d) => d,
         None => {
             info!(tag: "uplink", "usb0 not found; uplink disabled");
+            unsafe { UP_ACTIVE = false; }
             return;
         }
     };
+    unsafe {
+        UP_TX.write(UplinkTx::new(usb_dev));
+        UP_LOOPS = 0;
+        UP_ACTIVE = true;
+    }
+}
 
-    let mut tx = UplinkTx::new(usb_dev);
-    let mut rx_buf = [0u8; 64];
-
-    let mut loops: u32 = 0;
-    loop {
+/// ★design.md L3 WorkItem：**一拍**（非阻塞轮询 usb0.read + 增量解析 + 路由）。
+pub fn uplink_step() {
+    // ★design.md §8：过载等级 ≥ 3 ⇒ 降级本项
+    if crate::flyctrl::safety_task::OVERLOAD_LEVEL.load(core::sync::atomic::Ordering::Relaxed) >= 3 { return; }
+    if unsafe { !UP_ACTIVE } {
+        return;
+    }
+    let tx = unsafe { UP_TX.assume_init_mut() };
+    let rx_buf = unsafe { &mut *core::ptr::addr_of_mut!(UP_RX_BUF) };
+    let mut loops = unsafe { UP_LOOPS };
         // 非阻塞轮询 usb0.read + 增量解析 + 路由（RX ring 空时返回 0，不阻塞）。
         // 一期固件不带机载电脑 → 默认不轮询 usb0（见 Cargo.toml `usb-link` 说明）。
         #[cfg(feature = "usb-link")]
-        tx.poll_read(&mut rx_buf);
+        tx.poll_read(rx_buf);
         #[cfg(not(feature = "usb-link"))]
         let _ = (&tx, &mut rx_buf);
 
@@ -896,6 +913,6 @@ pub extern "C" fn uplink_task(_arg: *mut c_void) {
         }
 
         // 让出 CPU 1ms（HIL 下保证 RX ring 快速 drain/re-arm，降低 PC 写阻塞）。
-        msleep(1);
-    }
+
+    unsafe { UP_LOOPS = loops; }
 }

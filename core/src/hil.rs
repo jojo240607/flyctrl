@@ -10,7 +10,7 @@
 //! 运行时保证周期一致（均以固定 `dt` 推进）。
 
 use crate::config::VehicleConfig;
-use crate::controller::{Controller, Setpoint};
+use crate::controller::{Controller, RateSetpoint, Setpoint};
 use crate::estimator::Estimator;
 
 /// [联调诊断] step_hil 原始指令闸位观测（b0=armed b1=rc_fresh b2=health
@@ -26,11 +26,16 @@ use crate::math;
 use crate::units::{Meter, MeterPerSecondSquared, Radian, RadianPerSecond, Second};
 use crate::vehicle::{rotate_vec_by_quat_inverse, ActuatorCmd, ImuSample, PosSample, Quaternion, RtkSample, VehicleState, VioSample};
 
-/// HIL/共享单步结果：本拍估计状态 + 健康等级 + 已限幅执行器指令。
+/// HIL/共享单步结果：本拍估计状态 + 健康等级 + 已限幅执行器指令 + **速率设定值**。
 pub struct StepResult {
     pub est: VehicleState,
     pub health: Health,
     pub cmd: ActuatorCmd,
+    /// ★C3：姿态层产出的速率设定值（PX4 `vehicle_rates_setpoint` 同构）——
+    /// app 侧独立高频 `rate_task` 用它 + **新鲜陀螺**在 1kHz 跑速率层 ✓。
+    pub rate_sp: RateSetpoint,
+    /// ★C3：本拍速率设定值是否有效（健康/解锁/初始化闸全开 ⟺ true ✓）。false ⇒ 速率环零输出 ✓。
+    pub rate_gated: bool,
 }
 
 /// 占位 IMU 源（SIL/HIL 共享）：HIL 链路本拍无新 IMU 帧注入时启用。
@@ -137,6 +142,10 @@ where
     pub imu_gyro_lpf: [Biquad; 3],
     /// 本拍**控制器侧**陀螺（经 陷波(opt-in) → 低通(40Hz) ✓）——用于覆盖喂给控制器的 `omega` ✓
     pub last_gyro_ctl: [f32; 3],
+    /// ★design.md §7：本拍待 predict 的 IMU **增量**（宿主从 `ImuRing` 排空后填入）——
+    ///   1kHz IMU → 250Hz 估计器时**逐样本 predict**，不丢样本 ✓。
+    pub imu_deltas: [crate::imu_ring::ImuDelta; 16],
+    pub imu_deltas_len: usize,
 }
 
 use crate::perf::probe;
@@ -157,6 +166,8 @@ where
         // 采样率 = 1/控制周期。SIL 与 MCU 均以 dt=0.004（250Hz）推进 → 滤波器
         // 系数、状态演化两侧一致，同输入测试（逐位断言）仍成立。
         let fs = 1.0 / dt.0;
+        // ★design.md §5：IMU 预处理抽为可复用 `ImuFilters`（后续归 `wq:sensors`）
+        let imu_f = crate::imu_filters::ImuFilters::new(fs);
         let mut ctx = Self {
             est,
             ctrl,
@@ -176,8 +187,8 @@ where
             // gyro 只用 40Hz 陷波（不用低通）：见 `imu_gyro_notch` 注释——低通会衰减
             // 姿态环角速度阻尼反馈导致振荡发散。
             // 每轴独立实例（Biquad 为标量滤波器，跨轴复会污染状态）。
-            imu_accel_notch: [Biquad::notch(40.0, fs, 5.0); 3],
-            imu_accel_lowpass: [Biquad::low_pass(20.0, fs, 0.7071); 3],
+            imu_accel_notch: imu_f.accel_notch,
+            imu_accel_lowpass: imu_f.accel_lpf,
             // ★★§5.207【③ 低通：**默认 40Hz（对齐 PX4）** + 速率环联合重整定 ✓】
             //   一手 ✓：PX4 `IMU_GYRO_CUTOFF` default **40Hz**；其注释含义 =
             //     "using a D-term filter allows to **increase** IMU_GYRO_CUTOFF … and
@@ -185,25 +196,10 @@ where
             //   §5.206 首次直接照搬 40Hz ⇒ `guidance_track` 破（14/2 ✗，`sat_ratio` 超限）= **未重整定** ✓
             //   §5.207（本节 ✓）：**按一手做联合重整定**（降 P + 加 D 阻尼 ✓）⇒ 40Hz 可开 ✓
             //   `G_ESKF_GYR_LPF > 0` 可覆盖；≤0（含裸 bin 读 0）⇒ **40Hz** ✓
-            imu_gyro_lpf: {
-                let v = unsafe {
-                    core::ptr::read_volatile(core::ptr::addr_of!(
-                        crate::estimator::eskf::G_ESKF_GYR_LPF))
-                };
-                // ★★§5.207：**默认 40Hz**（对齐 PX4 `IMU_GYRO_CUTOFF` ✓）—— 随 ③ 的联合重整定
-                //   一并开启 ✓（裸 bin 读 0 ⇒ 40Hz ✓）。`>0` 可覆盖 ✓。
-                // ★★§5.210【③ 默认 40Hz（对齐 PX4 `IMU_GYRO_CUTOFF` ✓）】
-                //   §5.207 直接照搬 40Hz 破（未重整定 ✗）⇒ §5.208 补上 PX4 的角加速度 D ✓
-                //   ⇒ §5.209 找到根因（姿态估计滞后 = 重力锚定）并给出闭环境配置 `att_alpha=0` ✓
-                //   ⇒ 三者齐备后 40Hz 可默认开 ✓（`>0` 覆盖；`<0` 强制关，A/B 用 ✓）
-                if v < 0.0 {
-                    [Biquad::passthrough(); 3]
-                } else {
-                    let fc = if v > 0.0 { v } else { 40.0 };
-                    [Biquad::low_pass(fc, fs, 0.7071); 3]
-                }
-            },
+            imu_gyro_lpf: imu_f.gyro_lpf,
             last_gyro_ctl: [0.0; 3],
+            imu_deltas: [crate::imu_ring::ImuDelta::ZERO; 16],
+            imu_deltas_len: 0,
             // ★§5.136：陀螺陷波 Q 可配（A/B 定位 9Hz 姿态振荡的相位来源：
             //   实测 Q=5 时 9Hz 处相位滞后使姿态环越过临界 ⇒ 增长型振荡 ✗；
             //   旋钮 `G_ESKF_GYR_NOTCH_Q` >0 ⇒ 覆盖 Q（默认 5.0 保持既有行为 ✓）
@@ -213,28 +209,7 @@ where
             //   本仓历史（§5.136）：默认开 40Hz Q=2（为抑 40Hz 振动 ✓）——实测它吃掉 ~3.5~5dB 裕度 ✗
             //   ⇒ 现按一手**改默认关** ✓（需要时由 `G_ESKF_GYR_NOTCH_FRQ` 开启 ✓）
             //   ⚠️兼容：§5.136 的 `G_ESKF_GYR_NOTCH_Q`（>0 ⇒ 覆盖 Q ✓）保留 ✓
-            imu_gyro_notch: {
-                let frq = unsafe {
-                    core::ptr::read_volatile(core::ptr::addr_of!(
-                        crate::estimator::eskf::G_ESKF_GYR_NOTCH_FRQ))
-                };
-                let bw = unsafe {
-                    core::ptr::read_volatile(core::ptr::addr_of!(
-                        crate::estimator::eskf::G_ESKF_GYR_NOTCH_BW))
-                };
-                let bw = if bw > 0.0 { bw } else { 20.0 }; // 一手 default ✓
-                let q_ov = unsafe {
-                    core::ptr::read_volatile(core::ptr::addr_of!(
-                        crate::estimator::eskf::G_ESKF_GYR_NOTCH_Q))
-                };
-                if frq > 0.0 {
-                    let q = if q_ov > 0.0 { q_ov } else { frq / bw };
-                    [Biquad::notch(frq, fs, q); 3]
-                } else {
-                    // 0 ⇒ 禁用（一手语义 ✓）：恒等滤波（零相位/零开销 ✓）
-                    [Biquad::passthrough(); 3]
-                }
-            },        };
+            imu_gyro_notch: imu_f.gyro_notch,        };
         // ★★§5.187【比力低通延迟 τ 的自动标定 ✓】：从**实际滤波器系数**导出群延迟
         //   （比力链路：40Hz 陷波 → 20Hz Butterfly 低通 ✓），写入估计器供重力辅助补偿 ✓。
         //   · 参考频率取 **1Hz**：群延迟在飞行频段（≈0.5~5Hz）内近似平坦 ✓（实测
@@ -400,7 +375,13 @@ where
     ///   回退设定点（链路未建立时保持位置的占位值）虽是有限值，但**不得**用于
     ///   位置初始化——否则首拍即把 EKF 锁到占位目标，HIL 建立后叠加异常观测 → NaN。
     /// - `armed` / `rc_fresh`：解锁与遥控链路新鲜度（控制闸，任一为假则输出零指令）。
-    pub fn step_hil(
+    /// ★C1 **EKF/FDIR 步**（无控制律）：IMU 预处理 + 估计 + 气压/磁更新 +
+    /// 姿态/位置初始化门控 + FDIR 健康闸 + 全部门控判定。
+    ///
+    /// PX4 同构：EKF 跑在**IMU 率**（高频任务），姿态/速度外环另跑较低频 ✓。
+    /// 返回 `(估计状态, 健康, rate_gated)` —— 供宿主在高频路径每拍调用 ✓。
+    pub fn ekf_hil(
+
         &mut self,
         imu: Option<ImuSample>,
         gps: Option<PosSample>,
@@ -413,7 +394,7 @@ where
         armed: bool,
         rc_fresh: bool,
         sim_imu: &mut SimImu,
-    ) -> StepResult {
+    ) -> (VehicleState, Health, bool) {
         probe(0); // 进入 step_hil
         // 1) IMU：有真实帧用真实帧（单次消费由调用方保证），无则回退最近真实帧
         //    （sample-and-hold，角速度继续积分、比力继续锚定）；从未收到真实帧
@@ -541,7 +522,26 @@ where
         //   该字段会让 `PosSample` 变大 ⇒ 破坏【固件↔宿主共享帧 ABI】（§5.39 ✓）。
         //   现状：M 场虚拟 GPS 每拍皆为新鲜 ⇒ 本就不触发 ✓；真实"保持样本"场景的
         //   重复融合问题**另行解决**（带外标记 / 测试侧按符号读 ✓，见 §5.39 待办 ✓）。
-        let est_state = self.est.step(self.dt, imu_sample, gps, None);
+        // ★design.md §7 + PX4 同构：拆成**逐样本 predict** + 按率融合（`ekf.cpp:183-184`）。
+        let dtf = self.dt.0;
+        let gyr = [imu_sample.gyro[0].0, imu_sample.gyro[1].0, imu_sample.gyro[2].0];
+        let acc = [imu_sample.accel[0].0, imu_sample.accel[1].0, imu_sample.accel[2].0];
+        if self.imu_deltas_len > 0 {
+            // ★排空：逐样本 predict（1kHz 样本全部参与积分 ✓）
+            for i in 0..self.imu_deltas_len {
+                let d = self.imu_deltas[i];
+                self.est.predict_delta(d.delta_ang, d.delta_vel, d.dt);
+            }
+            self.imu_deltas_len = 0;
+        } else {
+            // 单帧回退（SIL/未接环形路径）
+            self.est.predict_delta(
+                [gyr[0] * dtf, gyr[1] * dtf, gyr[2] * dtf],
+                [acc[0] * dtf, acc[1] * dtf, acc[2] * dtf],
+                dtf,
+            );
+        }
+        let est_state = self.est.update_fusion(gps, None);
         probe(3); // EKF 预测+更新完成
         // 气压高度观测（垂直通道最紧锚）：在 step 之后注入（predict-then-correct），
         // 下一拍预测从修正后状态出发。此前 baro 只进 FDIR、垂直通道仅靠 GPS 锚定
@@ -629,43 +629,70 @@ where
                 | ((self.hil_att_inited as u32) << 5)
                 | ((self.hil_pos_inited as u32) << 6);
         }
-        let raw_cmd = if armed
+        let rate_gated = armed
             && rc_fresh
             && health != Health::Critical
             && est_finite
             && sp_finite
             && self.hil_att_inited
-            && self.hil_pos_inited
-        {
-            // ★§5.166 诊断：真值覆盖（默认 None ⇒ 不改变 ✓）
-            let mut est_for_ctrl = est_state;
-            // ★§5.206：喂控制器的角速度 = **控制器侧链**（陷波→低通 ✓），非估计器那个 ✓
-            for k in 0..3 {
-                est_for_ctrl.omega[k] = crate::units::RadianPerSecond(self.last_gyro_ctl[k]);
+            && self.hil_pos_inited;
+        (est_state, health, rate_gated)
+    }
+
+    /// 单步闭环（EKF + 控制 + 限幅）：`ekf_hil` + 控制律 + 执行器限幅。
+    ///
+    /// 保留为 **单拍回退路径**（SIL / 旧调用方）：一次跑完 EKF + 姿态 + 速率 +
+    /// 混控 + 限幅。★C1 高频分层路径改为 `ekf_hil`（1kHz）+ `attitude_step`(250Hz)
+    /// + `rate_step`(1kHz) 分调用 ✓。
+    pub fn step_hil(
+        &mut self,
+        imu: Option<ImuSample>,
+        gps: Option<PosSample>,
+        baro_alt: Option<f32>,
+        vio: Option<VioSample>,
+        rtk: Option<RtkSample>,
+        mag: Option<[f32; 3]>,
+        setpoint: &Setpoint,
+        setpoint_valid: bool,
+        armed: bool,
+        rc_fresh: bool,
+        sim_imu: &mut SimImu,
+    ) -> StepResult {
+        let (est_state, health, rate_gated) = self.ekf_hil(
+            imu, gps, baro_alt, vio, rtk, mag, setpoint, setpoint_valid, armed, rc_fresh, sim_imu,
+        );
+        probe(6); // 健康闸 + EKF 完成
+        // ★§5.206：喂控制器的角速度 = **控制器侧链**（陷波→低通 ✓）
+        let mut est_for_ctrl = est_state;
+        for k in 0..3 {
+            est_for_ctrl.omega[k] = crate::units::RadianPerSecond(self.last_gyro_ctl[k]);
+        }
+        if let Some((f, mask)) = self.truth_overlay {
+            let (p, v, q) = f();
+            if mask & 1 != 0 {
+                for k in 0..3 {
+                    est_for_ctrl.pos[k] = crate::units::Meter(p[k]);
+                }
             }
-            if let Some((f, mask)) = self.truth_overlay {
-                let (p, v, q) = f();
-                if mask & 1 != 0 {
-                    for k in 0..3 {
-                        est_for_ctrl.pos[k] = crate::units::Meter(p[k]);
-                    }
-                }
-                if mask & 2 != 0 {
-                    for k in 0..3 {
-                        est_for_ctrl.vel[k] = crate::units::MeterPerSecond(v[k]);
-                    }
-                }
-                if mask & 4 != 0 {
-                    est_for_ctrl.att = crate::vehicle::Quaternion { w: q[0], x: q[1], y: q[2], z: q[3] };
+            if mask & 2 != 0 {
+                for k in 0..3 {
+                    est_for_ctrl.vel[k] = crate::units::MeterPerSecond(v[k]);
                 }
             }
+            if mask & 4 != 0 {
+                est_for_ctrl.att = crate::vehicle::Quaternion { w: q[0], x: q[1], y: q[2], z: q[3] };
+            }
+        }
+        let raw_cmd = if rate_gated {
             self.ctrl.control(self.dt, setpoint, &est_for_ctrl)
         } else {
             ActuatorCmd::zero()
         };
-
-        probe(6); // 健康闸 + 控制律完成
-
+        let rsp = if rate_gated {
+            self.ctrl.rate_setpoint()
+        } else {
+            RateSetpoint::INVALID
+        };
         // 7) 执行器限幅（单向记录失控保护）。
         if health == Health::Critical {
             self.failsafe_engaged = true;
@@ -674,10 +701,10 @@ where
         for i in 0..4 {
             cmd.motor[i] = clamp_thrust(raw_cmd.motor[i]);
         }
-
         probe(7); // 执行器限幅完成
-        StepResult { est: est_state, health, cmd }
+        StepResult { est: est_state, health, cmd, rate_sp: rsp, rate_gated }
     }
+
 
     /// 当前估计状态（已含所有已融合观测，含控制器 step 之后的外部 update_alt）。
     pub fn estimate(&self) -> VehicleState

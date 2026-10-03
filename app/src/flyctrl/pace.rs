@@ -127,3 +127,6 @@ macro_rules! pacer {
 pacer!(control, "timer3", 55, "timer3/TIM7 @250Hz (4.000ms)");
 // 传感器任务：板级 `timer5` = TIM9（general，168MHz APB2）⇒ 板级配置 **500Hz = 2.000ms** ✓
 pacer!(sensors, "timer5", 24, "timer5/TIM9 @500Hz (2.000ms)");
+// ★C3 独立速率环任务：板级 `timer2` = TIM6（basic，84MHz APB1，**专用 IRQ54** —— 与已验证的
+//   timer3/TIM7 同类 ✓）⇒ 板级配置 **1000Hz = 1.000ms** ✓。对齐 PX4 `mc_rate_control` 跑在陀螺率上 ✓。
+pacer!(rate, "timer2", 54, "timer2/TIM6 @1000Hz (1.000ms)");

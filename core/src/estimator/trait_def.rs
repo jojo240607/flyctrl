@@ -57,6 +57,20 @@ pub trait Estimator {
     /// 默认 no-op（不融合重力/无需补偿的估计器不受影响）。
     fn set_accel_lag_s(&mut self, _tau_s: f32) {}
 
+    /// ★design.md §7 + PX4 同构（`ekf.cpp:184 predictState`）：**逐样本 predict** ——
+    ///   直接吃 `sensors` 的 `delta_ang/delta_vel` + 实测 dt ⇒ 1kHz IMU **不丢样本** ✓。
+    ///   默认 no-op（未做拆分的估计器不受影响 ✓）。
+    fn predict_delta(&mut self, _delta_ang: [f32; 3], _delta_vel: [f32; 3], _dt: f32) {}
+
+    /// 融合更新（predict 之外的部分，按各自率）。默认：直接返回当前状态。
+    fn update_fusion(
+        &mut self,
+        _pos: Option<crate::vehicle::PosSample>,
+        _airspeed: Option<crate::vehicle::AirspeedSample>,
+    ) -> VehicleState {
+        self.state()
+    }
+
     /// 当前估计状态（不推进），供诊断读取（已含所有已融合观测）。
     fn state(&self) -> VehicleState;
     /// 当前估计的加计零偏（机体系，m/s²）。默认实现返回零，

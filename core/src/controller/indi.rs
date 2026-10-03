@@ -68,6 +68,12 @@ impl<B: Controller> IndiController<B> {
         &self.base
     }
 
+    /// ★C3【可变访问器 ✓】：返回内层基础控制器 —— 供**独立高频速率层**在其上
+    /// 直接调用 `rate_step`（PX4 `mc_rate_control` 同构 ✓）。不改 INDI 自身行为 ✓。
+    pub fn base_mut(&mut self) -> &mut B {
+        &mut self.base
+    }
+
     /// 取内层基础控制律（调试用）。
     pub fn inner(&self) -> &B {
         &self.base

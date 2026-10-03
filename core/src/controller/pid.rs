@@ -11,7 +11,7 @@
 
 use crate::units::*;
 use crate::vehicle::{ActuatorCmd, Quaternion, VehicleState};
-use crate::controller::{Controller, trait_def::Setpoint};
+use crate::controller::{Controller, trait_def::{RateSetpoint, Setpoint}};
 
 
 /// [联调诊断] PID 内部量观测（静态，无栈开销；测试直读，定位后移除）。
@@ -297,8 +297,11 @@ pub struct PidController {
     /// ★§5.265 偏航力矩输出低通状态（PX4 `MC_YAW_TQ_CUTOFF` ✓）
     yaw_tq_lpf: f32,
     yaw_tq_initialized: bool,
-    att_kp: f32,
-    att_kd: f32,
+    /// ★C3 串级【姿态层 P】：四元数姿态误差 → 期望机体角速率（rad/s）。
+    ///   默认 = 旧 `att_kp/att_kd`（=10.0），使同频下与旧单层等价。
+    att_p: f32,
+    /// ★C3 串级【速率层 P】：速率误差 → 力矩。默认 = 旧 `att_kd`（=0.45）。
+    kp_rate: f32,
     // 推力基值（悬停油门）与重力（用于倾角->加速度映射）
     hover_thrust: f32,
     gravity: f32,
@@ -385,6 +388,8 @@ pub struct PidController {
     // 调试快照：最近一次内环计算的姿态误差向量与期望机体角速度
     dbg_err: [f32; 3],
     dbg_pqr: [f32; 3],
+    /// ★C3：最近一次《速率设定值》（姿态层输出，rad/s）——串级整定的关键观测量。
+    dbg_rate_sp: [f32; 3],
     dbg_omega: [f32; 3],
     // 阶段 11-A 诊断：控制律内部步计数（仅用于一次性 stderr 诊断，固定步后停止）
     dbg_step: u32,
@@ -421,6 +426,11 @@ impl PidController {
     /// 读取最近一次内环调试快照（误差向量、期望机体角速度、机体角速度）。
     pub fn dbg_last(&self) -> ([f32; 3], [f32; 3], [f32; 3]) {
         (self.dbg_err, self.dbg_pqr, self.dbg_omega)
+    }
+
+    /// ★C3：最近一次**速率设定值（仅三轴）**（姿态层输出，rad/s）——串级整定观测。
+    pub fn rate_setpoint_rates(&self) -> [f32; 3] {
+        self.dbg_rate_sp
     }
 
     /// 调试：返回垂向位置积分累积值。
@@ -515,8 +525,10 @@ impl PidController {
             //     ⇒ 在那之前 ③ 保持**默认关** ✓（`G_ESKF_GYR_LPF > 0` 可显式启用 ✓）
             yaw_tq_lpf: 0.0,
             yaw_tq_initialized: false,
-            att_kp: 4.5,
-            att_kd: 0.45,
+            // ★C3 串级：att_p = 4.5/0.45 = 10.0、kp_rate = 0.45
+            //   ⇒ `kp_rate·(att_p·err − ω) = att_kp·err − att_kd·ω`（同频等价 ✓）
+            att_p: 10.0,
+            kp_rate: 0.45,
             hover_thrust: 0.5,
             gravity: 9.81,
             ki_z: 0.3, // 原 0.6：积分零点从 ωz=1.2 降到 0.6 rad/s（低于增益穿越 ωc≈0.68 rad/s），
@@ -573,6 +585,7 @@ impl PidController {
             filt_init: false,
             dbg_err: [0.0; 3],
             dbg_pqr: [0.0; 3],
+            dbg_rate_sp: [0.0; 3],
             dbg_omega: [0.0; 3],
             dbg_step: 0,
             prev_yaw: None,
@@ -622,8 +635,11 @@ impl PidController {
         s.gravity = c.gravity;
         s.vmax_xy = c.vmax_xy;
         s.vmax_z = c.vmax_z;
-        s.att_kp = c.att_kp;
-        s.att_kd = c.att_kd;
+        // ★C3 串级映射：`att_p = att_kp/att_kd`、`kp_rate = att_kd`
+        //   （同频下与旧单层 `att_kp·err − att_kd·ω` 等价 ✓；两者可随后独立重整定 ✓）
+        let kd = if c.att_kd.abs() > 1e-6 { c.att_kd } else { 0.45 };
+        s.att_p = c.att_kp / kd;
+        s.kp_rate = kd;
         // ★★§5.208：角加速度 D（PX4 IMU_DGYRO_CUTOFF 同构 ✓）
         s.dgyro_k = c.dgyro_k;
         s.dgyro_cutoff = if c.dgyro_cutoff > 0.0 { c.dgyro_cutoff } else { 20.0 };
@@ -644,7 +660,38 @@ impl Controller for PidController {
         self.world_accel_meas = [a[0].0, a[1].0, a[2].0];
     }
 
+    /// ★C3：姿态层每拍产出的速率设定值（供 app 侧 1kHz `rate_task` ✓）。
+    fn rate_setpoint(&self) -> RateSetpoint {
+        RateSetpoint::new(self.dbg_rate_sp, self.dbg_des_thr)
+    }
+
+    /// ★C3 串级【单拍回退路径】：同拍调用姿态层 + 速率层
+    ///   （SIL / INDI base / swarm 仍走此路径 ✓；频率分离路径见 app 侧 rate_task ✓）。
     fn control(&mut self, _dt: Second, sp: &Setpoint, est: &VehicleState) -> ActuatorCmd {
+        let rsp = self.attitude_step(_dt, sp, est);
+        self.rate_step(_dt, &rsp, [est.omega[0].0, est.omega[1].0, est.omega[2].0])
+    }
+
+    fn reset(&mut self) {
+        // 四元数误差内环无状态积分；清除垂向位置积分项防 windup 残留
+        self.iz = 0.0;
+        // 阶段 11-A：重置 EMA 滤波状态，避免跨任务/重启残留
+        self.filt_vd = 0.0;
+        self.filt_d = 0.0;
+        self.filt_w = [0.0; 3];
+        self.rate_filt_init = false;
+        self.filt_init = false;
+        self.dbg_step = 0;
+    }
+}
+
+/// ★C3 串级（PX4 `mc_att_control` + `mc_rate_control` 同构）：
+/// 姿态层产出《速率设定值》，速率层独立消费并按自身周期运行。
+impl PidController {
+    /// ★C3 **姿态层**（PX4 `mc_att_control` 同构）：位置/速度外环 + 姿态 P → 速率设定值。
+    /// ★design.md P0-3b **外环（位置/速度）**（L3 归属）：位/速外环 → 期望姿态 + 总推力。
+    ///   L2 `attitude_step` 在此之上只加姿态 P ✓（拆开后 L3 可低频跑、L2 高频跑）。
+    pub fn outer_step(&mut self, _dt: Second, sp: &Setpoint, est: &VehicleState) -> (Quaternion, f32) {
         // ★§5.161 调用计数探针（唯一名 ✓ 查重名 ✓）
         unsafe {
             let c = crate::cost::knob_read(core::ptr::addr_of!(G_PID_CALLS));
@@ -777,10 +824,11 @@ impl Controller for PidController {
         let mut iy_final = clampf(self.i_xy[1] + self.ki_xy * ey * dt, -i_xy_max, i_xy_max);
         // ★§5.139 诊断旋钮覆盖（默认 -1 ⇒ 不覆盖 ✓）
         unsafe {
+            // ★C3：`G_ATT_KP` 现覆盖【姿态层 P `att_p`】、`G_ATT_KD` 覆盖【速率层 P `kp_rate`】
             let kp = crate::cost::knob_read(core::ptr::addr_of!(G_ATT_KP));
             let kd = crate::cost::knob_read(core::ptr::addr_of!(G_ATT_KD));
-            if kp > 0.0 { self.att_kp = kp; }
-            if kd > 0.0 { self.att_kd = kd; }
+            if kp > 0.0 { self.att_p = kp; }
+            if kd > 0.0 { self.kp_rate = kd; }
         }
         if !self.rate_mode_xy {
             let dx = pre_ix + ix_final;
@@ -1175,20 +1223,166 @@ impl Controller for PidController {
             q_des_thrust
         };
 
-        self.sp_yaw = sp.yaw.0; // 供内环做偏航速率前馈（见 prev_yaw 的说明）
-        self.control_attitude(_dt, q_des, des_thrust, est)
+        self.sp_yaw = sp.yaw.0; // 供姿态层做偏航速率前馈（见 prev_yaw 的说明）
+        (q_des, des_thrust)
     }
 
-    fn reset(&mut self) {
-        // 四元数误差内环无状态积分；清除垂向位置积分项防 windup 残留
-        self.iz = 0.0;
-        // 阶段 11-A：重置 EMA 滤波状态，避免跨任务/重启残留
-        self.filt_vd = 0.0;
-        self.filt_d = 0.0;
-        self.filt_w = [0.0; 3];
-        self.rate_filt_init = false;
-        self.filt_init = false;
-        self.dbg_step = 0;
+    /// ★design.md **L2 `wq:attitude`**：在外环产出的期望姿态上只加**姿态 P** → 速率设定值。
+    ///
+    /// 与 `outer_step` 拆开 ⇐ 二者归属不同层（外环 L3 / 姿态 L2），且可异频 ✓。
+    pub fn attitude_step(&mut self, _dt: Second, sp: &Setpoint, est: &VehicleState) -> RateSetpoint {
+        let (q_des, des_thrust) = self.outer_step(_dt, sp, est);
+        let rates = self.attitude_rates_sp(q_des, est, _dt);
+        RateSetpoint::new(rates, des_thrust)
+    }
+
+    /// ★C3 **速率层**（PX4 `mc_rate_control` 同构）：速率 PID + 混控 → 执行器指令。
+    ///
+    /// `omega` = 本拍实测机体角速率（rad/s）。高频路径由高频任务喂入**新鲜陀螺**；
+    /// 单拍回退路径由 [`control`](Controller::control) 喂入 EKF 估计值。`dt` = 本层周期。
+    pub fn rate_step(&mut self, dt: Second, rsp: &RateSetpoint, omega: [f32; 3]) -> ActuatorCmd {
+        let dt_s = dt.0;
+        // 速率低通（一阶，rate_lpf_tau；0=不过滤）：噪声直达 D 项会自激
+        let omega_f = if self.rate_lpf_tau > 0.0 {
+            let a = (dt_s / (self.rate_lpf_tau + dt_s)).clamp(0.0, 1.0);
+            if !self.rate_filt_init {
+                self.filt_w = omega;
+                self.rate_filt_init = true;
+            } else {
+                for k in 0..3 {
+                    self.filt_w[k] += a * (omega[k] - self.filt_w[k]);
+                }
+            }
+            self.filt_w
+        } else {
+            omega
+        };
+        // --- 速率层 P：`kp_rate·(rate_sp − ω)`（PX4 `RateControl` P ✓）---
+        let mut torque = [
+            self.kp_rate * (rsp.rates[0] - omega_f[0]),
+            self.kp_rate * (rsp.rates[1] - omega_f[1]),
+            self.kp_rate * (rsp.rates[2] - omega_f[2]),
+        ];
+        // --- 速率层 D：角加速度（LPF 后，PX4 `IMU_DGYRO_CUTOFF` ✓，§5.208）---
+        if self.dgyro_k != 0.0 && dt_s > 1e-6 {
+            if !self.dgyro_init {
+                self.prev_omega = omega_f;
+                self.dgyro_init = true;
+            }
+            let fc = if self.dgyro_cutoff > 0.0 { self.dgyro_cutoff } else { 20.0 };
+            let tau = 1.0 / (2.0 * core::f32::consts::PI * fc);
+            let a = (dt_s / (tau + dt_s)).clamp(0.0, 1.0);
+            for k in 0..3 {
+                let dw = (omega_f[k] - self.prev_omega[k]) / dt_s;
+                self.dgyro_filt[k] += a * (dw - self.dgyro_filt[k]);
+                torque[k] -= self.dgyro_k * self.dgyro_filt[k];
+            }
+            self.prev_omega = omega_f;
+        }
+        // --- 速率层 I：`ki·∫(rate_sp − ω)dt`（PX4 `RateControl` I ✓，§5.212/§5.214）---
+        if self.ki_rate != 0.0 && dt_s > 1e-6 {
+            for k in 0..3 {
+                let e = rsp.rates[k] - omega_f[k];
+                self.i_rate[k] = clampf(self.i_rate[k] + self.ki_rate * e * dt_s, -I_RATE_MAX, I_RATE_MAX);
+                torque[k] += self.i_rate[k];
+            }
+        }
+        // 偏航力矩输出低通（PX4 `MC_YAW_TQ_CUTOFF` ✓；默认关，§5.265）
+        if YAW_TQ_CUTOFF_HZ > 0.0 {
+            let dt_lp = dt_s.max(1e-6);
+            let rc = 1.0 / (2.0 * core::f32::consts::PI * YAW_TQ_CUTOFF_HZ);
+            let a = dt_lp / (dt_lp + rc);
+            if !self.yaw_tq_initialized {
+                self.yaw_tq_lpf = torque[2];
+                self.yaw_tq_initialized = true;
+            }
+            self.yaw_tq_lpf += a * (torque[2] - self.yaw_tq_lpf);
+            torque[2] = self.yaw_tq_lpf;
+        }
+        self.dbg_pqr = torque;
+        self.dbg_omega = omega;
+        unsafe {
+            (*core::ptr::addr_of_mut!(G_PID_ATT_DBG))[6] = rsp.thrust;
+        }
+        // 健康闸/未解锁 ⇒ 零输出（宿主置 `valid=false` ✓）
+        if !rsp.valid {
+            return ActuatorCmd::zero();
+        }
+        // --- 混控：X 型四旋翼（与旧实现一致 ✓）---
+        let des_thrust = rsp.thrust;
+        let motors = if self.mix_mode == 4 {
+            super::attitude::x4_mix_att_scale(des_thrust, torque)
+        } else if self.mix_mode == 3 {
+            super::attitude::x4_mix_px4_airmode(des_thrust, torque, true)
+        } else if self.mix_mode == 2 {
+            super::attitude::x4_mix_px4(des_thrust, torque)
+        } else if self.mix_mode == 1 {
+            super::attitude::x4_mix_sat(des_thrust, torque)
+        } else {
+            let m = super::attitude::x4_mix(des_thrust, torque);
+            [
+                clampf(m[0], 0.0, 1.0),
+                clampf(m[1], 0.0, 1.0),
+                clampf(m[2], 0.0, 1.0),
+                clampf(m[3], 0.0, 1.0),
+            ]
+        };
+        ActuatorCmd { motor: motors }
+    }
+
+    /// ★C3 **姿态层 P**：四元数姿态误差 → 速率设定值（rad/s，已按 `RATE_MAX_DPS` 限幅）。
+    ///
+    /// 与旧单层的关键差别 ✓：本层**不含** ω 反馈、D 项、I 项（那些全在速率层）——
+    /// 即 PX4 `AttitudeControl::update` 的"姿态 P → rate_setpoint"同构 ✓。
+    /// ★P0-3b：供 **L2 姿态层**（app `control`）直接调用 —— 只做姿态 P，期望姿态来自 L3 `nav` ✓。
+    pub fn attitude_rates_sp(&mut self, q_des: Quaternion, est: &VehicleState, dt: Second) -> [f32; 3] {
+        // 姿态误差向量：q_err = q_est⁻¹ ⊗ q_des，err ≈ 2·sign(w)·(x,y,z)（机体系 ✓）
+        let q_err = crate::vehicle::quat_mul(crate::vehicle::quat_conj(est.att), q_des);
+        let sgn = if q_err.w < 0.0 { -2.0 } else { 2.0 };
+        let err = [sgn * q_err.x, sgn * q_err.y, sgn * q_err.z];
+        // 姿态层 P：角度误差 → 速率设定值（rad/s）
+        let mut rates = [
+            self.att_p * err[0],
+            self.att_p * err[1],
+            self.att_p * YAW_P_SCALE * err[2],
+        ];
+        // 参考机体角速率前馈（PX4 `AttitudeControl::update` ✓；默认关 ✓，见 §5.256）
+        const ENABLE_YAW_RATE_FF: bool = false;
+        let yaw_sp = self.sp_yaw;
+        let yaw_rate = match self.prev_yaw {
+            Some(py) if dt.0 > 1e-6 => {
+                let mut d = yaw_sp - py;
+                while d > core::f32::consts::PI { d -= 2.0 * core::f32::consts::PI; }
+                while d < -core::f32::consts::PI { d += 2.0 * core::f32::consts::PI; }
+                d / dt.0
+            }
+            _ => 0.0,
+        };
+        self.prev_yaw = Some(yaw_sp);
+        if ENABLE_YAW_RATE_FF && yaw_rate.abs() > 1e-6 {
+            let w_ff = crate::vehicle::rotate_vec_by_quat_inverse(est.att, [0.0, 0.0, yaw_rate]);
+            for k in 0..3 {
+                rates[k] += w_ff[k]; // PX4：命令速率**单位前馈** ✓（旧单层为 ×att_kd）
+            }
+        }
+        // 速率指令限幅（PX4 `MC_*RATE_MAX` ✓，§5.267）：从源头切断"需求失控螺旋" ✓
+        for k in 0..3 {
+            let lim = RATE_MAX_DPS[k].to_radians();
+            if lim > 0.0 {
+                let v = rates[k];
+                rates[k] = if v > lim { lim } else if v < -lim { -lim } else { v };
+            }
+        }
+        self.dbg_err = err;
+        self.dbg_rate_sp = rates;
+        unsafe {
+            let d = core::ptr::addr_of_mut!(G_PID_ATT_DBG);
+            for k in 0..3 {
+                (*d)[k] = err[k];
+                (*d)[3 + k] = rates[k];
+            }
+        }
+        rates
     }
 }
 
@@ -1215,7 +1409,7 @@ impl PidController {
     /// `control()` 内部调用本方法，**行为逐位不变**（纯提取，无逻辑改动）。
     ///
     /// 链路：`omega` 一阶低通 → `attitude_rates`（四元数误差 P-D → 期望机体角速率）
-    /// → `x4_mix` → 限幅。注意此处**无独立速率 PID**：角速率指令直接进混控。
+    /// → `x4_mix` → 限幅。★C3 起**已有独立速率层**（见 `rate_step` ✓）：本方法 = 姿态层 P + 速率层（单拍）。
     pub fn control_attitude(
         &mut self,
         _dt: Second,
@@ -1223,212 +1417,9 @@ impl PidController {
         des_thrust: f32,
         est: &VehicleState,
     ) -> ActuatorCmd {
-        let dt = _dt.0;
-        // --- 内环：四元数姿态误差 -> 期望机体角速度（标准鲁棒写法，无欧拉角奇点） ---
-        // 复用共享姿态内环 `attitude::attitude_rates`（P3-A3 提取，与 TECS 完全一致）。
-        // 含：q_err = q_est^-1 ⊗ q_des、误差旋转向量 ≈ 2·sign(w)·(x,y,z)、
-        //     期望机体角速度 = Kp_att·误差向量 - Kd_att·当前角速度（阻尼）。
-        // 速率环低通：omega 直接来自 EKF(gyro-bias)，噪声直达内环 D 项会自激。
-        // 一阶低通 rate_lpf_tau（0=不过滤）。首帧直接赋值避免启动瞬态。
-        let omega_f = if self.rate_lpf_tau > 0.0 {
-            let a = (dt / (self.rate_lpf_tau + dt)).clamp(0.0, 1.0);
-            if !self.rate_filt_init {
-                self.filt_w = [est.omega[0].0, est.omega[1].0, est.omega[2].0];
-                self.rate_filt_init = true;
-            } else {
-                for k in 0..3 {
-                    self.filt_w[k] += a * (est.omega[k].0 - self.filt_w[k]);
-                }
-            }
-            self.filt_w
-        } else {
-            [est.omega[0].0, est.omega[1].0, est.omega[2].0]
-        };
-        // ★★§5.257【对齐 PX4 分轴增益比 ✓】`MC_YAWRATE_P / MC_ROLLRATE_P` = 0.2/0.15 = **1.3333**
-        //   （一手 `mc_rate_control_params.yaml` ✓）⇒ yaw 的 P 通道按此比例放大 ✓
-        //   （我仓原为三轴同增益 ✗ ⇒ yaw 权限比 PX4 惯例低 25% ✗）
-        //   （用**编译期常量**而非旋钮 ✓ —— 避免触发 §5.204 热路径旋钮读守卫 ✗；A/B 改此值 ✓）
-        const YAW_P_SCALE_DEFAULT: f32 = YAW_P_SCALE;
-        let kp_yaw_scale = YAW_P_SCALE_DEFAULT;
-        let mut att_out = super::attitude::attitude_rates_axis2(
-            est.att,
-            q_des,
-            self.att_kp,
-            self.att_kd,
-            omega_f,
-            kp_yaw_scale,
-            YAW_D_SCALE,
-        );
-        // ★★§5.208【对齐 PX4 `IMU_DGYRO_CUTOFF` ✓】角加速度 D（lead）：
-        //   `rates -= dgyro_k · LPF20Hz(dω/dt)` ✓ —— 符号与 `−att_kd·ω` 同源：
-        //   姿态误差的 1 阶导 ≈ −ω ⇒ D 项 `−kd·ω` ✓；2 阶导 ≈ −dω/dt ⇒ `−k·dω/dt` ✓。
-        //   `dgyro_k == 0` ⇒ 整段跳过（**逐位不变** ✓）。
-        if self.dgyro_k != 0.0 && dt > 1e-6 {
-            if !self.dgyro_init {
-                self.prev_omega = omega_f; // 首帧直接赋值，避免启动瞬态 ✓
-                self.dgyro_init = true;
-            }
-            let fc = if self.dgyro_cutoff > 0.0 { self.dgyro_cutoff } else { 20.0 };
-            let tau = 1.0 / (2.0 * core::f32::consts::PI * fc);
-            let a = (dt / (tau + dt)).clamp(0.0, 1.0); // 与 rate_lpf_tau 同法 ✓
-            for k in 0..3 {
-                let dw = (omega_f[k] - self.prev_omega[k]) / dt;
-                self.dgyro_filt[k] += a * (dw - self.dgyro_filt[k]);
-                att_out.rates[k] -= self.dgyro_k * self.dgyro_filt[k];
-            }
-            self.prev_omega = omega_f;
-        }
-
-        // ★★§5.212【速率环 I（PX4 串级结构 ✓）】——消掉**稳态配平**：
-        //   恒速偏航/侧滑需要非零力矩（气动阻尼、重心偏移、电机不均 ✓）
-        //   ⇒ 只用姿态 P 的稳态误差去顶 ⇒ 实测**偏航滞后 11.5°** ✗
-        //   本项把该误差**积掉** ⇒ 姿态误差 →0 ✓（等价 PX4 `rate_control` 的 I 通道 ✓）
-        //   `ki_rate == 0` ⇒ 整段跳过（**逐位不变** ✓）。
-        if self.ki_rate != 0.0 && dt > 1e-6 {
-            // 抗饱和：与 `i_v_xy` 同法（幅值夹紧 ✓）；上限取 2.0 rad/s
-            //（实测配平量级 `r_trim≈1.7·ψ̇` ⇒ 1 rad/s 偏航下 ≈1.7 ✓ ⇒ 2.0 留余量 ✓）
-            for k in 0..3 {
-                let e = att_out.rates[k] - omega_f[k]; // 速率指令 − 实测（同为机体系 ✓）
-                self.i_rate[k] = clampf(self.i_rate[k] + self.ki_rate * e * dt, -I_RATE_MAX, I_RATE_MAX);
-                att_out.rates[k] += self.i_rate[k];
-            }
-        }
-
-        // ---- **参考机体角速度前馈**（PX4 `MC_REF_FF` 同构）----------------------
-        //
-        // 期望姿态随时间旋转时（偏航速率 `ψ̇`），机体**本就该**以 `R^T·(0,0,ψ̇)` 的角速度
-        // 旋转 ⇒ 这部分应由**前馈**给出，而不是留给 P 项"追" ✗。
-        // 不加前馈时（实测）：切向偏航（1 rad/s）下姿态环持续要求大幅差动 ⇒ 单电机贴边
-        // **99.5%** 的时间 ⇒ 高度掉 10.002m、水平掉 10~13m ✗。
-        let yaw_sp = self.sp_yaw;
-        let yaw_rate = match self.prev_yaw {
-            Some(py) if dt > 1e-6 => {
-                let mut d = yaw_sp - py;
-                // 归一到 [-π, π]，避免跨 ±π 的假大速率
-                while d > core::f32::consts::PI { d -= 2.0 * core::f32::consts::PI; }
-                while d < -core::f32::consts::PI { d += 2.0 * core::f32::consts::PI; }
-                d / dt
-            }
-            _ => 0.0,
-        };
-        self.prev_yaw = Some(yaw_sp);
-        // ⚠️ **默认关闭（2026-09-21）**：本次实现使结果**更差** ✗
-        //   切向偏航稳态 17.850m -> **23.449m**、饱和 99.5% -> **100.0%** ✗
-        // ⇒ **符号/轴又错了**（本区域第 4 个约定问题 ✗）。
-        // 按纪律：不留更差的实现，故做成开关并默认关。
-        // **下一步**：为"参考角速度前馈"写**零件级自检**（与姿态构造那次同法 ✓——
-        // 那次迭代 3 轮才成功 ✓）：给定已知偏航速率，断言前馈向量在**机体轴**上的
-        // 方向与量级（本仓机体系非标准 FRD，不能照搬教科书的 R^T·(0,0,ψ̇)）。
-        // ⚠️ **两次实现均未改善，默认关闭**（2026-09-21）：
-        //   ① 加到输出（裸 rad/s）：17.850 → 23.449m、饱和 99.5% → 100.0% ✗
-        //   ② 并入 D 项输入（×att_kd，量纲正确）：19.031m、饱和 99.8% ✗
-        // ⇒ 即便量纲修对了也不改善 ⇒ 说明**饱和不是来自"速率环抵抗被命令旋转"** ✗，
-        //   或 `ω_ff` 的**方向/符号本身是错的** ✗（从未验证 —— 我又跳过了自检 ✗）。
-        //
-        // **教训（本会话第 N 次）**：姿态构造那次**先写零件级自检**，3 轮就成功 ✓；
-        // 这两次**跳过自检直接改闭环**，两次都失败且**无从判断** ✗。
-        // ⇒ 下一步必须先写自检：给定已知 ψ̇，断言 `ω_ff` 在**机体三轴**上的分量
-        //   （符号与量级），且**独立于实现推导**（否则会再犯"自洽地一起错" ✗）。
-        //
-        // **正确位置（供自检通过后参考）：并入 D 项的输入，不是加到输出**
-        //
-        // 量纲分析：`att_out.rates = att_kp·err − att_kd·ω` 直接送混控 ⇒ 是"力矩量纲" ✗。
-        // ① 裸加 rad/s 是量纲错 ✗（上一轮实测：17.850m → 23.449m、饱和 99.5% → 100.0%）；
-        // ② 且**恒速旋转本来不需要力矩** ⇒ 往输出端加前馈物理上就不对 ✗。
-        //
-        // 真正的病：D 项 `−att_kd·ω` **对抗被命令的旋转** —— 偏航以 1 rad/s 旋转 ⇒ `ω` 大
-        // ⇒ D 项持续索要大差动 ⇒ **单电机贴边 99.5%** ✗。
-        // 正解：D 项应阻尼**相对被命令速率**的偏差 ⇒ `−att_kd·(ω − ω_ff)`，
-        // 等价于 `rates += att_kd · ω_ff` ✓ —— **量纲正确**（Kd 的量纲 × rad/s ✓），
-        // 且"零姿态误差 + 零角速度"时输出仍为零 ✓（不破坏基本性质）。
-        const ENABLE_YAW_RATE_FF: bool = false;
-        if ENABLE_YAW_RATE_FF && yaw_rate.abs() > 1e-6 {
-            let w_ff = crate::vehicle::rotate_vec_by_quat_inverse(est.att, [0.0, 0.0, yaw_rate]);
-            for k in 0..3 {
-                att_out.rates[k] += self.att_kd * w_ff[k];
-            }
-        }
-        // ★★§5.267【PX4 一手：速率指令限幅 ✓（切断"需求失控"螺旋 ✓）】
-        //   `RATE_MAX_DPS > 0` ⇒ 对速率指令逐轴钳位 ✓（PX4 `MC_*RATE_MAX`，unit deg/s ✓）
-        for k in 0..3 {
-            let lim = RATE_MAX_DPS[k].to_radians();
-            if lim > 0.0 {
-                let v = att_out.rates[k];
-                att_out.rates[k] = if v > lim { lim } else if v < -lim { -lim } else { v };
-            }
-        }
-        // ★★§5.265【PX4 一手：偏航力矩输出低通 ✓】`MC_YAW_TQ_CUTOFF`（默认 2.0 Hz ✓）
-        //   一手语义 ✓：抑制"**旋翼加速引起的高频偏航力矩**" ✓（`MulticopterRateControl.cpp:235` ✓）
-        //   本仓实现 ✓：对 yaw 通道的**控制输出**（= 力矩量纲 ✓，送混控 ✓）做一阶低通 ✓
-        //   `YAW_TQ_CUTOFF_HZ <= 0` ⇒ **完全旁路** ✓（逐位不变 ✓）
-        if YAW_TQ_CUTOFF_HZ > 0.0 {
-            let dt_s = _dt.0.max(1e-6); // `_dt` = control 周期（Second ✓）
-            let rc = 1.0 / (2.0 * core::f32::consts::PI * YAW_TQ_CUTOFF_HZ);
-            let a = dt_s / (dt_s + rc);
-            if !self.yaw_tq_initialized {
-                self.yaw_tq_lpf = att_out.rates[2];
-                self.yaw_tq_initialized = true;
-            }
-            self.yaw_tq_lpf += a * (att_out.rates[2] - self.yaw_tq_lpf);
-            att_out.rates[2] = self.yaw_tq_lpf;
-        }
-        self.dbg_err = att_out.err;
-        self.dbg_pqr = att_out.rates;
-        unsafe {
-            // ★§5.161 探针写入（唯一名 ✓）：[0..3)=err(机体系) [3..6)=rates [6]=thrust
-            let d = core::ptr::addr_of_mut!(G_PID_ATT_DBG);
-            for k in 0..3 {
-                (*d)[k] = att_out.err[k];
-                (*d)[3 + k] = att_out.rates[k];
-            }
-            (*d)[6] = des_thrust;
-        }
-        unsafe {
-            // ★§5.159 探针：[0..3)=err（机体轴） [3..6)=rates(p,q,r) [6]=des_thrust
-            let d = core::ptr::addr_of_mut!(G_PID_ATT_DBG);
-            for k in 0..3 {
-                (*d)[k] = att_out.err[k];
-                (*d)[3 + k] = att_out.rates[k];
-            }
-            (*d)[6] = des_thrust;
-        }
-        self.dbg_omega = [est.omega[0].0, est.omega[1].0, est.omega[2].0];
-
-        // --- 混控：X 型四旋翼（0=前右 1=后左 2=前左 3=后右） ---
-        // 复用共享混控 `attitude::x4_mix`（P3-A3 提取，与 TECS 完全一致）。
-        // 布局与符号（含 yaw 取 +r_cmd 的符号修正）见 attitude.rs 混控注释；
-        // 控制器命令 (p_cmd,q_cmd,r_cmd) 定义在飞控机体轴（NED/FRD：前-X 右-Y 下-Z）。
-        // ★★§5.215：`mix_sat=true` ⇒ **推力优先**的饱和管理 ✓（差动塞不下时绕均值缩放 ⇒
-        //   **均值/总推力精确保住** ✓，代价是短时牺牲姿态权限 ✓）；
-        //   `false` ⇒ 原路径（四路各自 clamp ✗ ⇒ 触界时均值丢失 ⇒ 掉高 ✗）**逐位不变** ✓
-        let motors = if self.mix_mode == 4 {
-            // ✗§5.269【**已实测否决** ✗：姿态等比缩放分配】—— 保留为可选档（A/B 用 ✓）
-            //   实测 ✓：guidance 15/0 → **13/2** ✗、att_ctrl 18/0 → **10/8** ✗✗
-            //   原因 ✓：**等比缩放会全局削弱姿态权限** ✗ ⇒ 而"姿态优先"对稳定性是**必需的** ✓
-            //   ⇒ ★该否定结果**反证了 PX4 顺序去饱和设计（姿态优先）的正确性** ✓
-            super::attitude::x4_mix_att_scale(des_thrust, att_out.rates)
-        } else if self.mix_mode == 3 {
-            // ★★§5.255【PX4 `mixAirmodeRP`（`MC_AIRMODE=1` ✓）】—— 允许抬高推力换姿态权限 ✓
-            //   与 `mix_mode == 2`（= PX4 `mixAirmodeDisabled` ✓ 默认 ✓）的唯一差异 ✓：
-            //     混【含 yaw】✓ + 推力去饱和**无 increase_only** ✓ + yaw 最后去饱和 ✓
-            super::attitude::x4_mix_px4_airmode(des_thrust, att_out.rates, true)
-        } else if self.mix_mode == 2 {
-            // ★★§5.216：PX4 一手同构（姿态优先 ✓）
-            super::attitude::x4_mix_px4(des_thrust, att_out.rates)
-        } else if self.mix_mode == 1 {
-            // §5.215：保推力缩放（实测更差 ✗，留档）
-            super::attitude::x4_mix_sat(des_thrust, att_out.rates)
-        } else {
-            let m = super::attitude::x4_mix(des_thrust, att_out.rates);
-            [
-                clampf(m[0], 0.0, 1.0),
-                clampf(m[1], 0.0, 1.0),
-                clampf(m[2], 0.0, 1.0),
-                clampf(m[3], 0.0, 1.0),
-            ]
-        };
-
-        ActuatorCmd { motor: motors }
+        let rates = self.attitude_rates_sp(q_des, est, _dt);
+        self.rate_step(_dt, &RateSetpoint { rates, thrust: des_thrust, valid: true },
+                       [est.omega[0].0, est.omega[1].0, est.omega[2].0])
     }
 }
 
@@ -1456,10 +1447,10 @@ mod dgyro_tests {
             let _ = c.control_attitude(Second(dt), est.att, 0.5, &est);
         }
         let t = n as f32 * dt;
-        // ★解析必须含**全部**输出分量（第一版漏了 `−att_kd·ω` 那一路 ⇒ 自检当场抓出 ✗✓）：
-        //   w_sp = att_kp·0 − att_kd·ω − dgyro·(dω/dt=0) = −att_kd·(−e) = att_kd·e
-        //   e_rate = w_sp − ω = att_kd·e + e = e·(1 + att_kd) ✓
-        let ana = ki * e * (1.0 + c.att_kd) * t;
+        // ★C3 串级：速率层 I 的误差 = `rate_sp − ω`（**不含 D/ω 折叠**，PX4 `RateControl` 同构 ✓）。
+        //   本例 `rate_sp = att_p·err = 0`（姿态无误差）、`ω = −e` ⇒ `e_rate = +e`
+        //   ⇒ `i = ki·e·t`（解析 ✓）。
+        let ana = ki * e * t;
         let got = c.rate_integral()[0];
         assert!(
             (got - ana).abs() < 0.15 * ana,
@@ -1525,8 +1516,9 @@ mod dgyro_tests {
             let w = a_amp * (w0 * t).sin();
             est.omega = [RadianPerSecond(w), RadianPerSecond(0.0), RadianPerSecond(0.0)];
             let _ = c.control_attitude(Second(dt), est.att, 0.5, &est);
-            // 输出 = −att_kd·ω − k·LPF(dω/dt) ⇒ 反解出 D 项 ✓
-            let d_meas = -(c.dbg_pqr[0] + c.att_kd * w) / k;
+            // 输出（速率层）= kp_rate·(rate_sp−ω) − k·LPF(dω/dt)，本例 rate_sp=0
+            //   ⇒ 反解出 D 项 ✓
+            let d_meas = -(c.dbg_pqr[0] + c.kp_rate * w) / k;
             let d_ana = a_amp * w0 * hmag * (w0 * t - (w0 / wc).atan()).cos();
             if i > n / 2 {
                 max_meas = max_meas.max(d_meas.abs());
@@ -1565,5 +1557,80 @@ mod dgyro_tests {
             let _ = c1.control_attitude(Second(dt), est2.att, 0.5, &est2);
             assert_eq!(c0.dbg_pqr, c1.dbg_pqr, "k=0 必须与不启用**逐位相同** ✓");
         }
+    }
+}
+
+/// ★C3 串级（PX4 双模块同构）零件级自检：
+///  姿态层只出速率设定值（可限幅）；速率层才算 P/I/D + 混控。
+#[cfg(test)]
+mod cascade_tests {
+    use super::*;
+    use crate::units::{RadianPerSecond, Second};
+
+    /// 姿态层：`rate_sp = att_p·err`，并受 `RATE_MAX_DPS` 逐轴限幅。
+    #[test]
+    fn attitude_layer_emits_limited_rate_setpoint() {
+        use crate::units::Radian;
+        let mut c = PidController::default_quad();
+        c.rate_lpf_tau = 0.0;
+        // 大姿态误差：期望姿态 = 绕 X 轴 90°（err ≈ 1.0 rad ⇒ att_p·err = 10 rad/s ≫ 限幅）
+        let q_des = Quaternion::from_axis_angle([1.0, 0.0, 0.0], Radian(core::f32::consts::FRAC_PI_2));
+        let est = crate::vehicle::VehicleState::zero();
+        let rates = c.attitude_rates_sp(q_des, &est, Second(0.004));
+        let lim0 = RATE_MAX_DPS[0].to_radians();
+        assert!((rates[0] - lim0).abs() < 1e-3, "roll 速率指令应限幅到 {lim0} ✓ 实得 {}", rates[0]);
+        assert!(rates[1].abs() < 1e-3 && rates[2].abs() < 1e-3, "其余轴应≈0 ✓");
+        // 无线限幅时：小误差 ⇒ rate_sp = att_p·err（≈ att_p·2·sin(θ/2)）
+        let q_small = Quaternion::from_axis_angle([1.0, 0.0, 0.0], Radian(0.01));
+        let r_small = c.attitude_rates_sp(q_small, &est, Second(0.004));
+        let expect = c.att_p * 2.0 * (0.01f32 / 2.0).sin();
+        assert!((r_small[0] - expect).abs() < 1e-4, "姿态层 P 应为 att_p·err ✓");
+    }
+
+    /// 速率层：P 项 `kp_rate·(rate_sp − ω)`；`ki=kd=0` 时逐项可解析核对。
+    #[test]
+    fn rate_layer_p_is_kp_rate_times_error() {
+        let mut c = PidController::default_quad();
+        c.rate_lpf_tau = 0.0;
+        c.set_dgyro(0.0, 20.0);
+        c.set_ki_rate(0.0);
+        let rsp = RateSetpoint::new([1.0, -2.0, 0.5], 0.5);
+        let omega = [0.2f32, -0.1, 0.3];
+        let _ = c.rate_step(Second(0.001), &rsp, omega);
+        let expect = [
+            c.kp_rate * (1.0 - 0.2),
+            c.kp_rate * (-2.0 + 0.1),
+            c.kp_rate * (0.5 - 0.3),
+        ];
+        for k in 0..3 {
+            assert!((c.dbg_pqr[k] - expect[k]).abs() < 1e-6, "轴{k} 速率层 P 不符 ✓");
+        }
+    }
+
+    /// 速率层 I：恒定速率误差 ⇒ `i = ki·e·t`（与 dt 无关 ✓），且在 **1kHz** 下同样成立。
+    #[test]
+    fn rate_layer_i_integrates_at_1khz() {
+        let dt = 0.001f32; // ★1kHz 速率层
+        let (ki, e) = (2.0f32, 0.1f32);
+        let mut c = PidController::default_quad();
+        c.rate_lpf_tau = 0.0;
+        c.set_dgyro(0.0, 20.0);
+        c.set_ki_rate(ki);
+        let rsp = RateSetpoint::new([0.0, 0.0, 0.0], 0.5);
+        let omega = [-e, 0.0, 0.0]; // rate_error = 0 − (−e) = +e
+        let n = 2000usize;
+        for _ in 0..n {
+            let _ = c.rate_step(Second(dt), &rsp, omega);
+        }
+        let ana = ki * e * (n as f32 * dt);
+        assert!((c.rate_integral()[0] - ana).abs() < 0.15 * ana, "1kHz 速率层 I 积分不符 ✓");
+    }
+
+    /// `valid=false` ⇒ 速率层零输出（健康/解锁闸 ✓）。
+    #[test]
+    fn invalid_rate_setpoint_zeroes_output() {
+        let mut c = PidController::default_quad();
+        let cmd = c.rate_step(Second(0.001), &RateSetpoint::INVALID, [1.0, 1.0, 1.0]);
+        assert_eq!(cmd.motor, [0.0; 4], "无效设定值必须零输出 ✓");
     }
 }

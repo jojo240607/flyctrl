@@ -12,6 +12,8 @@ pub mod cost;
 pub mod math;
 pub mod units;
 pub mod filter;
+pub mod imu_ring;
+pub mod imu_filters;
 pub mod state;
 pub mod vehicle;
 pub mod config;
