@@ -96,6 +96,30 @@ static mut LAST_PC_SEQ: u32 = 0;
 /// 最近注入的加速度 z（供 diag 区回显）。
 static mut LAST_ACCEL_Z: f32 = 0.0;
 
+/// ★修复 C1：把注入的 IMU 样本推入 `IMU_RING`（与 L0 ISR 路径同语义）。
+fn push_imu_ring(gyr: &[f32; 3], acc: &[f32; 3]) {
+    static mut TS: u32 = 0;
+    static mut HAS: bool = false;
+    unsafe {
+        let ts = rtos_app_sdk::rtos::cycle_now();
+        let raw_dt = (ts.wrapping_sub(TS)) as f32 / 168_000_000.0;
+        if HAS && !(raw_dt > 1e-5 && raw_dt < 0.05) {
+            TS = ts; // 重同步，丢弃异常帧（同 ISR 单调性检查）
+            return;
+        }
+        let dt = if HAS { raw_dt } else { 0.004 };
+        HAS = true;
+        TS = ts;
+        let r = &mut *core::ptr::addr_of_mut!(crate::flyctrl::IMU_RING);
+        r.push(flyctrl_core::imu_ring::ImuDelta {
+            delta_ang: [gyr[0] * dt, gyr[1] * dt, gyr[2] * dt],
+            delta_vel: [acc[0] * dt, acc[1] * dt, acc[2] * dt],
+            dt,
+            ts_cyc: ts,
+        });
+    }
+}
+
 fn rd_u32(off: usize) -> u32 {
     unsafe { read_volatile((SHM_BASE + off) as *const u32) }
 }
@@ -188,6 +212,11 @@ pub fn shmem_poll_once() {
                 RadianPerSecond(gyr[2]),
             ],
         });
+        // ★修复 C1：HIL 构建里 `imu_sample_step()`（唯一填 `IMU_RING` 的 L0 ISR 路径）
+        //   被 `cfg(not(feature="hil"))` 编译掉 ⇒ 环恒空 ⇒ 速率环取 `[0,0,0]` 陀螺
+        //   ⇒ 误以为不转动 ⇒ 满推 ⇒ 姿态发散（实测 `roll=-1.572`）。
+        //   故由**注入路径**补上推环（与 ISR 同语义：硬件戳 + 实测 dt + 单调性检查）。
+        push_imu_ring(&gyr, &acc);
         f.baro_alt = Some(baro);
         f.gps = if gps_valid {
             Some(PosSample::with_vel(

@@ -874,11 +874,11 @@ pub fn uplink_step() {
         #[cfg(not(feature = "usb-link"))]
         let _ = (&tx, &mut rx_buf);
 
-        // HIL 共享内存直连（SRAM3）：PC 仿真器每 4ms 写 pc_seq，本任务 1ms 轮询
-        // 检测变化后全量注入 SENSOR_FRAME 并唤醒 control。与 USB 注入并存：
-        // 有 magic 且 pc_seq 变化即注入，无则静默（USB 路径不受影响）。
-        #[cfg(feature = "hil")]
-        crate::flyctrl::hil_shmem::shmem_poll_once();
+        // ★变更：HIL 共享内存注入已移到 **L1 `rate` 环（1kHz）**（见 `rate_task.rs`）——
+        //   原因：① 本 item 仅 50Hz ⇒ 1kHz 速率环拿到 20ms 滞后陀螺 ⇒ 振荡；
+        //   ② 保持 `SENSOR_FRAME` **单写者**（seqlock）不变式 ✗ 双写（此处删，只留 rate 环）。
+        #[cfg(all(feature = "hil", not(feature = "hil-shmem-here")))]
+        let _ = &mut loops;
 
         // 参数流水：每次循环最多发一条，避免单次 burst 占满 USB 下行缓冲。
         if G_PARAM_REQ.load(Ordering::Relaxed) {

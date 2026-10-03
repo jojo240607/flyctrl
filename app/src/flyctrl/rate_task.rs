@@ -80,13 +80,30 @@ pub extern "C" fn rate_entry(_arg: *mut c_void) {
         };
         // 新鲜原始陀螺（≈ PX4 `vehicle_angular_velocity` ✓；`rate_step` 内部做 rate_lpf/dgyro 滤波 ✓）。
         // ★design.md §7：取 `IMU_RING` 最新陀螺（带硬件戳；不再读原始帧）。
-        let (gyro, dt) = unsafe {
+        // ★design.md §7：取 `IMU_RING` 最新陀螺（带硬件戳）。
+        let sample_dt = unsafe {
             let r = &*core::ptr::addr_of!(crate::flyctrl::IMU_RING);
             match r.latest() {
-                Some(d) => (d.gyro(), Second(d.dt)),
-                None => ([0.0; 3], Second(0.001)),
+                Some(d) => d.dt,
+                None => 0.001,
             }
         };
+        let gyro = unsafe {
+            let r = &*core::ptr::addr_of!(crate::flyctrl::IMU_RING);
+            match r.latest() {
+                Some(d) => d.gyro(),
+                None => [0.0; 3],
+            }
+        };
+        // ★修复 C2：速率环是**离散控制器**，dt 必须用【本环迭代间隔】（tick 实测），
+        //   不能用 IMU 样本 dt —— 样本率 < 环频率时会把同一增量积分 N 倍（过积分）。
+        //   PX4 同构：HRT 速率环的 dt 就是环周期。样本 dt 仍供 EKF 逐样本 predict 用 ✓。
+        let _ = sample_dt;
+        let dt = Second((period_ticks.clamp(1, 20)) as f32 / 1000.0);
+        // ★修复 C1 配套：HIL 无 DRDY ISR ⇒ 由本环（1kHz）驱动共享内存注入，
+        //   否则注入仅在 50Hz uplink item ⇒ 1kHz 环拿到 20ms 滞后陀螺 ⇒ 振荡发散。
+        #[cfg(feature = "hil")]
+        crate::flyctrl::hil_shmem::shmem_poll_once();
 
         // 地面站参数即时生效（速率层增益 ✓）。
         crate::flyctrl::uplink::sync_gains_to_pid(&mut pid);
