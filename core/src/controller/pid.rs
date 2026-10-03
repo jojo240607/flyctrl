@@ -251,6 +251,21 @@ pub const YAW_D_SCALE: f32 = 1.0;
 ///   · 动机（本仓实测 ✓）：激进轨迹饱和 94~100% ✗、切向偏航族 ✗ —— 偏航与推力争权限 ✓
 ///   · `0.0` ⇒ **完全旁路** ✓（逐位不变 ✓）；`>0` 为 A/B 目标值 ✓
 pub const YAW_TQ_CUTOFF_HZ: f32 = 0.0;
+
+/// ★★§5.267【PX4 一手：**速率指令限幅** ✓】`MC_ROLLRATE_MAX` / `MC_PITCHRATE_MAX` / `MC_YAWRATE_MAX`
+///   （一手 `mc_att_control_params.yaml` ✓，unit = **deg/s** ✓；yaw 默认 **200 °/s** ✓）
+///   动机（本仓**量化实测** ✓，§5.266 ✓）：两个超包线场景下控制律需求的速率达
+///     **9.277 rad/s = 532°/s** ✗ ⇒ **远超** PX4 的 200°/s 上限 ✓ ⇒
+///     ⇒ 即"**不可达需求下的需求失控**"（权限丧失 → 误差增大 → P 项需求更大 → 正反馈 ✓）
+///   ⇒ PX4 用该限幅从**源头**截断该螺旋 ✓（我仓原只有积分限幅 `I_RATE_MAX` ✗，管不住 P 项 ✓）
+///   ★★实测采纳 ✓（一手默认 ✓ + 本仓实测 ✓）：
+///     · 启用后 guidance **15/0** ✓ · att_ctrl **18/0** ✓（**零破坏** ✓）· H 场全绿 ✓
+///     · yaw 权限缺口 **9.277 → 3.454 rad/s** ✓（**2.7×** ✓，正是钳到 200°/s ✓）
+///     · 两个超包线登记项略改善 ✓（切向稳态 18.845→18.620m ✓、偏航误差 172.1→170.9° ✓）
+///   ⇒ 与 PX4 **同默认启用** ✓（从**源头**切断"需求失控螺旋" ✓）
+///   ⚠️仍不足以让超包线项回到包线内 ✓（根本权限仍缺 ✓，缺口仍 >1 rad/s ✓）—— 但**零代价** ✓
+///   `0.0` ⇒ 不限（逐位不变 ✓，A/B 用 ✓）；`>0` ⇒ 该值（deg/s ✓，内部转 rad/s ✓）
+pub const RATE_MAX_DPS: [f32; 3] = [220.0, 220.0, 200.0]; // [roll, pitch, yaw] = **PX4 一手默认** ✓
 // ★★§5.265【实测结论 ✓：方向已扫（4 档 ✓），当前结构下**保持关** ✓】
 //   一手 ✓：PX4 `MC_YAW_TQ_CUTOFF` 默认 **2.0 Hz** ✓（`mc_rate_control_params.yaml` ✓），
 //     语义原文 ✓（`MulticopterRateControl.cpp:235`）："apply low-pass filtering on yaw axis to
@@ -1331,6 +1346,15 @@ impl PidController {
             let w_ff = crate::vehicle::rotate_vec_by_quat_inverse(est.att, [0.0, 0.0, yaw_rate]);
             for k in 0..3 {
                 att_out.rates[k] += self.att_kd * w_ff[k];
+            }
+        }
+        // ★★§5.267【PX4 一手：速率指令限幅 ✓（切断"需求失控"螺旋 ✓）】
+        //   `RATE_MAX_DPS > 0` ⇒ 对速率指令逐轴钳位 ✓（PX4 `MC_*RATE_MAX`，unit deg/s ✓）
+        for k in 0..3 {
+            let lim = RATE_MAX_DPS[k].to_radians();
+            if lim > 0.0 {
+                let v = att_out.rates[k];
+                att_out.rates[k] = if v > lim { lim } else if v < -lim { -lim } else { v };
             }
         }
         // ★★§5.265【PX4 一手：偏航力矩输出低通 ✓】`MC_YAW_TQ_CUTOFF`（默认 2.0 Hz ✓）
