@@ -19,7 +19,7 @@ use flyctrl_core::estimator::select::AnyEstimator;
 use flyctrl_core::hil::{HilContext, SimImu};
 use flyctrl_core::units::Second;
 
-use rtos_app_sdk::abi::{rtos_timer_t, rtos_work_t, slot};
+use rtos_app_sdk::abi::{rtos_work_t, slot};
 use rtos_app_sdk::info;
 use rtos_app_sdk::rtos::msleep;
 
@@ -52,9 +52,6 @@ static mut TELEM_ITEM: rtos_work_t = unsafe { core::mem::zeroed() };
 static mut UPLINK_ITEM: rtos_work_t = unsafe { core::mem::zeroed() };
 /// ★design.md §6：日志 WorkItem（L3「事件驱动·可丢弃」）—— 取代独立 log 线程 ✓。
 static mut LOG_ITEM: rtos_work_t = unsafe { core::mem::zeroed() };
-static mut WQ_TIMER: MaybeUninit<rtos_timer_t> = MaybeUninit::uninit();
-static mut L3_TIMER: MaybeUninit<rtos_timer_t> = MaybeUninit::uninit();
-static mut EST_TIMER: MaybeUninit<rtos_timer_t> = MaybeUninit::uninit();
 
 /// L2 WorkItem：estimator（EKF/FDIR 一拍）。
 extern "C" fn estimator_work(_arg: *mut c_void) {
@@ -156,31 +153,7 @@ extern "C" fn uplink_work(_arg: *mut c_void) {
 /// L3 WorkItem：uplink（usb0 非阻塞轮询 + MAVLink 上行）。
 
 
-/// L3 50Hz 定时器回调：提交 nav item。
-extern "C" fn tick_l3_cb(_t: *mut rtos_timer_t, _arg: *mut c_void) {
-    if let Some(f) = slot().work_submit_q {
-        // ★design.md §6：日志归 L3（"事件驱动·可丢弃"，不占独立线程 ✓）
-        f(Q_L3, unsafe { core::ptr::addr_of_mut!(LOG_ITEM) });
-        f(Q_L3, unsafe { core::ptr::addr_of_mut!(NAV_ITEM) });
-        f(Q_L3, unsafe { core::ptr::addr_of_mut!(TELEM_ITEM) });
-        f(Q_L3, unsafe { core::ptr::addr_of_mut!(UPLINK_ITEM) });
-    }
-}
 
-/// ★design.md §5：**attitude 250Hz** 定时器 —— 只提交姿态 item（200µs 预算）。
-extern "C" fn tick_cb(_t: *mut rtos_timer_t, _arg: *mut c_void) {
-    if let Some(f) = slot().work_submit_q {
-        f(Q_L2, unsafe { core::ptr::addr_of_mut!(ATT_ITEM) });
-    }
-}
-
-/// ★design.md §5：**estimator 200Hz + sensors 200Hz** 定时器 —— 提交 EKF 与慢传感器 item。
-extern "C" fn tick_est_cb(_t: *mut rtos_timer_t, _arg: *mut c_void) {
-    if let Some(f) = slot().work_submit_q {
-        f(Q_L2, unsafe { core::ptr::addr_of_mut!(EKF_ITEM) });
-        f(Q_L2, unsafe { core::ptr::addr_of_mut!(SENSORS_ITEM) });
-    }
-}
 
 /// ★装配（在**大栈 setup 任务**里调用：构造 `HilContext` 瞬时值需要栈）。
 pub fn setup() {
@@ -208,6 +181,10 @@ pub fn setup() {
             deadline_cycles: 0,
             miss_count: 0,
             degraded: 0,
+            period_cycles: 0, // 由 workq_add_periodic 声明
+            next_run_cycles: 0,
+            queued: 0,
+            pnext: core::ptr::null_mut(),
         };
         UPLINK_ITEM = rtos_work_t {
             next: core::ptr::null_mut(),
@@ -217,6 +194,10 @@ pub fn setup() {
             deadline_cycles: 0,
             miss_count: 0,
             degraded: 0,
+            period_cycles: 0, // 由 workq_add_periodic 声明
+            next_run_cycles: 0,
+            queued: 0,
+            pnext: core::ptr::null_mut(),
         };
         TELEM_ITEM = rtos_work_t {
             next: core::ptr::null_mut(),
@@ -226,6 +207,10 @@ pub fn setup() {
             deadline_cycles: 0,
             miss_count: 0,
             degraded: 0,
+            period_cycles: 0, // 由 workq_add_periodic 声明
+            next_run_cycles: 0,
+            queued: 0,
+            pnext: core::ptr::null_mut(),
         };
         NAV_ITEM = rtos_work_t {
             next: core::ptr::null_mut(),
@@ -235,6 +220,10 @@ pub fn setup() {
             deadline_cycles: 0,
             miss_count: 0,
             degraded: 0,
+            period_cycles: 0, // 由 workq_add_periodic 声明
+            next_run_cycles: 0,
+            queued: 0,
+            pnext: core::ptr::null_mut(),
         };
         LOG_ITEM = rtos_work_t {
             next: core::ptr::null_mut(),
@@ -244,6 +233,10 @@ pub fn setup() {
             deadline_cycles: 0,
             miss_count: 0,
             degraded: 0,
+            period_cycles: 0, // 由 workq_add_periodic 声明
+            next_run_cycles: 0,
+            queued: 0,
+            pnext: core::ptr::null_mut(),
         };
         SENSORS_ITEM = rtos_work_t {
             next: core::ptr::null_mut(),
@@ -253,6 +246,10 @@ pub fn setup() {
             deadline_cycles: 0,
             miss_count: 0,
             degraded: 0,
+            period_cycles: 0, // 由 workq_add_periodic 声明
+            next_run_cycles: 0,
+            queued: 0,
+            pnext: core::ptr::null_mut(),
         };
         ATT_ITEM = rtos_work_t {
             next: core::ptr::null_mut(),
@@ -262,6 +259,10 @@ pub fn setup() {
             deadline_cycles: 0,
             miss_count: 0,
             degraded: 0,
+            period_cycles: 0, // 由 workq_add_periodic 声明
+            next_run_cycles: 0,
+            queued: 0,
+            pnext: core::ptr::null_mut(),
         };
     }
     // attitude item 的控制器静态态 + sensors item 的静态态
@@ -286,27 +287,21 @@ pub fn setup() {
           unsafe { core::ptr::addr_of_mut!(L3_WQ_STACK).cast::<u8>() }, 2048);
     }
     unsafe {
-        if let Some(f) = slot().timer_init {
-            f(WQ_TIMER.as_mut_ptr(), b"wq250\0".as_ptr() as *const _, Some(tick_cb), core::ptr::null_mut());
-        }
-        if let Some(f) = slot().timer_start_ticks {
-            f(WQ_TIMER.as_mut_ptr(), 1 /*periodic*/, 4); // ★design.md §5: attitude 250Hz
-        }
-        if let Some(f) = slot().timer_init {
-            f(EST_TIMER.as_mut_ptr(), b"wq200\0".as_ptr() as *const _, Some(tick_est_cb), core::ptr::null_mut());
-        }
-        if let Some(f) = slot().timer_start_ticks {
-            f(EST_TIMER.as_mut_ptr(), 1 /*periodic*/, 5); // ★design.md §5: estimator/sensors 200Hz
-        }
-        // ★L3 50Hz 定时器 → 提交 nav item
-        if let Some(f) = slot().timer_init {
-            f(L3_TIMER.as_mut_ptr(), b"wq50\0".as_ptr() as *const _, Some(tick_l3_cb), core::ptr::null_mut());
-        }
-        if let Some(f) = slot().timer_start_ticks {
-            f(L3_TIMER.as_mut_ptr(), 1 /*periodic*/, 20); // 20ms = 50Hz
+        // ★design.md §5：【周期由 WorkItem 声明】—— 队列**自带调度器**按 EDF 派发，
+        //   不再用外部硬件定时器各自 submit ✗（那样等于把频率写在定时器里、且 EDF 失效）。
+        //   预算/周期/截止期全部落在 item 上 ⇒ §5#1「每个 WorkItem 声明」+ §5#3「队列内 EDF」✓。
+        const CY: u32 = 168_000; // 1ms @168MHz
+        if let Some(f) = slot().workq_add_periodic {
+            f(Q_L2, core::ptr::addr_of_mut!(ATT_ITEM), 4 * CY);      // attitude  250Hz（4ms）
+            f(Q_L2, core::ptr::addr_of_mut!(EKF_ITEM), 5 * CY);      // estimator 200Hz（5ms）
+            f(Q_L2, core::ptr::addr_of_mut!(SENSORS_ITEM), 5 * CY);  // sensors   200Hz（5ms）
+            f(Q_L3, core::ptr::addr_of_mut!(NAV_ITEM), 20 * CY);     // L3 50Hz
+            f(Q_L3, core::ptr::addr_of_mut!(TELEM_ITEM), 20 * CY);
+            f(Q_L3, core::ptr::addr_of_mut!(UPLINK_ITEM), 20 * CY);
+            f(Q_L3, core::ptr::addr_of_mut!(LOG_ITEM), 20 * CY);     // 日志（L3 事件驱动·可丢弃）
         }
     }
-    info!(tag: "wq", "P2-3: L2 queue(estimator+attitude) + 250Hz timer ready");
+    info!(tag: "wq", "design.md §5: L2/L3 队列自带调度器（item 声明周期 + EDF）ready");
 }
 
 /// ★design.md §3：DRDY 到（ISR）。
