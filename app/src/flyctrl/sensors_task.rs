@@ -19,7 +19,9 @@ use flyctrl_core::vehicle::{ImuSample, PosSample, RcInput};
 const WRITE_FRAME: bool = true;
 /// 采样周期（IMU 1kHz；design.md §3/§7）。
 pub const SAMPLE_DT: f32 = 0.001;
-const GPS_VALID_STEPS: u32 = 500; // 500 × 1ms = 500ms
+// ★架构变更重标（子代理 §B 建议）：GPS 保持超时改为 **时间基准**（tick 差），
+//   不再用"item 调用次数"——否则 item 频率一变（500Hz→250Hz）阈值时间语义就漂。
+const GPS_VALID_MS: u32 = 500; // 500 ticks × 1ms = 500ms 无新帧 ⇒ 判真丢失
 
 #[cfg(not(feature = "hil"))]
 static mut SENS_STACK: MaybeUninit<SensorStack> = MaybeUninit::uninit();
@@ -33,6 +35,8 @@ static mut SENS_TOPIC_GV: [f32; 3] = [0.0; 3];
 static mut SENS_TOPIC_RG: [f32; 3] = [0.0; 3];
 static mut SENS_TOPIC_TS: u32 = 0;
 static mut SENS_GPS_STALE: u32 = 0;
+/// 最近一次收到有效 GPS 帧的 tick（时间基准超时用）。
+static mut SENS_GPS_LAST_TICK: u32 = 0;
 #[cfg(not(feature = "hil"))]
 static mut SENS_LAST_IMU: ImuSample = ImuSample { accel: [flyctrl_core::units::MeterPerSecondSquared(0.0); 3], gyro: [flyctrl_core::units::RadianPerSecond(0.0); 3] };
 static mut SENS_HAVE_IMU: bool = false;
@@ -104,6 +108,7 @@ pub fn sensors_step() {
         let (mut topic_af, mut topic_gv, mut topic_rg, mut topic_ts) =
             unsafe { (SENS_TOPIC_AF, SENS_TOPIC_GV, SENS_TOPIC_RG, SENS_TOPIC_TS) };
         let mut gps_stale = unsafe { SENS_GPS_STALE };
+        let mut gps_last_tick = unsafe { SENS_GPS_LAST_TICK };
 
             // 非 HIL：采样 + 写共享帧（seqlock：sensors 单写、control 单读，control 优先级更高）。
             #[cfg(not(feature = "hil"))]
@@ -133,6 +138,7 @@ pub fn sensors_step() {
                 // （超时清理由下方写段按 gps_stale 处理，这里只维护过期计数）。
                 if gps_sample.is_some() {
                     gps_stale = 0;
+                    gps_last_tick = rtos_app_sdk::rtos::tick_count();
                 } else {
                     gps_stale += 1;
                 }
@@ -158,8 +164,10 @@ pub fn sensors_step() {
                         // false → FDIR 误判 GPS lost）；超时（500ms 无帧）置 None。
                         if gps_sample.is_some() {
                             f.gps = gps_sample; // 新帧 ✓（stale=false ✓）
-                        } else if gps_stale > GPS_VALID_STEPS {
-                            f.gps = None; // 超时 ⇒ 真丢失 ✓
+                        } else if rtos_app_sdk::rtos::tick_count().wrapping_sub(gps_last_tick)
+                            > GPS_VALID_MS
+                        {
+                            f.gps = None; // 超时（时间基准，500ms）⇒ 真丢失 ✓
                         }
                         // ⚠️ 曾在此给保持样本打 `stale` 标记 —— **已回退** ✗：
                         //   该字段使 `PosSample` 变大 ⇒ 破坏【固件↔宿主共享帧 ABI】✗（§5.39 ✓）。
@@ -206,6 +214,7 @@ pub fn sensors_step() {
             SENS_TOPIC_AF = topic_af; SENS_TOPIC_GV = topic_gv;
             SENS_TOPIC_RG = topic_rg; SENS_TOPIC_TS = topic_ts;
             SENS_GPS_STALE = gps_stale;
+            SENS_GPS_LAST_TICK = gps_last_tick;
         }
     }
     #[cfg(feature = "hil")]

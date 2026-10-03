@@ -19,7 +19,7 @@
 //! INDI 包装任意实现了 [`Controller`] 的基线（PID/LQR/MPC），且不改变其接口，
 //! 因此可直接复用 M7 的 HIL 闭环与属性测试。
 
-use crate::controller::{Controller, Setpoint};
+use crate::controller::{Controller, RateSetpoint, Setpoint};
 use crate::units::*;
 use crate::vehicle::{ActuatorCmd, VehicleState};
 
@@ -123,6 +123,13 @@ impl<B: Controller> IndiController<B> {
 }
 
 impl<B: Controller> Controller for IndiController<B> {
+    /// ★修复：转发基线控制器的**速率设定值**（PX4 `vehicle_rates_setpoint` 同构）。
+    ///   缺此转发 ⇒ 包装控制器的 `rate_setpoint()` 走 trait 默认 `INVALID`
+    ///   ⇒ 消费 `StepResult.rate_sp` 的宿主（SIL/HIL harness）拿到无效值 ⇒ 零推力。
+    fn rate_setpoint(&self) -> RateSetpoint {
+        self.base.rate_setpoint()
+    }
+
     fn control(&mut self, dt: Second, sp: &Setpoint, est: &VehicleState) -> ActuatorCmd {
         // 1) 基线控制器给出电机指令。
         let u_base = self.base.control(dt, sp, est);
