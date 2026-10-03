@@ -189,7 +189,7 @@ pub fn setup() {
             next: core::ptr::null_mut(),
             fn_: Some(estimator_work),
             arg: core::ptr::null_mut(),
-            budget_cycles: 504_000, // ~3ms @168MHz
+            budget_cycles: 134_400, // ★design.md §5: estimator 预算 800µs @168MHz
             deadline_cycles: 0,
             miss_count: 0,
             degraded: 0,
@@ -225,7 +225,7 @@ pub fn setup() {
             next: core::ptr::null_mut(),
             fn_: Some(sensors_work),
             arg: core::ptr::null_mut(),
-            budget_cycles: 100_000,
+            budget_cycles: 50_400, // ★design.md §5: sensors 预算 300µs @168MHz
             deadline_cycles: 0,
             miss_count: 0,
             degraded: 0,
@@ -234,7 +234,7 @@ pub fn setup() {
             next: core::ptr::null_mut(),
             fn_: Some(attitude_work),
             arg: core::ptr::null_mut(),
-            budget_cycles: 84_000, // ~0.5ms
+            budget_cycles: 33_600, // ★design.md §5: attitude 预算 200µs @168MHz
             deadline_cycles: 0,
             miss_count: 0,
             degraded: 0,
@@ -248,7 +248,7 @@ pub fn setup() {
     // ★design.md §5#4：**队列间带宽隔离** —— 给每条队列设 CPU 配额（cycles/突发）。
     //   L2(estimator+attitude+sensors) 上限 ~4ms；L3(nav/telem/uplink) 上限 ~1ms。
     if let Some(f) = slot().workq_set_quota {
-        f(Q_L2, 672_000);  // ~4ms @168MHz
+        f(Q_L2, 300_000);  // ★design.md §5#4：须 ≥ 三项预算和(218.4k) + 裕量（原 672k < 688k 自相矛盾）
         f(Q_L3, 168_000);  // ~1ms
     }
     crate::flyctrl::nav_task::nav_init();
@@ -266,7 +266,7 @@ pub fn setup() {
             f(WQ_TIMER.as_mut_ptr(), b"wq250\0".as_ptr() as *const _, Some(tick_cb), core::ptr::null_mut());
         }
         if let Some(f) = slot().timer_start_ticks {
-            f(WQ_TIMER.as_mut_ptr(), 1 /*periodic*/, 4); // L2 250Hz
+            f(WQ_TIMER.as_mut_ptr(), 1 /*periodic*/, 5); // ★design.md §5: L2 200Hz（原 250Hz）
         }
         // ★L3 50Hz 定时器 → 提交 nav item
         if let Some(f) = slot().timer_init {

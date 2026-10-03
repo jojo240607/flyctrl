@@ -49,6 +49,35 @@ pub extern "C" fn safety_entry(_arg: *mut c_void) {
         // ★停机条件：控制心跳停摆 >STUCK_MS（控制律卡死）或 健康=Critical
         let kill = (stuck_ms > STUCK_MS) || matches!(health, Health::Critical);
         SAFETY_KILL.store(kill, Ordering::Relaxed);
+        // ★design.md §4#2：**L1 截止期监控**（三级策略：1 次警告 → 2 次降级 → 3 次触发安全模式）。
+        //   预算取 design.md §4 表：rate_ctrl 80µs、safety_monitor 20µs（@168MHz）。
+        //   连续超预算计数；未超则清零（"连续"语义 ✓）。
+        {
+            const RATE_BUDGET_CYC: u32 = 80 * 168; // 80µs @168MHz
+            const SAFETY_BUDGET_CYC: u32 = 20 * 168; // 20µs @168MHz
+            static mut L1_STRIKES: u32 = 0;
+            let r = unsafe { crate::flyctrl::rate_task::RATE_EXEC_CYC };
+            let s = unsafe { SAFETY_EXEC_CYC };
+            let strikes = unsafe {
+                if r > RATE_BUDGET_CYC || s > SAFETY_BUDGET_CYC {
+                    L1_STRIKES += 1;
+                } else {
+                    L1_STRIKES = 0;
+                }
+                L1_STRIKES
+            };
+            if strikes > 0 {
+                match strikes {
+                    1 => info!(tag: "safety", "L1 deadline overrun #1 (rate={}cyc safe={}cyc) -> warn", r, s),
+                    2 => info!(tag: "safety", "L1 deadline overrun #2 -> degrade"),
+                    _ => {
+                        info!(tag: "safety", "L1 deadline overrun #3 -> SAFETY MODE");
+                        SAFETY_KILL.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+
         // ★design.md §8：过载逐级降级 —— 由 L1 CPU 负载 + 队列硬超时 + 截止期违约 判定
         {
             let r = unsafe { crate::flyctrl::rate_task::RATE_EXEC_CYC } as u64;
