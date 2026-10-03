@@ -86,8 +86,7 @@ pub extern "C" fn alloc_entry(_arg: *mut c_void) {
 
         let exec = st.tick().wrapping_sub(t0);
         unsafe { ALLOC_EXEC_CYC = exec; }
-        let cpu = crate::flyctrl::rt_stat::cycles_per_us() * 1000;
-        st.sample(exec, cpu, cpu); // 1kHz 名义
+        st.sample(exec, 168_000, 168_000); // 1kHz 名义
         it = it.wrapping_add(1);
         if it % 500 == 0 { st.report_and_reset(); } // ★design.md §9 可观测
         delay_until(&mut wake_tick, 1); // 1 tick = 1ms（独立 1kHz 网格 ✓）

@@ -301,6 +301,9 @@ pub fn setup() {
             f(Q_L3, core::ptr::addr_of_mut!(LOG_ITEM), 20);     // 日志（L3 事件驱动·可丢弃）
         }
     }
+    // ★诊断：打印内核实测 cycles/ms（仿真器声明 84MHz ⇒ 期望 ~84000；真机 168MHz ⇒ ~168000）
+    let cpu_per_ms = slot().cycles_per_ms.map(|f| f()).unwrap_or(0);
+    info!(tag: "wq", "calib: cycles/ms={} (仿真器期望 ~84000，真机 ~168000)", cpu_per_ms);
     info!(tag: "wq", "design.md §5: L2/L3 队列自带调度器（item 声明周期 + EDF）ready");
 }
 

@@ -12,15 +12,7 @@
 use rtos_app_sdk::rtos::cycle_now;
 
 /// 168MHz 下 cycles→µs 除数。
-/// ★design.md §5：cycles→µs 换算**唯一来源 = 内核实测**（不再硬编码 168 ✗——
-/// 实测仿真器 DWT 速率约 84/µs，硬编码会让显示的 µs 偏乐观 2×）。
-#[inline]
-pub fn cycles_per_us() -> u32 {
-    (rtos_app_sdk::abi::slot().cycles_per_ms)
-        .and_then(|f| Some(f()))
-        .unwrap_or(168_000)
-        / 1000
-}
+const CYCLES_PER_US: u32 = 168;
 
 pub struct RtStat {
     name: &'static str,
@@ -74,8 +66,8 @@ impl RtStat {
         let javg = (self.jit_sum / self.n as u64) as u32;
         rtos_app_sdk::info!(tag: "stat", "{} n={} exec_us={}/{}/{} jit_us={}/{}/{}",
             self.name, self.n,
-            self.exec_min / cycles_per_us(), avg / cycles_per_us(), self.exec_max / cycles_per_us(),
-            self.jit_min / cycles_per_us(), javg / cycles_per_us(), self.jit_max / cycles_per_us());
+            self.exec_min / CYCLES_PER_US, avg / CYCLES_PER_US, self.exec_max / CYCLES_PER_US,
+            self.jit_min / CYCLES_PER_US, javg / CYCLES_PER_US, self.jit_max / CYCLES_PER_US);
         self.n = 0;
         self.exec_min = u32::MAX;
         self.exec_max = 0;
