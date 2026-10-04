@@ -114,7 +114,8 @@ fn push_imu_ring(gyr: &[f32; 3], acc: &[f32; 3]) {
         r.push(flyctrl_core::imu_ring::ImuDelta {
             delta_ang: [gyr[0] * dt, gyr[1] * dt, gyr[2] * dt],
             delta_vel: [acc[0] * dt, acc[1] * dt, acc[2] * dt],
-            dt,
+            dt_ang: dt,
+            dt_vel: dt,
             ts_cyc: ts,
         });
     }

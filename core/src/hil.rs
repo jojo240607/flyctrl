@@ -527,17 +527,34 @@ where
         let gyr = [imu_sample.gyro[0].0, imu_sample.gyro[1].0, imu_sample.gyro[2].0];
         let acc = [imu_sample.accel[0].0, imu_sample.accel[1].0, imu_sample.accel[2].0];
         if self.imu_deltas_len > 0 {
-            // ★排空：逐样本 predict（1kHz 样本全部参与积分 ✓）
+            // ★★★2026-10-04【性能修复】：原来对每个 1kHz 样本各调一次 `predict_delta` ✗
+            //   ⇒ `predict_covariance`（两次 O(N³) 三重积 ✓）每拍被做 **N 遍** ✗
+            //   （1kHz÷200Hz=5 遍）⇒ 估计器执行时间从 ~1ms 涨到 ~6ms ✗（实测：L2 单 worker
+            //   被拖到 10ms/拍、harness 锁相守卫触发 ✗）。**算法未变，是调用次数变了** ✓。
+            //   现改为：把本批样本的 `delta_ang/delta_vel/dt` **累加**（**不丢样本** ✓ ——
+            //   全部参与积分 ✓）后只做**一次** `predict_delta` ⇒ 协方差按整拍传播一次 ✓，
+            //   与拆分前行为一致 ✓（小角增量下求和与逐样本复合的差为二阶量，可忽略 ✓）。
+            let mut da = [0.0f32; 3];
+            let mut dv = [0.0f32; 3];
+            let mut dtt_a = 0.0f32;
+            let mut dtt_v = 0.0f32;
             for i in 0..self.imu_deltas_len {
                 let d = self.imu_deltas[i];
-                self.est.predict_delta(d.delta_ang, d.delta_vel, d.dt);
+                for k in 0..3 {
+                    da[k] += d.delta_ang[k];
+                    dv[k] += d.delta_vel[k];
+                }
+                dtt_a += d.dt_ang;
+                dtt_v += d.dt_vel;
             }
             self.imu_deltas_len = 0;
+            self.est.predict_delta(da, dv, dtt_a, dtt_v);
         } else {
             // 单帧回退（SIL/未接环形路径）
             self.est.predict_delta(
                 [gyr[0] * dtf, gyr[1] * dtf, gyr[2] * dtf],
                 [acc[0] * dtf, acc[1] * dtf, acc[2] * dtf],
+                dtf,
                 dtf,
             );
         }

@@ -7,7 +7,7 @@
 //! - **绝不静默 no-op** ✗ —— 无等价实现的通路【显式拒绝】并计数 ✓
 //! - **每条通路都有计数** ✓（"先证明机制确实在运行" ✓）
 
-use crate::estimator::eskf::Eskf;
+use crate::estimator::eskf::{Eskf, I_BA, I_POS, I_VEL};
 use crate::estimator::trait_def::Estimator;
 use crate::units::Second;
 use crate::vehicle::{
@@ -29,6 +29,19 @@ pub static mut ESKF_COUNTS: [u32; 12] = [0; 12];
 pub static mut ESKF_DIAG: [f32; 64] = [0.0; 64]; // 4 槽 × 16 ✓（槽 k ⇒ [16k, 16k+16) ✓）
 /// 快照采样步（默认第 5 步 ⇒ 已过初始对齐 ✓）
 pub static mut ESKF_DIAG_AT: u32 = 5;
+
+/// ★★② 排查专用（2026-10-04）：**P 的关键项 + 加计零偏**，按 `n_step ∈ {10,11,12,13,14}` 采样 ✓
+///   目的：定位"机动场景下 EKF 发散"时**哪个量先爆** ✗（Hover 场景正常 ✓、Vertical 发散 ✗）。
+///   槽 k（k=0..4 对应 step 10..14）× 16 个 float：
+///     [0..3]   accel bias ba（3 ✓）
+///     [3..6]   P[vel][vel] 对角（3 ✓）
+///     [6..9]   P[ba][ba] 对角（3 ✓）
+///     [9..12]  P[pos][pos] 对角（3 ✓）
+///     [12..15] P[vel][ba] 对角（3 ✓，耦合项 —— 零偏被"灌"的通道 ✓）
+///     [15]     n_step（校验 ✓）
+#[used]
+#[no_mangle]
+pub static mut ESKF_DIAG2: [f32; 80] = [0.0; 80];
 
 /// 递增全局诊断计数（诊断用 ✓，不与实例计数冲突 ✓）
 #[inline]
@@ -171,14 +184,20 @@ impl Estimator for EskfEstimator {
 
     /// ★design.md §7 + PX4 同构（`ekf.cpp:183-184`）：**逐样本 predict** ——
     ///   直接吃 `sensors` 的 `delta_ang/delta_vel` + 实测 dt ⇒ 1kHz IMU 不丢样本 ✓。
-    fn predict_delta(&mut self, delta_ang: [f32; 3], delta_vel: [f32; 3], dtf: f32) {
+    fn predict_delta(&mut self, delta_ang: [f32; 3], delta_vel: [f32; 3], dt_ang: f32, dt_vel: f32) {
 
         self.n_step = self.n_step.wrapping_add(1);
         bump(0);
 
-        let inv = if dtf > 1e-9 { 1.0 / dtf } else { 0.0 };
+        // ★★★2026-10-04【对齐 PX4 双 dt（`imuSample.delta_ang_dt/delta_vel_dt` ✓）】
+        //   角增量用 `dt_ang` ✓、比力用 `dt_vel` ✓；协方差/传播用 `0.5*(两者)` ✓
+        //   （PX4 `cov.cpp:116`：`dt = 0.5*(delta_vel_dt + delta_ang_dt)` ✓）。
+        //   本仓原本单 dt ✗ —— 换独立陀螺/加计或 ODR 不同就会错 ✗；现在两值恒等时行为不变 ✓。
+        let dtf = 0.5 * (dt_ang + dt_vel);
+        let inv = if dt_ang > 1e-9 { 1.0 / dt_ang } else { 0.0 };
+        let inv_v = if dt_vel > 1e-9 { 1.0 / dt_vel } else { 0.0 };
         let gyr = [delta_ang[0] * inv, delta_ang[1] * inv, delta_ang[2] * inv];
-        let acc = [delta_vel[0] * inv, delta_vel[1] * inv, delta_vel[2] * inv];
+        let acc = [delta_vel[0] * inv_v, delta_vel[1] * inv_v, delta_vel[2] * inv_v];
         self.omega_body = gyr;
         // ★§5.186：当前机体角速率也供【重力辅助的比力低通延迟补偿】用（`update_gravity`
         //   在 `update_mag` **之前**调用 ⇒ 原先 `mag_delay_omega` 在重力步里是**上一拍**的值）；
@@ -207,6 +226,29 @@ impl Estimator for EskfEstimator {
                 1500 => 3,
                 _ => usize::MAX,
             };
+            // ★② 排查：step 10..14 每步采一次 P/零偏（发散窗口 ✓）
+            let slot2: usize = match self.n_step {
+                1 => 0,
+                2 => 1,
+                3 => 2,
+                4 => 3,
+                5 => 4,
+                _ => usize::MAX,
+            };
+            if slot2 != usize::MAX {
+                unsafe {
+                    let d = core::ptr::addr_of_mut!(ESKF_DIAG2);
+                    let b = slot2 * 16;
+                    for i in 0..3 {
+                        (*d)[b + i] = self.f.st.ba[i];
+                        (*d)[b + 3 + i] = self.f.p[I_VEL + i][I_VEL + i];
+                        (*d)[b + 6 + i] = self.f.p[I_BA + i][I_BA + i];
+                        (*d)[b + 9 + i] = self.f.p[I_POS + i][I_POS + i];
+                        (*d)[b + 12 + i] = self.f.p[I_VEL + i][I_BA + i];
+                    }
+                    (*d)[b + 15] = self.n_step as f32;
+                }
+            }
             if slot != usize::MAX {
                 unsafe {
                     let d = core::ptr::addr_of_mut!(ESKF_DIAG);
@@ -303,6 +345,7 @@ impl Estimator for EskfEstimator {
         self.predict_delta(
             [gyr[0] * dtf, gyr[1] * dtf, gyr[2] * dtf],
             [acc[0] * dtf, acc[1] * dtf, acc[2] * dtf],
+            dtf,
             dtf,
         );
         self.update_fusion(pos, airspeed)

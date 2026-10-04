@@ -19,26 +19,34 @@ pub struct ImuDelta {
     pub delta_ang: [f32; 3],
     /// 相邻样本间**比力增量**（m/s，机体系；= ∫accel dt）。
     pub delta_vel: [f32; 3],
-    /// 本样本间隔（s，实测 = 相邻时间戳差）。
-    pub dt: f32,
+    /// ★★★2026-10-04【对齐 PX4 `imuSample` 的**双 dt** 设计 ✓】：
+    ///   PX4 的陀螺与加计是**两条独立消息**（各有自己的 dt ✓）——
+    ///   姿态积分用 `delta_ang_dt` ✓、速度/重力用 `delta_vel_dt` ✓、
+    ///   协方差用 `0.5*(两者)` ✓（`cov.cpp:116` ✓）。
+    ///   本仓原为**单一 dt** ✗ —— 只在"同器件同 DRDY（BMI088 ✓）"下凑巧成立 ✗，
+    ///   **换独立陀螺/加计或两者 ODR 不同时就会错** ✗。现按 PX4 结构拆分 ✓
+    ///   （当前两值恒等 ✓，行为不变 ✓，但结构已具前瞻性 ✓）。
+    pub dt_ang: f32,
+    /// 比力增量对应的时间间隔（s ✓）
+    pub dt_vel: f32,
     /// 采样**硬件时间戳**（DWT CYCCNT，~6ns；design.md §7）。
     pub ts_cyc: u32,
 }
 
 impl ImuDelta {
     /// 全零（静态数组初始化用）。
-    pub const ZERO: ImuDelta = ImuDelta { delta_ang: [0.0; 3], delta_vel: [0.0; 3], dt: 0.0, ts_cyc: 0 };
+    pub const ZERO: ImuDelta = ImuDelta { delta_ang: [0.0; 3], delta_vel: [0.0; 3], dt_ang: 0.0, dt_vel: 0.0, ts_cyc: 0 };
 
     /// 反解瞬时角速率（rad/s）。
     #[inline]
     pub fn gyro(&self) -> [f32; 3] {
-        let inv = if self.dt > 1e-9 { 1.0 / self.dt } else { 0.0 };
+        let inv = if self.dt_ang > 1e-9 { 1.0 / self.dt_ang } else { 0.0 };
         [self.delta_ang[0] * inv, self.delta_ang[1] * inv, self.delta_ang[2] * inv]
     }
     /// 反解瞬时比力（m/s²）。
     #[inline]
     pub fn accel(&self) -> [f32; 3] {
-        let inv = if self.dt > 1e-9 { 1.0 / self.dt } else { 0.0 };
+        let inv = if self.dt_vel > 1e-9 { 1.0 / self.dt_vel } else { 0.0 };
         [self.delta_vel[0] * inv, self.delta_vel[1] * inv, self.delta_vel[2] * inv]
     }
 }
@@ -57,7 +65,7 @@ pub struct ImuRing {
 impl ImuRing {
     pub const fn new() -> Self {
         Self {
-            buf: [ImuDelta { delta_ang: [0.0; 3], delta_vel: [0.0; 3], dt: 0.0, ts_cyc: 0 }; IMU_RING_N],
+            buf: [ImuDelta { delta_ang: [0.0; 3], delta_vel: [0.0; 3], dt_ang: 0.0, dt_vel: 0.0, ts_cyc: 0 }; IMU_RING_N],
             head: 0,
             tail: 0,
             dropped: 0,

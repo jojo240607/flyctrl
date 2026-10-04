@@ -84,7 +84,7 @@ pub extern "C" fn rate_entry(_arg: *mut c_void) {
         let sample_dt = unsafe {
             let r = &*core::ptr::addr_of!(crate::flyctrl::IMU_RING);
             match r.latest() {
-                Some(d) => d.dt,
+                Some(d) => d.dt_ang,
                 None => 0.001,
             }
         };

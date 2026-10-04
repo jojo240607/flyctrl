@@ -89,7 +89,8 @@ pub fn imu_sample_step() {
         r.push(flyctrl_core::imu_ring::ImuDelta {
             delta_ang: [s.gyro[0].0 * dt, s.gyro[1].0 * dt, s.gyro[2].0 * dt],
             delta_vel: [s.accel[0].0 * dt, s.accel[1].0 * dt, s.accel[2].0 * dt],
-            dt,
+            dt_ang: dt,
+            dt_vel: dt,
             ts_cyc: ts,
         });
     }
@@ -197,9 +198,12 @@ pub fn sensors_step() {
                     let l1_permille = (l1 * 1000 / 168_000_000) as u32;
                     let ovl = crate::flyctrl::safety_task::OVERLOAD_LEVEL
                         .load(core::sync::atomic::Ordering::Relaxed);
-                    info!(tag: "sensor", "loop {} drdy={} wq={}/{}/{}/{}/{} l2used={} l1={}permille ovl={}",
+                    info!(tag: "sensor", "loop {} drdy={} wq={}/{}/{}/{}/{} l2used={} l1={}permille ovl={} it_us=ekf:{}/att:{}/sen:{}",
                           loop_cnt, unsafe { crate::flyctrl::IMU_DRDY_CNT },
-                          w[0], w[1], w[2], w[3], w[4], w[5], l1_permille, ovl);
+                          w[0], w[1], w[2], w[3], w[4], w[5], l1_permille, ovl,
+                          unsafe { crate::flyctrl::wq_tasks::IT_EXEC_EKF } / 168,
+                          unsafe { crate::flyctrl::wq_tasks::IT_EXEC_ATT } / 168,
+                          unsafe { crate::flyctrl::wq_tasks::IT_EXEC_SEN } / 168);
                 }
             }
 

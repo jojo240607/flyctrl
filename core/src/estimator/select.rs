@@ -58,6 +58,23 @@ impl Estimator for AnyEstimator {
     fn step(&mut self, dt: Second, imu: ImuSample, pos: Option<PosSample>, airspeed: Option<AirspeedSample>) -> VehicleState {
         self.inner.step(dt, imu, pos, airspeed)
     }
+    /// ★★★修复（2026-10-04）：**转发拆分后的两个新方法** —— 原实现漏转发 ⇒ 落到 trait
+    ///   默认**空实现** ✗ ⇒ `HilContext` 调 `self.est.predict_delta/update_fusion` 全是空操作
+    ///   ⇒ **ESKF 永不预测/融合** ⇒ est 从开机第一拍就冻结 ✗（实测：`n_step=0`、
+    ///   `n_gps_pos=0/0`、`n_grav_applied=0/0`，而 `n_mag=1001` 因为 `update_mag` 有转发 ✓）。
+    ///   同类坑：见 `IndiController` 漏转发 `rate_setpoint`（fix A ✓）。
+    fn predict_delta(&mut self, delta_ang: [f32; 3], delta_vel: [f32; 3], dt_ang: f32, dt_vel: f32) {
+        self.inner.predict_delta(delta_ang, delta_vel, dt_ang, dt_vel)
+    }
+
+    fn update_fusion(
+        &mut self,
+        pos: Option<PosSample>,
+        airspeed: Option<AirspeedSample>,
+    ) -> VehicleState {
+        self.inner.update_fusion(pos, airspeed)
+    }
+
     fn update_vio(&mut self, vio: Option<VioSample>) {
         self.inner.update_vio(vio)
     }

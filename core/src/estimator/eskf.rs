@@ -56,10 +56,42 @@ impl EskfState {
             imu.delta_vel[2] / dt - self.ba[2],
         ];
         let aw = rotate_vec_by_quat(self.q, f);
+        // ★★★2026-10-04【对齐 PX4 一手 `/tmp/ekf.cpp:231-280 predictState`】
+        //   ① 位置用**梯形积分**（PX4: `_gpos += (vel_last + _state.vel) * dt * 0.5f` ✓）
+        //      —— 我们原来是矩形（欧拉）积分 ✗ ⇒ 大 dt 下位置误差累积更快 ✗。
+        //   ② 速度**状态钳位**（PX4: `_state.vel = constrain(_state.vel, ±vel_lim)` ✓）
+        //      —— 我们原来无任何状态钳位 ✗ ⇒ 一旦被量测灌偏就没有反发散能力 ✗
+        //      （PX4 每拍都做 ✓，是它"抗发散"的关键护栏之一 ✓）。
+        //   两者都是 PX4 的**标准做法** ✓，与协方差侧的 Joseph/对称化/钳位配套 ✓。
         let v_old = self.v;
         for i in 0..3 {
             self.v[i] = v_old[i] + (aw[i] + g_ned[i]) * dt;
-            self.p[i] += v_old[i] * dt;
+        }
+        for i in 0..3 {
+            self.p[i] += (v_old[i] + self.v[i]) * dt * 0.5; // ★梯形 ✓（PX4 同款）
+        }
+        // ★速度钳位（PX4 `ekf2_vel_lim` 默认 100 m/s ⇒ 这里取同量级 ✓）
+        const VEL_LIM: f32 = 100.0;
+        for i in 0..3 {
+            if !(self.v[i] > -VEL_LIM) {
+                self.v[i] = -VEL_LIM;
+            } else if self.v[i] > VEL_LIM {
+                self.v[i] = VEL_LIM;
+            }
+            if !self.v[i].is_finite() {
+                self.v[i] = 0.0; // NaN 保护（PX4 的 constrain 亦如此 ✓）
+            }
+        }
+        // ★位置钳位（真机安全护栏 ✓；PX4 用 `ekf2_pos_lim` 同量级 ✓）
+        const POS_LIM: f32 = 1e5;
+        for i in 0..3 {
+            if !self.p[i].is_finite() {
+                self.p[i] = 0.0;
+            } else if self.p[i] > POS_LIM {
+                self.p[i] = POS_LIM;
+            } else if self.p[i] < -POS_LIM {
+                self.p[i] = -POS_LIM;
+            }
         }
     }
 }
@@ -231,6 +263,14 @@ pub struct ImuDelta {
 }
 
 /// 误差状态的块索引（**C2 后 21 维** ✓：原 15 + `mag_I`3 + `mag_B`3 ✓）
+/** ★② 排查：**位置修正量最大**的那一路更新（定位"位置被一步推飞"✗）
+ *  [0]=kind(1=gpsP 2=gpsV 3=baro 4=grav 5=mag) [1]=|dp| [2]=未用 [3]=未用 */
+#[used]
+#[no_mangle]
+pub static mut ESKF_MAX_UPD: [f32; 8] = [0.0; 8];
+#[no_mangle]
+pub static mut ESKF_KIND: f32 = 0.0;
+
 pub const N: usize = 21;
 pub const I_ATT: usize = 0;
 pub const I_VEL: usize = 3;
@@ -318,42 +358,44 @@ pub type Cov = [[f32; N]; N];
 /// **可以实现的理由**：F 已 5/5 块数值/参照双证通过 ✓（§12.5–§12.8）。
 /// 实现纪律：先用**不变量**自检（对称性 / F=I 时退化为 P+Q ✓），再谈精度 ✓。
 pub fn predict_covariance(p: &Cov, f: &[[f32; N]; N], q: &Cov) -> Cov {
-    // ★★**G = F − I 分解**（2026-09-23，§5.31 ✓）——经典 INS 技巧 ✓，数学恒等 ✗：
-    //     P' = F·P·Fᵀ + Q = (I+G)·P·(I+G)ᵀ + Q
-    //        = P + G·P + (G·P)ᵀ + G·(G·P)ᵀ + Q        （P 对称 ✓）
-    // 为何快 ✓：F 里绝大多数非零其实是【对角 1】（状态自身延续 ✓），而 **G = F−I 极稀疏** ✓
-    //   ⇒ 两个 G·X 乘法各只需 O(nnz(G)·N) ✓，远小于 N³=9261 ✓
-    //   ⇒ G·(G·P)ᵀ 为二阶小项 ✓（nnz 小时可忽略）
-    // 数值等价 ✓（仅重排乘序 ✓）；由既有协方差数值对照测试守护 ✓。
-    let mut gp = [[0.0f32; N]; N]; // G·P
+    // ★★★2026-10-04【对齐 PX4 一手 `cov.cpp:113 predictCovariance`：**完整 F·P·Fᵀ + Q**】
+    //
+    // 替换掉原先的 `G = F − I` 分解近似 ✗。为何必须换：
+    //   · 该分解 `P' = P + GP + (GP)ᵀ + G(GP)ᵀ + Q` 在 G 很小时才成立 ✓；
+    //   · 新时间口径下 dt/Q 与 F 的填充度变了 ⇒ 被丢掉的**高阶项不可忽略** ✗
+    //     ⇒ 实测 Y 通道在 **step 2→3** 从 1.0 直冲 1e6（Pba[1] 打满钳位上界 ✗）
+    //     ⇒ 负方差 ⇒ 滤波发散 ✗（`ESKF_DIAG2` 一手证据 ✓）。
+    //   · PX4 自己的注释也把这种近似列为 TODO 要拆开（`cov.cpp:252-255` ✓）：
+    //     "TODO: Split covariance prediction into separate F*P*transpose(F) and Q contributions"
+    //   ⇒ 直接照 PX4 的做法：**显式算 F·P·Fᵀ + Q** ✓（F 稀疏 ⇒ 仍可跳过零元 ✓）。
+    //
+    // 实现：FP = F·P（跳过 f 的零元 ✓）；out = FP·Fᵀ + Q（只算上三角再镜像 ⇒ 强制对称 ✓）。
+    // 成本：O(nnz(F)·N + N³/2) ≈ 21³/2 ≈ 4.6k 次乘加/次（N=21 ✓）—— 可接受 ✓。
+    let mut fp = [[0.0f32; N]; N];
     for i in 0..N {
         for k in 0..N {
-            let g = if i == k { f[i][k] - 1.0 } else { f[i][k] };
-            if g == 0.0 {
-                continue; // ★跳过零（G 极稀疏 ✓）
+            let fik = f[i][k];
+            if fik == 0.0 {
+                continue; // ★F 稀疏 ⇒ 跳过 ✓
             }
             for j in 0..N {
-                gp[i][j] += g * p[k][j];
-            }
-        }
-    }
-    // G·(G·P)ᵀ
-    let mut gg = [[0.0f32; N]; N];
-    for i in 0..N {
-        for k in 0..N {
-            let g = if i == k { f[i][k] - 1.0 } else { f[i][k] };
-            if g == 0.0 {
-                continue;
-            }
-            for j in 0..N {
-                gg[i][j] += g * gp[j][k]; // (GP)ᵀ[k][j] = gp[j][k] ✓
+                fp[i][j] += fik * p[k][j];
             }
         }
     }
     let mut out = [[0.0f32; N]; N];
     for i in 0..N {
-        for j in 0..N {
-            out[i][j] = p[i][j] + gp[i][j] + gp[j][i] + gg[i][j] + q[i][j];
+        for j in 0..=i {
+            let mut s = q[i][j];
+            for k in 0..N {
+                let fjk = f[j][k];
+                if fjk == 0.0 {
+                    continue; // ★同上（F 稀疏 ✓）
+                }
+                s += fp[i][k] * fjk;
+            }
+            out[i][j] = s;
+            out[j][i] = s; // ★强制对称（PX4 `cov.cpp:241-246` 同款 ✓）
         }
     }
     out
@@ -430,6 +472,7 @@ pub fn update_scalar(
             hp[j] += hk * p[kk][j];
         }
     }
+    // Step 1（常规）：P_temp = (I − K·h)·P
     for i in 0..N {
         let ki = k[i];
         if ki == 0.0 {
@@ -437,6 +480,33 @@ pub fn update_scalar(
         }
         for j in 0..N {
             p[i][j] -= ki * hp[j];
+        }
+    }
+    // ★★★2026-10-04【对齐 PX4 一手 `ekf_helper.cpp:1059-1087`：**Joseph 稳定化更新**】——
+    //   上面 Step 1 是简化式 ✗，在"K 非最优"（NIS 门拒观测 / 某维增益被置零 ✓）时会
+    //   丢失正定性 ✗ ⇒ 方差变负 ⇒ 发散 ✗。补 PX4 的 Step 2 ✓（标量版，与 PX4 逐行同构 ✓）：
+    //     P = P_temp − P_temp·hᵀ·Kᵀ + K·R·Kᵀ ，只算上三角再镜像 ✓（强制对称 ✓）
+    let mut ph2 = [0.0f32; N]; // P_temp · hᵀ
+    for i in 0..N {
+        let mut acc = 0.0f32;
+        for j in 0..N {
+            acc += p[i][j] * h[j];
+        }
+        ph2[i] = acc;
+    }
+    for i in 0..N {
+        for j in 0..=i {
+            let v = p[i][j] - ph2[i] * k[j] + k[i] * r * k[j];
+            p[i][j] = v;
+            p[j][i] = v;
+        }
+    }
+    // 对角方差钳位（PX4 `constrainStateVariances()` ✓，last resort ✓）
+    for i in 0..N {
+        if !(p[i][i] > 1e-6) {
+            p[i][i] = 1e-6;
+        } else if p[i][i] > 1e6 {
+            p[i][i] = 1e6;
         }
     }
     Ok(nis_sigma)
@@ -651,8 +721,19 @@ pub fn update_vec3(
             k[i][b] = s;
         }
     }
-    // P ← (I − K·H)·P（在更新前的 P 上算 ✓）
-    // ★★一次算好 (H·P)（3×N² ✓）—— 必须【循环外】算 ✗
+    // ★★★2026-10-04【对齐 PX4 一手 `ekf_helper.cpp:1059-1087` 的 **Joseph 稳定化更新**】：
+    //   原实现是简化式 `P ← (I−K·H)·P` ✗ —— 代数上等价，但**当 K 不是最优时**（PX4 原注：
+    //   "P is now not symmetric if K is not optimal (e.g.: some gains have been zeroed)" ✓）
+    //   会**丢失正定性** ✗ ⇒ 方差出现负值 ⇒ 滤波器发散 ✗（本仓实测：Vertical 场景 Pvv=-2209 ✗）。
+    //   我们恰好就是"K 非最优"的情形 ✓：NIS 门会拒观测、GPS 垂直分量 R=1e6（等价增益置零 ✓）
+    //   ⇒ 必须用 Joseph 形式 ✓（真机噪声更差 ⇒ 更是硬需求 ✓）。
+    //
+    // PX4 两步法（照抄 ✓）：
+    //   Step 1（常规）  ：P_temp = (I − K·H)·P
+    //   Step 2（稳定化）：P = P_temp − P_temp·Hᵀ·Kᵀ + K·R·Kᵀ ，且**只算上三角再镜像** ✓
+    // 本仓为 3 维量测（H 是 3×N ✓），故 K 为 N×3、R 为 3×3 ✓，求和维度 a/b=0..3 ✓。
+    //
+    // 一次算好 (H·P)（3×N² ✓）—— 必须【循环外】算 ✗
     //   （曾把它放在 (i,j,a) 最内层 ⇒ 每对 (i,j) 重算 N 次 ⇒ **又是 N³** ✗✓）
     let mut hp = [[0.0f32; N]; 3];
     for a in 0..3 {
@@ -664,14 +745,50 @@ pub fn update_vec3(
             hp[a][j] = acc;
         }
     }
+    // Step 1：P ← (I − K·H)·P
     let mut newp = [[0.0f32; N]; N];
     for i in 0..N {
         for j in 0..N {
             let mut s = p[i][j];
             for a in 0..3 {
-                s -= k[i][a] * hp[a][j]; // ★用【循环外算好】的 (H·P) ✓
+                s -= k[i][a] * hp[a][j];
             }
             newp[i][j] = s;
+        }
+    }
+    // Step 2：PH2 = P_temp·Hᵀ（N×3 ✓，由 hp 转置得到：hp[a][j] = (H·P)[a][j]
+    //         ⇒ P_temp·Hᵀ 的第 (i,b) 元素 = Σ_j newp[i][j]·h[b][j] ✓）
+    let mut ph2 = [[0.0f32; 3]; N];
+    for i in 0..N {
+        for b in 0..3 {
+            let mut acc = 0.0f32;
+            for j in 0..N {
+                acc += newp[i][j] * h[b][j];
+            }
+            ph2[i][b] = acc;
+        }
+    }
+    // P ← P_temp − PH2·Kᵀ + K·R·Kᵀ（只算上三角 j≤i，再镜像 ✓ —— PX4 同款 ✓）
+    for i in 0..N {
+        for j in 0..=i {
+            let mut s = newp[i][j];
+            for a in 0..3 {
+                s -= ph2[i][a] * k[j][a];
+                for b in 0..3 {
+                    s += k[i][a] * r[a][b] * k[j][b];
+                }
+            }
+            newp[i][j] = s;
+            newp[j][i] = s; // ★强制对称 ✓（PX4 `P(j,i) = P(i,j)` ✓）
+        }
+    }
+    // ★对角方差钳位（PX4 `constrainStateVariances()` ✓，其原注：last resort、不应依赖 ✓）
+    //   vel/pos：1e-6..1e6（PX4 同值 ✓）；这里统一给全部状态一个下界 eps ✓
+    for i in 0..N {
+        if !(newp[i][i] > 1e-6) {
+            newp[i][i] = 1e-6;
+        } else if newp[i][i] > 1e6 {
+            newp[i][i] = 1e6;
         }
     }
     *p = newp;
@@ -1002,6 +1119,14 @@ impl Eskf {
     /// ⇒ 修正必须取【负】：`x̂ ← x̂ ⊖ δx̂` ✓
     /// 若写成相加 ⇒ **正反馈 ⇒ 发散** ✗（实测 |v|² 冲到 88430 ✓✓）
     fn apply(&mut self, e: &ErrorState) {
+        unsafe {
+            let d = core::ptr::addr_of_mut!(ESKF_MAX_UPD);
+            let dp = crate::math::sqrt(e.dp[0] * e.dp[0] + e.dp[1] * e.dp[1] + e.dp[2] * e.dp[2]);
+            if dp > (*d)[1] {
+                (*d)[1] = dp;
+                (*d)[0] = ESKF_KIND;
+            }
+        }
         // ★§5.136 第二层防护（NaN 兜底，商用同款 isfinite 检查）：误差状态若含
         //   非有限值则**拒绝注入**并计数——防止任何未预料的 NaN 源（历史实测：
         //   mag_i/mag_b 变 NaN 经此路径污染姿态 ⇒ M 场慢振荡/飞散）。第一层为四处
@@ -1040,11 +1165,18 @@ impl Eskf {
 
     /// GPS 位置（H = [0 0 I] ✓）
     pub fn update_gps_pos(&mut self, meas: [f32; 3]) -> Result<f32, &'static str> {
+        unsafe { ESKF_KIND = 1.0; }
         let mut h = [[0.0f32; N]; 3];
         for a in 0..3 {
             h[a][I_POS + a] = 1.0;
         }
         let resid = [meas[0] - self.st.p[0], meas[1] - self.st.p[1], meas[2] - self.st.p[2]];
+        // ★② 排查：把**进 EKF 的 GPS 位置观测**记进诊断（判"源错"还是"融合错"✓）
+        unsafe {
+            let d = core::ptr::addr_of_mut!(ESKF_MAX_UPD);
+            (*d)[2] = meas[0]; (*d)[3] = meas[1]; (*d)[4] = meas[2];
+            (*d)[5] = crate::math::sqrt(resid[0]*resid[0]+resid[1]*resid[1]+resid[2]*resid[2]);
+        }
         let r = diag3(self.r_gps_p);
         // ⚠️ 顺序：**先用更新前的 P 算增益** ✓，再更新 P，最后注入 ✓（经典顺序 ✓）
         crate::perf::probe(19); // GPS位内1：构 H 完，进 gain_apply
@@ -1064,6 +1196,7 @@ impl Eskf {
     /// 死锁 ⇒ 失控爬升（x_hover_demo 实测：est_vz 恒 0、真值爬 245m；H 场 PC SIL
     /// 注入真实 v_z 故全绿——两场差异的根因 ✓）。垂直速度由气压/GPS 位置观测提供。
     pub fn update_gps_vel(&mut self, meas: [f32; 3]) -> Result<f32, &'static str> {
+        unsafe { ESKF_KIND = 2.0; }
         let mut h = [[0.0f32; N]; 3];
         for a in 0..3 {
             h[a][I_VEL + a] = 1.0;
@@ -1091,6 +1224,7 @@ impl Eskf {
 
     /// 气压高度（标量 ✓，h = −d ✓ 已数值验证 ✓）
     pub fn update_baro(&mut self, alt: f32) -> Result<f32, &'static str> {
+        unsafe { ESKF_KIND = 3.0; }
         if unsafe { crate::cost::knob_read(core::ptr::addr_of!(G_ESKF_BARO_ON)) } == 2.0 {
             return Err("气压：消融开关关闭 ✓（诊断用，非静默 ✗）");
         }
@@ -1173,6 +1307,7 @@ impl Eskf {
     }
 
     pub fn update_gravity(&mut self, accel_body: [f32; 3], g_ned: [f32; 3]) -> Result<u32, &'static str> {
+        unsafe { ESKF_KIND = 4.0; }
         // ★★**0 = 默认开** ✓（固件裸 bin 加载 ⇒ `.data` 初值不生效 ⇒ 旋钮读到 0 ✗）
         //   显式关闭用 **2.0** ✓（2026-09-23，§5.52 ✓）—— 否则诊断开关会把观测全关 ✗
         if unsafe { crate::cost::knob_read(core::ptr::addr_of!(G_ESKF_GRAV_ON)) } == 2.0 {
@@ -1195,13 +1330,23 @@ impl Eskf {
             ESKF_LAST_DEV[0] = dev;
             ESKF_LAST_DEV[1] = dev / gn;
         }
-        // ★★§5.225：幅值门（对齐 PX4 `gravity_fusion.cpp` 的 (0.9g,1.1g) ✓）
-        //   旋钮 `G_ESKF_GRAV_GATE`：>0 ⇒ 该比例；<=0（默认/裸 bin）⇒ 沿用 0.25 ✓ 逐位不变 ✓
-        // ★§5.225：用**构造期读入的字段** ✓（热路径不新增每拍旋钮读 ✗ —— 静态守卫会拦 ✓）
+        // ★★★2026-10-04【门控对齐 PX4 一手 `gravity_fusion.cpp:57-66`】：
+        //   PX4 判的是**加速度自身的模值**在 (0.9g, 1.1g) 内 ✓：
+        //     `accel_lpf_norm_good = (norm_sq > (0.9g)²) && (norm_sq < (1.1g)²)`
+        //   —— 而本仓原来是"**世界系去重力后的残差** `dev = |R·a + g|` > 0.25g/0.10g"✗，
+        //   与 PX4 **不是同一判据** ✗（真实飞行中几乎恒拒 ✗，实测 `grav=0/1` ✓ 即此）。
+        //   现改为 PX4 语义 ✓（模值门 ✓）；原残差门保留为**二级保护**（dev 过大仍拒 ✓）。
+        const G_ONE: f32 = 9.80665;
+        let an_ok = (an > 0.9 * G_ONE) && (an < 1.1 * G_ONE);
+        if !an_ok {
+            unsafe { ESKF_GRAV_BRANCH[1] += 1.0; }
+            return Err("重力辅助：比力模值不在 (0.9g,1.1g) ⇒ 关闭 ✓（PX4 同款 ✓）");
+        }
+        // 二级：世界系残差过大（机动中）仍关闭 ✓（保留本仓原有意图 ✓）
         let gate_frac = self.grav_gate_frac;
         if dev > gate_frac * gn {
             unsafe { ESKF_GRAV_BRANCH[1] += 1.0; }
-            return Err("重力辅助：总加速度过大 ⇒ 关闭 ✓（照参照 ✓）");
+            return Err("重力辅助：世界系残差过大（机动中）⇒ 关闭 ✓（保持原语义 ✓）");
         }
         let meas = [accel_body[0] / an, accel_body[1] / an, accel_body[2] / an];
         let mut applied = 0u32;
@@ -1269,9 +1414,41 @@ impl Eskf {
             if nis > self.gate {
                 continue;
             }
+            // ★★★2026-10-04【补齐 P 更新 —— 对齐 PX4 `fuse()`（`gravity_fusion.cpp:71-84`）】
+            //   本仓这两处手写更新**只改状态、不更新协方差** ✗ ⇒ 实测矛盾：加计零偏涨到
+            //   -2.8e5 ✗ 而其方差 `Pba` 恒为 0 ✓（KF 里 K∝P ⇒ P=0 时状态本不该动 ✗）。
+            //   PX4 让 **P 与状态一起更新** ✓；此处补齐（Joseph + 镜像 + 钳位，与
+            //   `update_scalar` 同款 ✓，用同一个 K ✓）。
+            let mut kvec = [0.0f32; N];
+            for k in 0..N {
+                kvec[k] = ph[k] / s_;
+            }
             let mut dx = [0.0f32; N];
             for k in 0..N {
-                dx[k] = ph[k] / s_ * resid;
+                dx[k] = kvec[k] * resid;
+            }
+            for i in 0..N {
+                let ki = kvec[i];
+                if ki == 0.0 { continue; }
+                for j in 0..N { self.p[i][j] -= ki * ph[j]; }
+            }
+            let mut ph2 = [0.0f32; N];
+            for i in 0..N {
+                let mut acc = 0.0f32;
+                for j in 0..N { acc += self.p[i][j] * h[j]; }
+                ph2[i] = acc;
+            }
+            let r_obs = self.r_grav;
+            for i in 0..N {
+                for j in 0..=i {
+                    let v = self.p[i][j] - ph2[i] * kvec[j] + kvec[i] * r_obs * kvec[j];
+                    self.p[i][j] = v;
+                    self.p[j][i] = v;
+                }
+            }
+            for i in 0..N {
+                if !(self.p[i][i] > 1e-6) { self.p[i][i] = 1e-6; }
+                else if self.p[i][i] > 1e6 { self.p[i][i] = 1e6; }
             }
             let mut e = ErrorState::default();
             for kk in 0..3 {
@@ -1820,6 +1997,7 @@ impl Eskf {
     }
 
     pub fn update_mag(&mut self, meas_body: [f32; 3]) -> Result<f32, &'static str> {
+        unsafe { ESKF_KIND = 5.0; }
         // ★§5.139 诊断：融合前低通（默认 0 ⇒ 关 ✓ 逐位不变）
         let _meas_body = {
             let tau_ms = unsafe {
@@ -1892,9 +2070,41 @@ impl Eskf {
             self.mag_applied += 1;
             worst = worst.max(nis);
             // 误差状态增量 dx = K·ν = P·hᵀ·ν / S
+            // ★★★2026-10-04【补齐 P 更新 —— 对齐 PX4 `fuse()`（`gravity_fusion.cpp:71-84`）】
+            //   本仓这两处手写更新**只改状态、不更新协方差** ✗ ⇒ 实测矛盾：加计零偏涨到
+            //   -2.8e5 ✗ 而其方差 `Pba` 恒为 0 ✓（KF 里 K∝P ⇒ P=0 时状态本不该动 ✗）。
+            //   PX4 让 **P 与状态一起更新** ✓；此处补齐（Joseph + 镜像 + 钳位，与
+            //   `update_scalar` 同款 ✓，用同一个 K ✓）。
+            let mut kvec = [0.0f32; N];
+            for k in 0..N {
+                kvec[k] = ph[k] / s_;
+            }
             let mut dx = [0.0f32; N];
             for k in 0..N {
-                dx[k] = ph[k] / s_ * resid;
+                dx[k] = kvec[k] * resid;
+            }
+            for i in 0..N {
+                let ki = kvec[i];
+                if ki == 0.0 { continue; }
+                for j in 0..N { self.p[i][j] -= ki * ph[j]; }
+            }
+            let mut ph2 = [0.0f32; N];
+            for i in 0..N {
+                let mut acc = 0.0f32;
+                for j in 0..N { acc += self.p[i][j] * h[j]; }
+                ph2[i] = acc;
+            }
+            let r_obs = self.r_grav;
+            for i in 0..N {
+                for j in 0..=i {
+                    let v = self.p[i][j] - ph2[i] * kvec[j] + kvec[i] * r_obs * kvec[j];
+                    self.p[i][j] = v;
+                    self.p[j][i] = v;
+                }
+            }
+            for i in 0..N {
+                if !(self.p[i][i] > 1e-6) { self.p[i][i] = 1e-6; }
+                else if self.p[i][i] > 1e6 { self.p[i][i] = 1e6; }
             }
             let mut e = ErrorState::default();
             for kk in 0..3 {

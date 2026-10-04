@@ -16,6 +16,7 @@ use core::mem::MaybeUninit;
 use flyctrl_core::config::VehicleConfig;
 use flyctrl_core::controller::PidController;
 use flyctrl_core::estimator::select::AnyEstimator;
+use flyctrl_core::estimator::Estimator as _; // ★诊断：`accel_bias()` 是 trait 方法，须导入 ✓
 use flyctrl_core::hil::{HilContext, SimImu};
 use flyctrl_core::units::Second;
 
@@ -54,7 +55,14 @@ static mut UPLINK_ITEM: rtos_work_t = unsafe { core::mem::zeroed() };
 static mut LOG_ITEM: rtos_work_t = unsafe { core::mem::zeroed() };
 
 /// L2 WorkItem：estimator（EKF/FDIR 一拍）。
+/// ★诊断：L2 各 item 的 exec（cycles）——定位"谁在吃 4ms"
+pub static mut IT_EXEC_EKF: u32 = 0;
+pub static mut IT_EXEC_ATT: u32 = 0;
+pub static mut IT_EXEC_SEN: u32 = 0;
+
 extern "C" fn estimator_work(_arg: *mut c_void) {
+    let t_it = rtos_app_sdk::rtos::cycle_now();
+    struct D; impl Drop for D { fn drop(&mut self) {} }
     let hil = unsafe { EKF_HIL.assume_init_mut() };
     let sim_imu = unsafe { EKF_IMU.assume_init_mut() };
     // ★design.md §7：排空 `IMU_RING`（1kHz 样本）→ 逐样本 `predict_delta`（不丢样本）。
@@ -101,6 +109,31 @@ extern "C" fn estimator_work(_arg: *mut c_void) {
         s.health = health;
         s.armed = armed;
     }
+    // ★诊断（限流）：加计零偏 + 估计位置/速度 —— 定位 `x_env_motion` 的 est.y 发散源
+    unsafe {
+        static mut DBG_EKF_N: u32 = 0;
+        let c = DBG_EKF_N;
+        DBG_EKF_N = DBG_EKF_N.wrapping_add(1);
+        if c % 250 == 0 || c < 20 {  // ★②：头 20 次全打（定位 NaN 起点）
+            let ab = hil.est.accel_bias();
+            let e = &hil.est.inner;
+            // ★② 最大位置修正量及其来源路（kind: 1=gpsP 2=gpsV 3=baro 4=grav 5=mag ✓）
+            let (mu_kind, mu_dp, gm0, gm1, gm2, gr) = unsafe {
+                let d = core::ptr::addr_of!(flyctrl_core::estimator::eskf::ESKF_MAX_UPD);
+                ((*d)[0], (*d)[1], (*d)[2], (*d)[3], (*d)[4], (*d)[5])
+            };
+            info!(tag: "ekfdbg", "maxUpd kind={} |dp|={:.2} est=({:.2},{:.2},{:.2}) ab=({:.3},{:.3},{:.3}) | step={} gpsP={}/{} gpsV={}/{} grav={}/{} mag={}/{}/{}",
+                  mu_kind, mu_dp,
+                  est.pos[0].0, est.pos[1].0, est.pos[2].0,
+                  ab[0], ab[1], ab[2],
+                  e.n_step, e.n_gps_pos, e.n_gps_pos_rejected,
+                  e.n_gps_vel, e.n_gps_vel_rejected,
+                  e.n_grav_applied, e.n_grav_gated,
+                  e.n_mag, e.n_mag_rejected, e.n_mag_reanchored);
+            info!(tag: "gpsmeas", "meas=({:.2},{:.2},{:.2}) |resid|={:.2}", gm0, gm1, gm2, gr);
+        }
+    }
+    unsafe { IT_EXEC_EKF = rtos_app_sdk::rtos::cycle_now().wrapping_sub(t_it); }
     unsafe {
         let fl = hil.est.inner.filter();
         let wa = hil.est.inner.world_accel();
@@ -121,13 +154,17 @@ extern "C" fn estimator_work(_arg: *mut c_void) {
 
 /// L2 WorkItem：attitude（姿态层一拍 = 原 `control` 的一次循环体）。
 extern "C" fn attitude_work(_arg: *mut c_void) {
+    let t = rtos_app_sdk::rtos::cycle_now();
     crate::flyctrl::control::control_step();
+    unsafe { IT_EXEC_ATT = rtos_app_sdk::rtos::cycle_now().wrapping_sub(t); }
 }
 
 /// L2 WorkItem：sensors（慢传感器 + IMU 采样；design.md §5 `wq:sensors`）。
 extern "C" fn sensors_work(_arg: *mut c_void) {
     // IMU 采样已迁 L0 ISR；本 item 只读慢传感器（气压/磁/GPS）+ 组装帧
+    let t = rtos_app_sdk::rtos::cycle_now();
     crate::flyctrl::sensors_task::sensors_step();
+    unsafe { IT_EXEC_SEN = rtos_app_sdk::rtos::cycle_now().wrapping_sub(t); }
 }
 
 /// ★L3 WorkItem：nav/pos（位置/速度外环，50Hz）→ ATT_SP。
