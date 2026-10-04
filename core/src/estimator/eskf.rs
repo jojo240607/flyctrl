@@ -805,6 +805,17 @@ pub struct Eskf {
     /// C2：机体磁偏置（机体系常量 ✓）—— 未知 ⇒ 由 0 起步并在线估计 ✓（A12 正解 ✓）
     pub mag_b: [f32; 3],
     pub p: Cov,
+    /// ★★2026-10-04【对齐 PX4 `ekf_helper.cpp:48 isHeightResetRequired` / `:82 checkAltitudeValidity`】
+    ///   **融合超时 ⇒ 状态复位** —— PX4 的立场：**绝不让滤波器无限惯性推算** ✗。
+    ///   本仓原无此层 ✗ ⇒ 一旦 GPS/baro 被门拒就无限 dead-reckon ⇒ 漂到千米级 ⇒
+    ///   新息更大 ⇒ 更被拒 ⇒ **正反馈锁死** ✗（实测 est=1000m 而 GPS 说 0 ✓）。
+    pub last_baro_alt: f32,     // 最近有效气压高度（局部 NED z ✓）
+    pub last_gps_pos: [f32; 3], // 最近有效 GPS 位置（NED ✓）
+    pub last_gps_vel: [f32; 3],
+    pub since_hgt_fuse: u32,    // 距上次高度融合的拍数（超时 ⇒ 复位 ✓）
+    pub since_pos_fuse: u32,    // 距上次水平位置融合的拍数 ✓
+    pub n_hgt_reset: u32,       // 复位计数（可观测 ✓）
+    pub n_pos_reset: u32,
     /// NIS 门限（σ ✓；参照：mag 3.0σ / hdg 2.6σ / baro·gps 5.0σ ✓）
     pub gate: f32,
     /// ★★§5.225【对齐 PX4 `gravity_fusion.cpp` ✓】重力辅助幅值门（占 g 比例 ✓）。
@@ -912,6 +923,13 @@ impl Eskf {
             mag_b: [0.0; 3], // 未知硬铁 ⇒ 0 起步 ✓
             p,
             gate,
+            last_baro_alt: 0.0,
+            last_gps_pos: [0.0; 3],
+            last_gps_vel: [0.0; 3],
+            since_hgt_fuse: 0,
+            since_pos_fuse: 0,
+            n_hgt_reset: 0,
+            n_pos_reset: 0,
             // ★§5.225：幅值门在**构造期**读一次旋钮（非热路径 ✓）；>0 用旋钮，否则 0.10（PX4 ✓）
             grav_gate_frac: unsafe {
                 let v = core::ptr::read_volatile(core::ptr::addr_of!(G_ESKF_GRAV_GATE));
@@ -1103,6 +1121,32 @@ impl Eskf {
             }
         }
         self.st.predict(ImuDelta { delta_ang, delta_vel }, g, dt);
+        // ★PX4 `isHeightResetRequired` ✓：融合超时 ⇒ **复位**（不许无限 dead-reckon ✗）
+        //   阈值按 PX4 `EKF2_HGT_TIMEOUT`(默认 2.5s ✓) / 水平 ~2.5s ✓；按拍数近似
+        //   （本函数由 IMU 样本驱动 ✓ ⇒ 200Hz 下 2.5s ≈ 500 拍 ✓）。
+        self.since_hgt_fuse = self.since_hgt_fuse.saturating_add(1);
+        self.since_pos_fuse = self.since_pos_fuse.saturating_add(1);
+        const HGT_TIMEOUT_STEPS: u32 = 500;
+        const POS_TIMEOUT_STEPS: u32 = 500;
+        if self.since_hgt_fuse > HGT_TIMEOUT_STEPS {
+            // 复位高度/垂速到最近有效气压（PX4 `resetHeightTo`/`resetVerticalVelocityTo` ✓）
+            self.st.p[2] = self.last_baro_alt;
+            self.st.v[2] = self.last_gps_vel[2];
+            self.p[I_POS + 2][I_POS + 2] = 25.0; // 复位方差（PX4 同义 ✓）
+            self.since_hgt_fuse = 0;
+            self.n_hgt_reset = self.n_hgt_reset.wrapping_add(1);
+        }
+        if self.since_pos_fuse > POS_TIMEOUT_STEPS {
+            // 复位水平位置/速度到最近有效 GPS（PX4 `resetHorizontalPositionTo` ✓）
+            self.st.p[0] = self.last_gps_pos[0];
+            self.st.p[1] = self.last_gps_pos[1];
+            self.st.v[0] = self.last_gps_vel[0];
+            self.st.v[1] = self.last_gps_vel[1];
+            self.p[I_POS][I_POS] = 25.0;
+            self.p[I_POS + 1][I_POS + 1] = 25.0;
+            self.since_pos_fuse = 0;
+            self.n_pos_reset = self.n_pos_reset.wrapping_add(1);
+        }
         // ★§5.247【姿态历史推入 ✓】每拍记录（供延迟时刻查表 ✓；O(1) ✓）
         self.last_dt = dt;
         self.q_hist[self.q_hist_head] = self.st.q;
@@ -1166,6 +1210,10 @@ impl Eskf {
     /// GPS 位置（H = [0 0 I] ✓）
     pub fn update_gps_pos(&mut self, meas: [f32; 3]) -> Result<f32, &'static str> {
         unsafe { ESKF_KIND = 1.0; }
+        // ★有效性（PX4 `checkLatLonValidity`/`checkAltitudeValidity` 同义 ✓）：有限 + 量级合理
+        if !meas.iter().all(|v| v.is_finite()) || meas[2] < -12_000.0 || meas[2] > 100_000.0 {
+            return Err("GPS 位置：越界/非有限（PX4 check*Validity ✓）⇒ 拒绝 ✓");
+        }
         let mut h = [[0.0f32; N]; 3];
         for a in 0..3 {
             h[a][I_POS + a] = 1.0;
@@ -1185,6 +1233,9 @@ impl Eskf {
         let nis = update_vec3(&mut self.p, &h, &resid, &r, self.gate)?;
         crate::perf::probe(21); // GPS位内3：update_vec3 完
         self.apply(&e);
+        // ★成功融合 ⇒ 刷新"最近有效观测"并清零超时计数（PX4 `_time_last_hgt_fuse` 同义 ✓）
+        self.last_gps_pos = meas;
+        self.since_pos_fuse = 0;
         Ok(nis)
     }
 
@@ -1197,6 +1248,9 @@ impl Eskf {
     /// 注入真实 v_z 故全绿——两场差异的根因 ✓）。垂直速度由气压/GPS 位置观测提供。
     pub fn update_gps_vel(&mut self, meas: [f32; 3]) -> Result<f32, &'static str> {
         unsafe { ESKF_KIND = 2.0; }
+        if !meas.iter().all(|v| v.is_finite()) || meas.iter().any(|v| v.abs() > 200.0) {
+            return Err("GPS 速度：越界/非有限 ⇒ 拒绝 ✓");
+        }
         let mut h = [[0.0f32; N]; 3];
         for a in 0..3 {
             h[a][I_VEL + a] = 1.0;
@@ -1207,6 +1261,8 @@ impl Eskf {
         let e = self.gain_apply(&h, &resid, &r); // 先用更新前的 P ✓
         let nis = update_vec3(&mut self.p, &h, &resid, &r, self.gate)?;
         self.apply(&e);
+        self.last_gps_vel = meas;
+        self.since_hgt_fuse = 0; // GPS 速度含垂直分量 ⇒ 也算高度融合 ✓
         Ok(nis)
     }
 
@@ -1225,6 +1281,11 @@ impl Eskf {
     /// 气压高度（标量 ✓，h = −d ✓ 已数值验证 ✓）
     pub fn update_baro(&mut self, alt: f32) -> Result<f32, &'static str> {
         unsafe { ESKF_KIND = 3.0; }
+        // ★PX4 `checkAltitudeValidity` ✓：马里亚纳海沟~太空边缘之外的观测一律拒绝 ✗
+        //   （防一次坏观测把高度推飞 ✗ —— 实测 kind=3 曾给出 |dp|=456697 的巨型修正 ✓）
+        if !alt.is_finite() || alt < -12_000.0 || alt > 100_000.0 {
+            return Err("气压：高度越界（PX4 checkAltitudeValidity ✓）⇒ 拒绝 ✓");
+        }
         if unsafe { crate::cost::knob_read(core::ptr::addr_of!(G_ESKF_BARO_ON)) } == 2.0 {
             return Err("气压：消融开关关闭 ✓（诊断用，非静默 ✗）");
         }
@@ -1259,6 +1320,9 @@ impl Eskf {
         }
         let nis = update_scalar(&mut self.p, &h, resid, self.r_baro, self.gate)?;
         self.apply(&e);
+        // 气压：观测模型 `alt_obs == −p[2]` ⇒ 最近有效高度 = −alt ✓
+        self.last_baro_alt = -alt;
+        self.since_hgt_fuse = 0;
         Ok(nis)
     }
 

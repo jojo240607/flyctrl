@@ -131,6 +131,14 @@ extern "C" fn estimator_work(_arg: *mut c_void) {
                   e.n_grav_applied, e.n_grav_gated,
                   e.n_mag, e.n_mag_rejected, e.n_mag_reanchored);
             info!(tag: "gpsmeas", "meas=({:.2},{:.2},{:.2}) |resid|={:.2}", gm0, gm1, gm2, gr);
+            // ★拒收诊断：最后一次被拒的 (max_resid, |ν|, nis) + 最后一次成功的 nis
+            let (rj0, rj1, rj2, rjn, ok0, ok1, ok2) = unsafe {
+                let r = core::ptr::addr_of!(flyctrl_core::estimator::eskf::ESKF_LAST_REJ);
+                let k = core::ptr::addr_of!(flyctrl_core::estimator::eskf::ESKF_LAST_OK);
+                ((*r)[0], (*r)[1], (*r)[2], (*r)[3], (*k)[0], (*k)[1], (*k)[2])
+            };
+            info!(tag: "rejdbg", "rej maxres={:.2} |nu|={:.2} nis={:.2} n={} | ok maxres={:.2} |nu|={:.2} nis={:.2}",
+                  rj0, rj1, rj2, rjn, ok0, ok1, ok2);
         }
     }
     unsafe { IT_EXEC_EKF = rtos_app_sdk::rtos::cycle_now().wrapping_sub(t_it); }

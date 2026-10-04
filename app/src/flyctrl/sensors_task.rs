@@ -80,15 +80,26 @@ pub fn imu_sample_step() {
         let dt = if SENS_IMU_PREV_HAS { raw_dt } else { 0.001 };
         SENS_IMU_PREV_HAS = true;
         SENS_IMU_PREV_TS = ts;
-        // ★design.md §3：ISR **只做搬运+打戳**（滤波是"复杂计算" ⇒ 移到 L2 `sensors` item ✗）
-        let _ = (raw_a, raw_g, imu_filters);
+        // ★★★2026-10-04【新旧流程对照发现的根因修复 —— 照 PX4 驱动层语义 ✓】：
+        //   **滤波必须在"形成 IMU 增量之前"** ✓。
+        //   重构前：`ekf_hil` 先对样本滤波（notch+LPF ✓）⇒ EKF 积分的是【滤波后】的陀螺/加计 ✓
+        //           （PX4 同构：驱动层出来就是 `imu.delta_vel/delta_ang` 已滤波 ✓，
+        //            见 `/tmp/gravity.cpp:52` 直接消费 ✓）。
+        //   重构后：本 ISR 用【原始样本】构造 `ImuDelta` ✗，而滤波被移到 L2 item 且只写 topic ✗
+        //           ⇒ **EKF 从此吃未滤波的原始增量** ⇒ 振动/噪声直入传播 ⇒ 零偏/姿态被污染 ⇒ 发散 ✗
+        //           （这解释了"重构前绿、之后红"，且 EKF 内部 11 项 PX4 护栏都治不了 ✓）。
+        //   现：在构造增量**之前**滤波 ✓（与旧路径逐位等价 ✓）。
+        let (a_f, g_f) = imu_filters.process(raw_a, raw_g);
+        SENS_TOPIC_AF = a_f;
+        SENS_TOPIC_GV = g_f;
+        SENS_TOPIC_RG = raw_g;
         SENS_LAST_IMU = s;
         SENS_TOPIC_TS = ts;
         SENS_HAVE_IMU = true;
         let r = &mut *core::ptr::addr_of_mut!(crate::flyctrl::IMU_RING);
         r.push(flyctrl_core::imu_ring::ImuDelta {
-            delta_ang: [s.gyro[0].0 * dt, s.gyro[1].0 * dt, s.gyro[2].0 * dt],
-            delta_vel: [s.accel[0].0 * dt, s.accel[1].0 * dt, s.accel[2].0 * dt],
+            delta_ang: [g_f[0] * dt, g_f[1] * dt, g_f[2] * dt],
+            delta_vel: [a_f[0] * dt, a_f[1] * dt, a_f[2] * dt],
             dt_ang: dt,
             dt_vel: dt,
             ts_cyc: ts,
@@ -124,12 +135,11 @@ pub fn sensors_step() {
                 let imu_sample: Option<ImuSample> =
                     if unsafe { SENS_HAVE_IMU } { Some(unsafe { SENS_LAST_IMU }) } else { None };
                 if let Some(s) = imu_sample.as_ref() {
-                    let (af, gv) = imu_filters.process(
-                        [s.accel[0].0, s.accel[1].0, s.accel[2].0],
-                        [s.gyro[0].0, s.gyro[1].0, s.gyro[2].0],
-                    );
-                    topic_af = af; topic_gv = gv;
-                    topic_rg = [s.gyro[0].0, s.gyro[1].0, s.gyro[2].0];
+                    // ★滤波已前移到 L0 ISR（构造增量之前 ✓，见 `imu_sample_step`）
+                    //   ⇒ 此处**不得再滤一次** ✗（滤波器有状态 ⇒ 双重滤波 = 错误 ✓）；
+                    //   直接取 ISR 存下的结果 ✓（topic 与 `ImuRing` 同源 ✓）。
+                    let _ = (&imu_filters, &s);
+                    unsafe { topic_af = SENS_TOPIC_AF; topic_gv = SENS_TOPIC_GV; topic_rg = SENS_TOPIC_RG; }
                 }
                 let _ = &stack; // 慢传感器由本 item 读；IMU 不在此
                 // ★design.md §7：逐样本**打硬件时间戳**并入 `IMU_RING`（后续 `rate`/`ekf` 消费）。
