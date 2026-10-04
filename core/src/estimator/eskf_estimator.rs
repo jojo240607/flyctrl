@@ -66,6 +66,17 @@ pub struct EskfEstimator {
     omega_body: [f32; 3],
     /// ★§5.136：最近一拍比力（延迟对齐的**机动门**用 ✓；与 PX4 `_accel_horiz_lpf` 同源）
     last_accel: [f32; 3],
+    /// ★★2026-10-04【对齐 PX4 `ekf_helper.cpp:976 updateIMUBiasInhibit`】**IMU 零偏抑制**：
+    ///   PX4 原注："xy accel bias learning is also disabled on ground as those states are
+    ///   **poorly observable when perpendicular to the gravity vector**" ✓，机动过大时也禁止 ✓。
+    ///   本仓原**无此层** ✗ ⇒ 不可观测的零偏被观测噪声乱推 ⇒ 实测 `ba` 涨到 ±1e6 ⇒ 发散 ✗。
+    ///   实现照 PX4 ✓：`|Δv/Δt−ba|`、`|Δω/Δt−bg|` 各做**峰值保持低通**（τ=EKF2_ABL_TAU=10s ✓）；
+    ///   任一超限（EKF2_ABL_ACCLIM=25 m/s² / GYR LIM=3 rad/s ✓）⇒ 抑制。
+    ///   抑制动作：把【零偏状态的协方差清零】✓ —— 与 PX4 `clearInhibitedStateKalmanGains`
+    ///   的"K 清零"**等价**（K∝P ⇒ P=0 ⇒ 该拍不学习 ✓），且只改一处、最不易出错 ✓。
+    accel_mag_filt: f32,
+    ang_rate_mag_filt: f32,
+    accel_bias_inhibit: bool,
     /// ★§5.168【对齐 PX4 `states.acceleration` ✓】：**世界系（NED）加速度**输出
     ///   = `R(q)·f_b + [0,0,g]`（比力旋转 + 重力 ✓），一阶低通 τ=0.05s ✓（平滑 ✓）
     ///   用途：速度环 D 项（§5.167 ✓，PX4 `_vel_dot` 同源 ✓）—— 本仓此前无该量 ✗
@@ -116,6 +127,9 @@ impl EskfEstimator {
     /// 新建：`q0/v0/p0` 初值 + 观测门 `gate`（σ ✓）+ 磁 `mag_I` 先验 ✓。
     pub fn new(q0: Quaternion, v0: [f32; 3], p0: [f32; 3], gate: f32, mag_i_prior: [f32; 3]) -> Self {
         Self {
+            accel_mag_filt: 0.0,
+            ang_rate_mag_filt: 0.0,
+            accel_bias_inhibit: false,
             f: Eskf::new(q0, v0, p0, gate),
             g_ned: [0.0, 0.0, 9.81],
             mag_i_prior,
@@ -271,6 +285,42 @@ impl Estimator for EskfEstimator {
         // 1) 标称态 + 协方差推进 ✓（速率×dt ✓）
         crate::perf::probe(8); // ESKF: step 进入
         self.f.predict(delta_ang, delta_vel, dtf, self.g_ned);
+        // ★★PX4 `updateIMUBiasInhibit` ✓：峰值保持低通 + 超限抑制 + 零偏协方差清零
+        {
+            let inv_dt = if dtf > 1e-9 { 1.0 / dtf } else { 0.0 };
+            let a_corr = [
+                delta_vel[0] * inv_dt - self.f.st.ba[0],
+                delta_vel[1] * inv_dt - self.f.st.ba[1],
+                delta_vel[2] * inv_dt - self.f.st.ba[2],
+            ];
+            let w_corr = [
+                delta_ang[0] * inv_dt - self.f.st.bg[0],
+                delta_ang[1] * inv_dt - self.f.st.bg[1],
+                delta_ang[2] * inv_dt - self.f.st.bg[2],
+            ];
+            let a_n = crate::math::sqrt(a_corr[0]*a_corr[0] + a_corr[1]*a_corr[1] + a_corr[2]*a_corr[2]);
+            let w_n = crate::math::sqrt(w_corr[0]*w_corr[0] + w_corr[1]*w_corr[1] + w_corr[2]*w_corr[2]);
+            const TAU: f32 = 10.0; // EKF2_ABL_TAU ✓
+            let alpha = if TAU > 1e-6 { (dtf / TAU).min(1.0) } else { 1.0 };
+            let beta = 1.0 - alpha;
+            self.accel_mag_filt = if a_n > beta * self.accel_mag_filt { a_n } else { beta * self.accel_mag_filt };
+            self.ang_rate_mag_filt = if w_n > beta * self.ang_rate_mag_filt { w_n } else { beta * self.ang_rate_mag_filt };
+            const ACC_LIM: f32 = 25.0; // EKF2_ABL_ACCLIM ✓
+            const GYR_LIM: f32 = 3.0;  // EKF2_ABL_GYRLIM ✓
+            self.accel_bias_inhibit =
+                (self.accel_mag_filt > ACC_LIM) || (self.ang_rate_mag_filt > GYR_LIM);
+            if self.accel_bias_inhibit {
+                // 抑制：清零零偏状态的协方差（↔ PX4 的 K 清零 ✓，效果等价 ✓）
+                for i in 0..crate::estimator::eskf::N {
+                    for k in 0..3 {
+                        self.f.p[crate::estimator::eskf::I_BA + k][i] = 0.0;
+                        self.f.p[i][crate::estimator::eskf::I_BA + k] = 0.0;
+                        self.f.p[crate::estimator::eskf::I_BG + k][i] = 0.0;
+                        self.f.p[i][crate::estimator::eskf::I_BG + k] = 0.0;
+                    }
+                }
+            }
+        }
         crate::perf::probe(9); // ESKF: predict 完成
 
     }
