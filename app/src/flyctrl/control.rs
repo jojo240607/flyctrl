@@ -107,6 +107,10 @@ pub fn ctrl_init() {
 }
 
 /// ★L2 `wq:attitude`：**一拍**（由工作队列 worker 调用）。
+/// ★解锁直通用的**怠速油门**（PX4 `MOT_SPIN_ARMED` 同构）：仅让电机低速转动，
+/// 远低于悬停（~0.5）⇒ 已解锁但无设定点时**不会起飞** ✓。
+const IDLE_THRUST: f32 = 0.05;
+
 pub fn control_step() {
     unsafe { CTRL_HEARTBEAT = CTRL_HEARTBEAT.wrapping_add(1); }
     let ctrl = unsafe { CTRL_PID.assume_init_mut() };
@@ -424,7 +428,22 @@ pub fn control_step() {
             if a.valid != 0 {
                 let q_des = Quaternion { w: a.q[0], x: a.q[1], y: a.q[2], z: a.q[3] };
                 let rates = ctrl.attitude_rates_sp(q_des, &est, _dt);
-                flyctrl_core::controller::RateSetpoint::new(rates, a.thrust)
+                // ★★怠速下限（PX4 `MOT_SPIN_ARMED` 同构）：**已解锁**时油门不得低于 IDLE_THRUST，
+                //   否则"外环尚未给出油门（未起飞）"⇒ thrust=0 ⇒ 执行器恒 0 ✗（实测
+                //   `unlock_flight` 抓到 `armed=true` 而 `m_permille` 全 0 ✗）。上限仍由外环/限幅决定 ✓。
+                let thr = if armed_eff && health != Health::Critical {
+                    a.thrust.max(IDLE_THRUST)
+                } else {
+                    a.thrust
+                };
+                flyctrl_core::controller::RateSetpoint::new(rates, thr)
+            } else if armed_eff && health != Health::Critical {
+                // ★★★解锁直通（PX4 `MOT_SPIN_ARMED` 同构）：**已解锁但外环尚未给出有效
+                //   姿态设定点**（`ATT_SP.valid=0`，如仅解锁未起飞 / 位置环未就绪）——
+                //   此时若回 INVALID（thrust=0）⇒ 速率环零推力 ⇒ 执行器恒 0 ✗，与"已解锁
+                //   ⇒ 电机应怠速运转"的语义不符（实测 `unlock_flight` 抓到 m_permille 全 0 ✗）。
+                //   直通：**零角速率 + 怠速油门** ⇒ 保持水平且不起飞 ✓。
+                flyctrl_core::controller::RateSetpoint::new([0.0, 0.0, 0.0], IDLE_THRUST)
             } else {
                 flyctrl_core::controller::RateSetpoint::INVALID
             }
