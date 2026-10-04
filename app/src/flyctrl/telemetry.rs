@@ -121,6 +121,32 @@ pub fn telemetry_step() {
             let ng = mavlink::encode_global_position_int(est, seq, fb);
             let kg = d.write(&fb[..ng]);
             if kg > 0 { total += kg; }
+
+            // ★design.md §9：**可观测量经 MAVLink 下发**（NAMED_VALUE_FLOAT，id 251）——
+            //   地面站 / NSH 可直接查看 ✓（§9「可通过 NSH 命令或 MAVLink 实时查看」✓）。
+            //   三项：L1 CPU 占用(‰) / L2 队列上突发已用 cycles / 过载等级(0..3)。
+            {
+                let l1 = unsafe { crate::flyctrl::rate_task::RATE_EXEC_CYC } as u64 * 1000
+                    + unsafe { crate::flyctrl::alloc_task::ALLOC_EXEC_CYC } as u64 * 1000
+                    + unsafe { crate::flyctrl::safety_task::SAFETY_EXEC_CYC } as u64 * 500;
+                let l1_permille = (l1 * 1000 / 168_000_000) as f32;
+                let ovl = crate::flyctrl::safety_task::OVERLOAD_LEVEL
+                    .load(Ordering::Relaxed) as f32;
+                let mut wq = [0u32; 6];
+                if let Some(f) = rtos_app_sdk::abi::slot().work_stats {
+                    f(wq.as_mut_ptr());
+                }
+                let l2_used = wq[5] as f32;
+                for (name, val) in [
+                    (&b"l1_cpu_permille"[..], l1_permille),
+                    (&b"l2_queue_cycles"[..], l2_used),
+                    (&b"overload_level"[..], ovl),
+                ] {
+                    let nn = mavlink::encode_named_value_float_raw(0, val, name, seq, fb);
+                    let kn = d.write(&fb[..nn]);
+                    if kn > 0 { total += kn; }
+                }
+            }
             total
         };
         // 一期固件不带机载电脑 → 默认不做 usb0 下行（见 Cargo.toml `usb-link` 说明）。

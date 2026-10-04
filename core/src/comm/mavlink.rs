@@ -39,7 +39,8 @@ pub use mavlink_core::codec::{
     encode_hil_actuator_controls, encode_hil_sensor, encode_hil_gps, encode_local_pos_from_raw,
     encode_local_pos_raw, encode_set_position_target_local_ned,
     encode_mission_ack, encode_mission_count, encode_mission_item_int, encode_mission_request,
-    encode_param_request_list, encode_param_value, encode_sys_status, encode_vfr_hud_raw,
+    encode_named_value_float_raw, encode_param_request_list, encode_param_value,
+    encode_sys_status, encode_vfr_hud_raw,
 };
 
 // ── VehicleState 便捷封装（内部委托 mavlink-core 的 *_raw） ───────
