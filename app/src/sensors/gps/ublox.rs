@@ -419,6 +419,16 @@ impl GpsSensor for GpsUblox {
         let n = (d_lat * R_EARTH_F64) as f32;
         let e = (d_lon * R_EARTH_F64 * libm_cos(ref_lat * DEG2RAD_F64)) as f32;
         let d = (-(alt - ref_alt)) as f32; // 向下为正
+        // ★诊断（限流）：raw lat/lon → NED（定位"-4676m 量级"来源）
+        {
+            static mut DBG_N: u32 = 0;
+            let c = unsafe { DBG_N };
+            unsafe { DBG_N = DBG_N.wrapping_add(1); }
+            if c % 200 == 0 {
+                info!(tag: "gpsdbg", "lat={:.7} lon={:.7} alt={:.2} ref=({:.7},{:.7},{:.2}) ned=({:.2},{:.2},{:.2})",
+                      lat, lon, alt, ref_lat, ref_lon, ref_alt, n, e, d);
+            }
+        }
         match vel {
             // RMC 附带 Doppler 速度：位置 + 速度观测（EKF update_vel 约束水平速度）
             Some(v) => {

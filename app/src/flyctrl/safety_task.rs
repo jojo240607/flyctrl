@@ -95,8 +95,14 @@ pub extern "C" fn safety_entry(_arg: *mut c_void) {
             if let Some(f) = rtos_app_sdk::abi::slot().work_stats { f(wq.as_mut_ptr()); }
             let mut vio = [0u32; 3];
             if let Some(f) = rtos_app_sdk::abi::slot().rt_violation { f(vio.as_mut_ptr()); }
+            // ★★修正（2026-10-04）：原判据"**单次**硬超时(wq[2]>0) ⇒ level 2"过于激进 ✗
+            //   —— 实测 env 家族中 EKF 单拍偶发超 3× 预算（106 软/1 硬）即把 level 抬到 2
+            //   ⇒ 按 §8 门控 **nav（位置外环）被跳过** ⇒ 飞机完全不跟踪机动 ✗
+            //   （`x_env_motion` 飞机不动、est 冻结；而 Hover 的 env_smoke 不触发 ⇒ 通过 ✓）。
+            //   过载降级是给**【真过载】**用的：必须**持续**违规才降级 ✓（单次抖动不算 ✗）。
+            //   阈值取"连续 5 次硬超时"（与 §5#2 的降级口径一致 ✓）。
             let lvl = if vio[0] > 0 || vio[1] > 0 { 3 }
-                      else if wq[2] > 0 { 2 }
+                      else if wq[2] >= 5 { 2 }
                       else if l1_permille > 600 { 1 }
                       else { 0 };
             OVERLOAD_LEVEL.store(lvl, Ordering::Relaxed);
