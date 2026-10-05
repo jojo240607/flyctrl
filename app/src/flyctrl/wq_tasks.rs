@@ -211,7 +211,12 @@ pub fn setup() {
         );
         hil.est.set_observation_noise(0.25, 0.01, 0.09);
         flyctrl_core::estimator::eskf::G_ESKF_MAG_HDG_GATE = 2.0;
-        flyctrl_core::estimator::eskf::G_ESKF_MAG_YAW_ON = 0.0;
+        // ★★★2026-10-04【根因修复 ⑦：磁强制 **yaw-only**（PX4 安全默认 ✓）】
+        //   AUTO（=0.0）在"磁场干净 + yaw 已对齐"时会**自动启用 3D 磁融合** ✗（含 roll/pitch 观测），
+        //   而重力辅助若被门控 ⇒ 3D 磁成 roll/pitch 唯一参考 ⇒ 每拍把姿态旋转数十度 ⇒ NaN ✗
+        //   （ELFSYM 直读：`magq.before→after` 差数十度 ✗；`update_mag_yaw` 只写 `e.dtheta[2]` ✓）。
+        //   PX4：3D 依赖重力锚定 roll/pitch、属高级可选；默认只用 yaw ✓。
+        flyctrl_core::estimator::eskf::G_ESKF_MAG_YAW_ON = 2.0; // 2.0 = yaw-only ✓
         let k = core::ptr::read_volatile(core::ptr::addr_of!(flyctrl_core::estimator::eskf::G_ESKF_FREEZE_BIAS));
         if k >= 0.5 {
             hil.est.set_freeze_bias(true);
