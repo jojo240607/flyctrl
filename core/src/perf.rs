@@ -17,6 +17,25 @@
 #[link_section = ".app_hilprobe"]
 pub static mut PROBE: [u32; 2] = [0, 0];
 
+/// ★★2026-10-04【相位剖分（固件侧自计，ELFSYM 直读 ✓）】：
+///   每段累计 DWT 周期 + 调用次数 ⇒ 宿主一次读回即可得**每相位精确耗时** ✓
+///   （此前只能"读两次翻号之间的退休指令差"⇒ 需要宿主高频采样 ✗）。
+///   读 DWT->CYCCNT（Cortex-M 固定地址 ✓，仿真器已把它作为计时器 ✓，零副作用 ✓）。
+#[used]
+#[no_mangle]
+pub static mut STAGE_CYC: [u32; 24] = [0; 24];
+#[used]
+#[no_mangle]
+pub static mut STAGE_N: [u32; 24] = [0; 24];
+static mut LAST_STAGE: u32 = 0xFF;
+static mut LAST_CYC: u32 = 0;
+
+#[inline(always)]
+fn dwt_cyccnt() -> u32 {
+    // 0xE000_1004 = DWT->CYCCNT ✓
+    unsafe { core::ptr::read_volatile(0xE000_1004 as *const u32) }
+}
+
 /// 写分段探针（热路径）。
 #[inline(always)]
 pub fn probe(stage: u32) {
@@ -26,5 +45,17 @@ pub fn probe(stage: u32) {
         if stage == 0 {
             (*p)[1] = (*p)[1].wrapping_add(1);
         }
+        // 把**上一段**的耗时记到上一段的账上 ✓
+        let now = dwt_cyccnt();
+        let last = LAST_STAGE;
+        if last < 24 {
+            let d = now.wrapping_sub(LAST_CYC);
+            let sc = core::ptr::addr_of_mut!(STAGE_CYC);
+            (*sc)[last as usize] = (*sc)[last as usize].wrapping_add(d);
+            let sn = core::ptr::addr_of_mut!(STAGE_N);
+            (*sn)[last as usize] = (*sn)[last as usize].wrapping_add(1);
+        }
+        LAST_STAGE = stage;
+        LAST_CYC = now;
     }
 }
