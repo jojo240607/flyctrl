@@ -564,6 +564,7 @@ where
             //   与拆分前行为一致 ✓（小角增量下求和与逐样本复合的差为二阶量，可忽略 ✓）。
             let mut da = [0.0f32; 3];
             let mut dv = [0.0f32; 3];
+            let n_deltas = self.imu_deltas_len;
             let mut dtt_a = 0.0f32;
             let mut dtt_v = 0.0f32;
             for i in 0..self.imu_deltas_len {
@@ -576,6 +577,16 @@ where
                 dtt_v += d.dt_vel;
             }
             self.imu_deltas_len = 0;
+            // ★诊断：predict 入参直读（判定分子/分母哪一侧坏 ✓）
+            unsafe {
+                let d = core::ptr::addr_of_mut!(
+                    crate::estimator::eskf_estimator::ESKF_PRED);
+                (*d)[0] = n_deltas as f32;
+                (*d)[1] = dtt_a;
+                (*d)[2] = dtt_v;
+                (*d)[3] = dv[0]; (*d)[4] = dv[1]; (*d)[5] = dv[2];
+                (*d)[6] = da[0]; (*d)[7] = da[1];
+            }
             self.est.predict_delta(da, dv, dtt_a, dtt_v);
         } else {
             // 单帧回退（SIL/未接环形路径）

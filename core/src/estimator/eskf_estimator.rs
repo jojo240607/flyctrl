@@ -54,6 +54,16 @@ fn bump(idx: usize) {
 }
 
 /// C1 适配器：把 [`Eskf`] 包成统一 [`Estimator`] ✓。
+/// ★诊断：垂直通道（`[obs, est_pz, est_vz, accepted, ...]`）——ELFSYM 直读 ✓
+#[used]
+#[no_mangle]
+pub static mut ESKF_VZ: [f32; 12] = [0.0; 12];
+
+/// ★诊断：predict 入参（`[N, dtt_a, dtt_v, dv0..2, da0..2]`）——ELFSYM 直读 ✓
+#[used]
+#[no_mangle]
+pub static mut ESKF_PRED: [f32; 8] = [0.0; 8];
+
 pub struct EskfEstimator {
     f: Eskf,
     /// 世界重力（NED，向下为正 ✓）
@@ -417,12 +427,21 @@ impl Estimator for EskfEstimator {
 
 
     fn update_alt(&mut self, alt: f32) {
-        if self.f.update_baro(alt).is_ok() {
+        let r = self.f.update_baro(alt).is_ok();
+        if r {
             self.n_baro = self.n_baro.wrapping_add(1);
             bump(3);
         } else {
             self.n_baro_rejected = self.n_baro_rejected.wrapping_add(1);
             bump(4);
+        }
+        // ★诊断：垂直通道直读（ELFSYM ✓）：[obs, est_pz, est_vz, accepted, 0, 0]
+        unsafe {
+            let d = core::ptr::addr_of_mut!(ESKF_VZ);
+            (*d)[0] = alt;
+            (*d)[1] = self.f.st.p[2];
+            (*d)[2] = self.f.st.v[2];
+            (*d)[3] = if r { 1.0 } else { 0.0 };
         }
     }
 
