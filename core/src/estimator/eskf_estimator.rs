@@ -309,6 +309,19 @@ impl Estimator for EskfEstimator {
             const GYR_LIM: f32 = 3.0;  // EKF2_ABL_GYRLIM ✓
             self.accel_bias_inhibit =
                 (self.accel_mag_filt > ACC_LIM) || (self.ang_rate_mag_filt > GYR_LIM);
+            // ★★★2026-10-04【根因修复 ⑧：补齐 **陀螺零偏抑制**（PX4 `_gyro_bias_inhibit` ✓）】
+            //   PX4 `ekf_helper.cpp:1256-1259` 同时抑制 accel_bias 与 **gyro_bias** 两路 ✗；
+            //   本仓此前只做 accel ✗ ⇒ 陀螺零偏发散 ⇒ `predict` 每拍按 `−bg·dt` 旋转姿态 ✗
+            //   （ELFSYM 直读：`d_ang=(0,0,0)` 而 q 单拍转 ~45° ✗ ⇒ 反推 |bg|≈157 rad/s ✗）
+            //   ⇒ 姿态乱走 ⇒ NaN ✓。抑制条件照 PX4 ✓：角速率幅值 < 0.5 rad/s（近静止/未机动）。
+            if self.ang_rate_mag_filt < 0.5 {
+                for i in 0..crate::estimator::eskf::N {
+                    for k in 0..3 {
+                        self.f.p[crate::estimator::eskf::I_BG + k][i] = 0.0;
+                        self.f.p[i][crate::estimator::eskf::I_BG + k] = 0.0;
+                    }
+                }
+            }
             if self.accel_bias_inhibit {
                 // 抑制：清零零偏状态的协方差（↔ PX4 的 K 清零 ✓，效果等价 ✓）
                 for i in 0..crate::estimator::eskf::N {
