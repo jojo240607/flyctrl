@@ -103,10 +103,19 @@ pub fn imu_sample_step() {
                 flyctrl_core::units::MeterPerSecondSquared(a_f[1]),
                 flyctrl_core::units::MeterPerSecondSquared(a_f[2]),
             ],
+            // ★★★2026-10-04【口径修正（正向分析：控制器丢失陀螺滤波 ✗）】
+            //   本字段的消费者**只有**两条，都要求【滤波后】陀螺 ✓：
+            //     · 控制器侧链 `hil.rs` 的 `last_gyro_ctl` ✓（PX4 `VAV.cpp:172-187` 的
+            //       VehicleAngularVelocity 角色 ✓ = **控制器用滤波后陀螺** ✓）
+            //     · `mag_delay_omega`（磁延迟补偿 ✓）
+            //   而 EKF 的姿态传播用 `ImuRing.delta_ang`（**原始** ✓，见下方 push ✓），
+            //   **不读本字段** ✓ ⇒ 本字段取【滤波后】不会污染 EKF ✓。
+            //   我此前把本字段设成 `raw_g` ✗ ⇒ **速率环吃到未滤波陀螺** ✗ ⇒ 闭环
+            //   （env_smoke ✓）发散 —— 这正是它的破坏点 ✓（把两种口径混在同一字段 ✗）。
             gyro: [
-                flyctrl_core::units::RadianPerSecond(raw_g[0]),
-                flyctrl_core::units::RadianPerSecond(raw_g[1]),
-                flyctrl_core::units::RadianPerSecond(raw_g[2]),
+                flyctrl_core::units::RadianPerSecond(g_f[0]),
+                flyctrl_core::units::RadianPerSecond(g_f[1]),
+                flyctrl_core::units::RadianPerSecond(g_f[2]),
             ],
         };
         SENS_TOPIC_TS = ts;
