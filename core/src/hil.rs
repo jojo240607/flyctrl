@@ -92,6 +92,8 @@ where
     pub failsafe_engaged: bool,
     /// HIL 姿态初始化门控：基于首帧**真实** IMU 重力向量做 tilt alignment 后置位。
     pub hil_att_inited: bool,
+    /// ★初始化门控用：连续满足「比力 ≈1g」的帧数（防 IIR/驱动瞬态污染 tilt alignment ✓）
+    pub hil_att_init_cnt: u8,
     /// HIL 位置初始化门控：首个有限设定点到达、EKF 位置对齐物理真值后置位。
     pub hil_pos_inited: bool,
     /// 气压高度基准（m，向上为正）：GPS 首次有效定位（fix）时锁定，此后
@@ -177,6 +179,7 @@ where
             truth_overlay: None,
             failsafe_engaged: false,
             hil_att_inited: false,
+            hil_att_init_cnt: 0,
             hil_pos_inited: false,
             baro_ref: 0.0,
             baro_locked: false,
@@ -504,7 +507,19 @@ where
             // 是物理真值 → 初始姿态最准确。
             let a = raw_accel.unwrap();
             let an = math::sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2]);
-            if an > 1.0 {
+            // ★★★2026-10-04【根因修复：初始化门控必须要求比力 **≈1g**（PX4 `ekf2` 同义 ✓）】
+            //   实测（ELFSYM 直读 ✓）：初始化发生时**原始比力 = (0,0,−1.11)** ✗ —— 幅值
+            //   仅 1.11 ✗（真实静止应为 9.81 ✓）⇒ 旧门控 `an > 1.0` 恰好被 1.11 放行 ✗
+            //   ⇒ 用**尚未建立**的重力矢量做 tilt alignment ⇒ 姿态初值垃圾 ✗
+            //   ⇒ `roll = atan2(−a[1], −a[2])` 在 `a[2]>0` 时给出 **±π** ✗（实测首采样
+            //     `rpy=(3.142,0,…)` ✗）⇒ 比力被错误旋转 ⇒ 水平加速度读成 ~2g ⇒
+            //     速度积分打满 ±100 钳位 ⇒ 位置发散 ✓✓（env_smoke 的破坏点 ✓）。
+            //   现要求幅值落在 [0.9g, 1.1g] 且**连续 5 帧**满足 ✓ ⇒ 确保重力矢量真实 ✓。
+            self.hil_att_init_cnt = self.hil_att_init_cnt.saturating_add(1);
+            // 门控：幅值∈[0.9g,1.1g] ⇒ 立即初始化 ✓；否则最多等 200 帧（约 0.2~0.8s ✓）
+            // 后**兜底初始化** ✓（照 PX4 `ekf2` 的"超时用当前值启动"语义 ✓），
+            // 避免门控过严导致 EKF **永不初始化** ✗（实测反例：5 帧门控 ⇒ rpy=NaN ✗）。
+            if (an > 0.9 * 9.80665 && an < 1.1 * 9.80665) || self.hil_att_init_cnt > 200 {
                 let pitch = math::atan2(a[0], math::sqrt(a[1] * a[1] + a[2] * a[2]));
                 let roll = math::atan2(-a[1], -a[2]);
                 let yaw = if setpoint.yaw.0.is_finite() { setpoint.yaw.0 } else { 0.0 };
