@@ -93,12 +93,33 @@ pub fn imu_sample_step() {
         SENS_TOPIC_AF = a_f;
         SENS_TOPIC_GV = g_f;
         SENS_TOPIC_RG = raw_g;
-        SENS_LAST_IMU = s;
+        // ★帧里存【与 ImuRing **同一口径**】的样本（PX4：一份数据、一条链 ✓）：
+        //   accel = 滤波后 ✓（供重力辅助 ✓）、gyro = **原始** ✓（`ekf_hil` 的既有语义 ✓）。
+        //   此前存的是原始 accel → `ekf_hil` 会**再滤一次**（另一套滤波器实例 ✗），
+        //   且其输入样本序列与 ISR 不同（ISR 对坏 dt 帧先 return ✗）⇒ 两套状态分叉 ✗。
+        SENS_LAST_IMU = flyctrl_core::vehicle::ImuSample {
+            accel: [
+                flyctrl_core::units::MeterPerSecondSquared(a_f[0]),
+                flyctrl_core::units::MeterPerSecondSquared(a_f[1]),
+                flyctrl_core::units::MeterPerSecondSquared(a_f[2]),
+            ],
+            gyro: [
+                flyctrl_core::units::RadianPerSecond(raw_g[0]),
+                flyctrl_core::units::RadianPerSecond(raw_g[1]),
+                flyctrl_core::units::RadianPerSecond(raw_g[2]),
+            ],
+        };
         SENS_TOPIC_TS = ts;
         SENS_HAVE_IMU = true;
         let r = &mut *core::ptr::addr_of_mut!(crate::flyctrl::IMU_RING);
         r.push(flyctrl_core::imu_ring::ImuDelta {
-            delta_ang: [g_f[0] * dt, g_f[1] * dt, g_f[2] * dt],
+            // ★★★2026-10-04【口径修正 —— 对齐 `ekf_hil` 的既有语义（引 PX4 一手 ✓）】：
+            //   · **加速度：滤波后** ✓（供重力辅助 ✓，与 `ekf_hil` 的 `acc` 一致 ✓）
+            //   · **陀螺：原始** ✓（`ekf_hil:452-470` 明确："PX4 陷波/低通 not the estimators
+            //     ⇒ EKF2 用**未滤波**陀螺" ✓）—— 我上一版误用了滤波后的陀螺 ✗ ⇒ 给姿态传播
+            //     引入 40Hz 低通相位滞后 ✗ ⇒ 姿态/重力系统性偏 ✗ ⇒ 发散（11 项内部护栏都治不了 ✓）。
+            //   两者必须与 `ekf_hil` 的消费口径**逐一一致** ✓（PX4：**一份数据、一条链**✓）。
+            delta_ang: [raw_g[0] * dt, raw_g[1] * dt, raw_g[2] * dt],
             delta_vel: [a_f[0] * dt, a_f[1] * dt, a_f[2] * dt],
             dt_ang: dt,
             dt_vel: dt,

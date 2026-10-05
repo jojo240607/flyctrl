@@ -433,10 +433,17 @@ where
                         .unwrap_or_else(|| sim_imu.next(self.dt.0))
                 } else {
                     raw_accel = Some(a);
-                    let mut acc = [0.0f32; 3];
+                    // ★★★2026-10-04【消除双重滤波（PX4：一份数据、一条链 ✓）】：
+                    //   滤波已上移到 **L0 ISR**（`imu_sample_step` ✓ 在构造 `ImuDelta` 之前 ✓），
+                    //   且帧里存的样本已是【accel 滤波后 + gyro 原始】✓（与 `ImuRing` 同口径 ✓）。
+                    //   此处**不得再滤** ✗ —— 否则：(a) 两套滤波器实例状态分叉（ISR 对坏 dt 帧
+                    //   先 return ⇒ 输入序列不同 ✗）；(b) 与传播口径不符 ⇒ 姿态/重力系统性偏 ✗
+                    //   （实测：est.z 开机 800ms 内冲到 +73~174 ✗，而 11 项内部护栏都无效 ✓）。
+                    //   现改为**直接采用**上游已滤波的比力 ✓ 与原始陀螺 ✓（沿用既有语义 ✓）。
+                    let acc = a;
                     let mut gy = [0.0f32; 3];
                     for i in 0..3 {
-                        acc[i] = self.imu_accel_lowpass[i].process(self.imu_accel_notch[i].process(a[i]));
+                        gy[i] = g[i];
                         // ★§5.136 A/B 旋钮：G_ESKF_BYPASS_GYR_NOTCH=2 ⇒ 旁路陀螺陷波
                         let bypass = unsafe {
                             crate::cost::knob_read(core::ptr::addr_of!(
