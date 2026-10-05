@@ -219,8 +219,14 @@ where
         //     落在最优平台内（≈3.93° ✓）。
         {
             let f_ref = 1.0f32;
-            let tau = ctx.imu_gyro_notch[0].group_delay_s(f_ref, fs)
-                + ctx.imu_accel_lowpass[0].group_delay_s(f_ref, fs);
+            // ★★★2026-10-04【遗留不一致修复】：滤波已上移到 **L0 ISR**（按 **IMU 实际率
+            //   1/SAMPLE_DT = 1000 Hz** 设计 ✓），而此处仍用 `fs = 1/dt`（= **250 Hz** ✗）
+            //   计算群延迟 τ ⇒ τ 差 4 倍 ✗ ⇒ **重力辅助的延迟补偿错** ✗ ⇒ 重力把姿态
+            //   拉向滞后方向 ⇒ 系统性姿态误差 ⇒ 闭环发散 ✓（本仓 SAMPLE_DT=1ms ✓）。
+            //   ⇒ 按 IMU 实际率算 τ，与 ISR 的滤波器设计保持一致 ✓。
+            const FS_IMU: f32 = 1000.0; // = 1/SAMPLE_DT ✓（app `sensors_task` 同源）
+            let tau = ctx.imu_gyro_notch[0].group_delay_s(f_ref, FS_IMU)
+                + ctx.imu_accel_lowpass[0].group_delay_s(f_ref, FS_IMU);
             ctx.est.set_accel_lag_s(tau);
         }
         ctx
