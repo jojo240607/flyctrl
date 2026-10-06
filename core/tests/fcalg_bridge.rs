@@ -670,3 +670,58 @@ fn firmware_accel_filter_dc_gain_probe() {
         );
     }
 }
+
+/// ★装配层判据 #9（2026-10-05）：**灌入真链路的噪声 σ** —— 复现第 13°?
+///
+/// 依据（本轮新查 ✓）：真链路传感器**带真实噪声**（`scenario.rs:70-82` ✓）：
+///   `baro σ=0.5 m`、`gps_pos σ=[0.5, 0.5, 0.8] m`、`gps_vel σ=[0.1, 0.1, 0.15] m/s`
+/// 而 app 的 R 正是为这些 σ 配的（`set_observation_noise(0.25, 0.01, 0.09)`
+/// ⇒ σ = 0.5 m / 0.1 m/s / 0.3 m ✓ 逐一吻合 ✓）—— 但此前所有判据（含 #8）**喂理想值** ✗。
+/// 真链路实测形态：前 234 ms 水平 ✓ → 12 Hz 欠阻尼振荡 + 直流累积 ✗，且**三次运行逐字节相同** ✓
+///   ⇒ 与"固定种子噪声 + 欠阻尼回路"完全自洽 ✓✓
+/// 本判据：同 #8 的配置与帧节奏，仅把 GPS/气压换成上述 σ 的噪声（LCG 固定种子 ⇒ 可重复 ✓）。
+/// **只打印**（不制造红灯 ✓）。
+#[test]
+fn hil_app_config_noisy_probe() {
+    use flyctrl_core::controller::PidController;
+    use flyctrl_core::estimator::select::AnyEstimator;
+    use flyctrl_core::hil::{HilContext, SimImu};
+    use flyctrl_core::units::{Meter, MeterPerSecond, MeterPerSecondSquared, RadianPerSecond, Second};
+    use flyctrl_core::vehicle::{ImuSample, PosSample};
+
+    let mut hil = HilContext::new(
+        AnyEstimator::default_product(),
+        PidController::default_quad(),
+        Second(4.0 / 1000.0),
+    );
+    hil.est.set_observation_noise(0.25, 0.01, 0.09); // 真链路配置 ✓
+    let mut sim = SimImu::new();
+    let sp = unsafe { core::mem::zeroed() };
+    let frame = ImuSample {
+        accel: [MeterPerSecondSquared(0.0), MeterPerSecondSquared(0.0), MeterPerSecondSquared(-9.81)],
+        gyro: [RadianPerSecond(0.0); 3],
+    };
+    // 固定种子 LCG ⇒ U(-1,1)（幅值 × σ ✓）
+    let mut seed: u32 = 12345;
+    let mut nz = move || {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        ((seed >> 8) as f32 / 8388608.0) - 1.0
+    };
+    for k in 0..1300u32 {
+        let imu = if k % 3 == 0 { Some(frame) } else { None };
+        let pos = Some(PosSample {
+            pos: [Meter(0.5 * nz()), Meter(0.5 * nz()), Meter(0.8 * nz())],
+            vel: Some([MeterPerSecond(0.1 * nz()), MeterPerSecond(0.1 * nz()), MeterPerSecond(0.15 * nz())]),
+        });
+        let baro = Some(0.5 * nz());
+        let _ = hil.ekf_hil(imu, pos, baro, None, None, None, &sp, false, false, true, &mut sim);
+        if k == 49 || k == 99 || k == 199 || k == 399 || k == 1299 {
+            let q = hil.est.state().att;
+            eprintln!(
+                "[noisy] 第 {:4} 拍：wxyz = [{:+.4}, {:+.4}, {:+.4}, {:+.4}] | 俯仰≈{:.1}°",
+                k + 1, q.w, q.x, q.y, q.z,
+                2.0 * (q.x.abs().min(1.0)).asin().to_degrees()
+            );
+        }
+    }
+}
