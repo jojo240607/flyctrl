@@ -277,11 +277,15 @@ fn nis_consistency_scan_over_q_scale() {
         };
         let rej = f.rejects_total as f64 / (f.nis_n.iter().map(|x| *x as f64).sum::<f64>() + f.rejects_total as f64);
         eprintln!(
-            "[nis] Q×{scale:<7} 平均NIS: baro={:.2}(期望1) gpsP={:.2}(期望3) gpsV={:.2}(期望2) | 拒收率={:.1}%",
+            "[nis] Q×{scale:<7} 平均NIS: baro={:.2}(期望1) gpsP={:.2}(期望3) gpsV={:.2}(期望2) | 拒收率={:.1}% | 拆分: gate={} numeric={} singular={} nonfinite={}",
             mean(0),
             mean(1),
             mean(2),
-            rej * 100.0
+            rej * 100.0,
+            f.rejects_gate,
+            f.rejects_numeric,
+            f.rejects_singular,
+            f.rejects_nonfinite
         );
     }
 }

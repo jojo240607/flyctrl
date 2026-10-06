@@ -123,6 +123,12 @@ pub struct Eskf {
     /// 由 L9 的 `NO_INFO` 设计决定，不是拍的数。
     pub nis_sum: [f64; 4],
     pub nis_n: [u32; 4],
+    /// 拒收**按原因拆分**（诊断用：混在一起会误导 —— 本会话就误导过一次）：
+    /// 门限拒收 / 数值非正定 / S 奇异 / 非有限。
+    pub rejects_gate: u32,
+    pub rejects_numeric: u32,
+    pub rejects_singular: u32,
+    pub rejects_nonfinite: u32,
     /// **本估计器**累计被拒的观测数（含门限拒收与量级门拒收）。
     /// 估计器应当能自报这个数 —— 否则"H 场绿"无法区分"观测都很好"与"观测全被拒"。
     pub rejects_total: u32,
@@ -139,6 +145,10 @@ impl Eskf {
             sigma_gravity: 0.3,
             g_tol_frac: 0.06,
             rejects_total: 0,
+            rejects_gate: 0,
+            rejects_numeric: 0,
+            rejects_singular: 0,
+            rejects_nonfinite: 0,
             nis_sum: [0.0; 4],
             nis_n: [0; 4],
         }
@@ -187,6 +197,20 @@ impl Eskf {
             }
             Err(e) => {
                 self.rejects_total = self.rejects_total.wrapping_add(1);
+                match e {
+                    UpdateError::Rejected { .. } => {
+                        self.rejects_gate = self.rejects_gate.wrapping_add(1)
+                    }
+                    UpdateError::NotPositiveDefinite => {
+                        self.rejects_numeric = self.rejects_numeric.wrapping_add(1)
+                    }
+                    UpdateError::SingularS => {
+                        self.rejects_singular = self.rejects_singular.wrapping_add(1)
+                    }
+                    UpdateError::NonFinite(_) => {
+                        self.rejects_nonfinite = self.rejects_nonfinite.wrapping_add(1)
+                    }
+                }
                 if self.guards[ch_idx(ch)].rejected() {
                     // 达阈值 ⇒ 重灌该通道可观测的方差（L10）。重灌失败（非有限）也**不掩盖**：
                     // 直接放弃本拍，让调用方看到 Err。
