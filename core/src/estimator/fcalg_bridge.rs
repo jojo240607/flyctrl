@@ -179,6 +179,11 @@ pub struct FcalgEstimator {
     pub n_mag_rejected: u32,
     /// ⚠**恒 0**：旧栈的"磁重锚"在 fcalg **无对应** ⇒ 显式登记（绝不假装有数）。
     pub n_mag_reanchored: u32,
+    /// ★磁参考未配置（`mag_i == [0,0,0]`）⇒ **显式拒绝**磁融合的次数（契约 §4「永不静默」）✓。
+    /// 动因（2026-10-05 实测根因）：`State::level()` 的 `mag_i` 是零矢量 ✗ 且
+    /// `set_mag_ref()` 无人调用 ✗ ⇒ `mag_yaw` 拿零参考算创新 ⇒ 姿态悄悄漂走 ✗✗。
+    /// 表现成"姿态不对"而不是"磁没配"正是最糟的失效形式 ⇒ 必须计数、可断言 ✓。
+    pub n_mag_ref_missing: u32,
     /// **本实例**被调用但未实现的次数（按实例计数 ⇒ 并行安全；
     /// 全局 `NOT_IMPLEMENTED_CALLS` 仅作跨实例聚合，不作为单测断言对象）。
     pub not_impl_calls: u32,
@@ -212,6 +217,7 @@ impl FcalgEstimator {
             n_mag: 0,
             n_mag_rejected: 0,
             n_mag_reanchored: 0,
+            n_mag_ref_missing: 0,
         }
     }
 
@@ -386,6 +392,11 @@ impl Estimator for FcalgEstimator {
     /// 磁航向（yaw-only；语义与参数表 `obs.sigma_mag` 对齐）。
     fn update_mag(&mut self, mag: Option<[f32; 3]>) {
         if let Some(m) = mag {
+            // ★未配置磁参考 ⇒ **不融合、显式计数**（契约 §4）✓
+            if self.f.st.mag_i == [0.0; 3] {
+                self.n_mag_ref_missing = self.n_mag_ref_missing.wrapping_add(1);
+                return;
+            }
             let o = mag_yaw(m, &self.f.st, self.prm.sigma_mag);
             self.fuse_track(&o, Channel::MagYaw);
         }

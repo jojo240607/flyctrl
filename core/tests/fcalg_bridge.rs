@@ -238,7 +238,10 @@ fn bridge_level_static_with_mag_keeps_attitude() {
     use flyctrl_core::vehicle::ImuSample;
 
     let mut est = FcalgEstimator::new();
-    let m = est.mag_i(); // 桥接持有的磁参考（水平姿态下应有的机体测量 ✓）
+    // ★★仪器修正（2026-10-05）：原来喂 `est.mag_i()` 当测量 ⇒ **而它就是零矢量** ✗
+    //   ⇒ 零测量被门掉 ⇒ 磁路径**根本没被测到**，"通过"是**空转** ✗（绿灯即噪声 ✗）。
+    //   改喂**真实非零磁场**（对应仿真 `hil.rs:635` 喂真磁场 ✓）。
+    let m = [0.45f32, 0.0, -0.28];
     let dt = Second(0.013);
     let mut worst_abs_w = 1.0f32;
     let mut first_bad = None;
@@ -261,9 +264,19 @@ fn bridge_level_static_with_mag_keeps_attitude() {
         }
         worst_abs_w = worst_abs_w.min(aw);
     }
+    // ★仪器可信性断言（**这条才是关键**）：必须证明磁路径**确实被走到** ✓ ——
+    //   未配置参考 ⇒ 按契约 §4 必须**显式拒绝并计数**（而不是静默漂走 ✗）。
+    assert!(
+        est.n_mag_ref_missing > 0,
+        "磁参考未配置（mag_i 为零矢量）⇒ 必须【显式拒绝并计数】；         若该计数为 0 则本判据**空转** ✗（磁路径没被测到）。n_mag={} n_mag_rejected={}",
+        est.n_mag,
+        est.n_mag_rejected
+    );
     assert!(
         worst_abs_w > 0.9,
-        "加磁观测后水平静止 400 步仍须水平：worst |w| = {worst_abs_w}；首次越界 = {first_bad:?}"
+        "加磁观测后水平静止 400 步仍须水平：worst |w| = {worst_abs_w}；首次越界 = {first_bad:?}；         n_mag_ref_missing={} n_mag={}",
+        est.n_mag_ref_missing,
+        est.n_mag
     );
 }
 
