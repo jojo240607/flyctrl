@@ -23,6 +23,8 @@ pub struct UpdateOut {
     pub p: Cov,
     /// 误差态修正量（由调用方用 `boxplus` 施加）。
     pub dx: [f32; N],
+    /// 本拍新息的 `sqrt(NIS)`（**NIS 一致性标定的原料** —— 期望值由有效观测轴数决定）。
+    pub nis_sigma: f32,
 }
 /// 显式失败原因。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -204,5 +206,5 @@ pub fn update(
     if has_negative_variance(&out) {
         return Err(UpdateError::NotPositiveDefinite);
     }
-    Ok(UpdateOut { p: out, dx })
+    Ok(UpdateOut { p: out, dx, nis_sigma })
 }

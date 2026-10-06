@@ -118,6 +118,11 @@ pub struct Eskf {
     pub sigma_gravity: f32,
     /// 量级门容差（相对；与静止对齐共用 `align.g_tol_frac`）。
     pub g_tol_frac: f32,
+    /// 各通道已接受更新的 **NIS 累计与计数**（NIS 一致性标定用）。
+    /// 期望平均 NIS = 该通道的**有效观测轴数**（气压 1、GPS位 3、GPS速 2、磁航向 1）——
+    /// 由 L9 的 `NO_INFO` 设计决定，不是拍的数。
+    pub nis_sum: [f64; 4],
+    pub nis_n: [u32; 4],
     /// **本估计器**累计被拒的观测数（含门限拒收与量级门拒收）。
     /// 估计器应当能自报这个数 —— 否则"H 场绿"无法区分"观测都很好"与"观测全被拒"。
     pub rejects_total: u32,
@@ -134,6 +139,8 @@ impl Eskf {
             sigma_gravity: 0.3,
             g_tol_frac: 0.06,
             rejects_total: 0,
+            nis_sum: [0.0; 4],
+            nis_n: [0; 4],
         }
     }
     /// 预测：先推协方差（用解析 F），再推标称态。任一失败 ⇒ `Err`（调用方不得提交）。
@@ -172,7 +179,10 @@ impl Eskf {
                 let st_new = boxplus(&self.st, &out.dx).ok_or(FilterError::State(Violation::Nan))?;
                 self.p = out.p;
                 self.st = st_new;
-                self.guards[ch_idx(ch)].accepted();
+                let i = ch_idx(ch);
+                self.nis_sum[i] += out.nis_sigma as f64;
+                self.nis_n[i] = self.nis_n[i].saturating_add(1);
+                self.guards[i].accepted();
                 Ok(())
             }
             Err(e) => {

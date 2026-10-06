@@ -219,3 +219,69 @@ fn blackout_then_recovery_reanchors_in_driven_loop() {
         f.st.p[0].abs()
     );
 }
+
+/// **NIS 一致性扫描** —— 反推 Q 缩放：平均 NIS 应等于该通道的**有效观测轴数**。
+/// 期望值由设计导出（L9 的 NO_INFO）：气压 1、GPS位 3、GPS速 2、磁航向 1。
+/// 扫描只打印（不设断言）—— 它是**标定的原料**，标定结果再写回参数表。
+#[test]
+fn nis_consistency_scan_over_q_scale() {
+    let t = truth();
+    let prm = ObsParams::default();
+    let f_b = specific_force_at_rest(t.q);
+    for scale in [1.0f32, 10.0, 100.0, 1000.0, 10000.0] {
+        let mut f = Eskf::new(t, diag_cov(0.2), 10);
+        f.q = fcalg::filter::ProcessNoise {
+            q_att: 1e-4 * scale,
+            q_vel: 2.0 * scale,
+            q_pos: 1e-4 * scale,
+            q_bg: 1e-6 * scale,
+            q_ba: 1e-4 * scale,
+            q_mag_i: 1e-3 * scale,
+            q_mag_b: 1e-3 * scale,
+        };
+        let mut rng = Rng::new(0x2468_ACE0);
+        for k in 0..3000 {
+            let d = ImuDelta {
+                delta_ang: [0.0; 3],
+                delta_vel: [f_b[0] * DT, f_b[1] * DT, f_b[2] * DT],
+                dt_ang: DT,
+                dt_vel: DT,
+                ts_ticks: 0,
+            };
+            f.predict(&d, GRAVITY_NED).unwrap();
+            let ob = baro(prm.sigma_baro * rng.g(), &f.st, &prm);
+            let _ = f.fuse(&ob, Channel::Baro, 3.0, 1.0);
+            if k % 10 == 0 {
+                let pp = [
+                    prm.sigma_gps_p * rng.g(),
+                    prm.sigma_gps_p * rng.g(),
+                    prm.sigma_gps_p * rng.g(),
+                ];
+                let ob = gps_pos(pp, &f.st, &prm);
+                let _ = f.fuse(&ob, Channel::GpsPos, 3.0, 1.0);
+                let vv = [
+                    prm.sigma_gps_v * rng.g(),
+                    prm.sigma_gps_v * rng.g(),
+                    prm.sigma_gps_v * rng.g(),
+                ];
+                let ob = gps_vel(vv, &f.st, &prm);
+                let _ = f.fuse(&ob, Channel::GpsVel, 3.0, 1.0);
+            }
+        }
+        let mean = |i: usize| -> f64 {
+            if f.nis_n[i] == 0 {
+                f64::NAN
+            } else {
+                f.nis_sum[i] / f.nis_n[i] as f64
+            }
+        };
+        let rej = f.rejects_total as f64 / (f.nis_n.iter().map(|x| *x as f64).sum::<f64>() + f.rejects_total as f64);
+        eprintln!(
+            "[nis] Q×{scale:<7} 平均NIS: baro={:.2}(期望1) gpsP={:.2}(期望3) gpsV={:.2}(期望2) | 拒收率={:.1}%",
+            mean(0),
+            mean(1),
+            mean(2),
+            rej * 100.0
+        );
+    }
+}
