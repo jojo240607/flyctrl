@@ -11,6 +11,7 @@ pub mod finite;
 pub mod imu_delta;
 pub mod imu_filter;
 pub mod math;
+pub mod propagate;
 pub mod quat;
 pub mod units;
 
@@ -18,5 +19,6 @@ pub use align::{align_static, AlignConfig, AlignError, AlignResult};
 pub use finite::{gate, gate_all, violations, violations_total, Stage, Violation};
 pub use imu_delta::{DeltaBuilder, ImuDelta, Reject};
 pub use imu_filter::{ImuFilter, ImuFiltered};
+pub use propagate::{propagate, State};
 pub use quat::{specific_force_at_rest, Quat, GRAVITY_NED};
 pub use units::{Meters, Mps, Radians, Rps, Seconds};
