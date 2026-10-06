@@ -5,14 +5,25 @@
 //!   **Legacy 不再作为任何判据的参照** ✓ ⇒ 按用户要求（"去掉 legacy" ✓）删除本体 ✓。
 
 use crate::estimator::eskf_estimator::EskfEstimator;
+#[cfg(feature = "fcalg-est")]
+use crate::estimator::fcalg_bridge::FcalgEstimator;
+
+/// **内层实现类型（按 feature 选择）** —— 用类型别名而不是枚举：
+/// 两种类型都实现了 `Estimator` ⇒ **下面 13 个 trait 转发一行都不用改** ✓
+/// （枚举则要逐方法 match；那是在装配必经点上做无谓的风险）。
+/// ⚠默认（无 feature）行为**逐位不变** ✓。
+#[cfg(not(feature = "fcalg-est"))]
+pub type InnerEst = EskfEstimator;
+#[cfg(feature = "fcalg-est")]
+pub type InnerEst = FcalgEstimator;
 use crate::estimator::trait_def::Estimator;
 use crate::units::Second;
 use crate::vehicle::{AirspeedSample, ImuSample, PosSample, Quaternion, RtkSample, VehicleState, VioSample};
 
 /// 估计器句柄 ✓（现仅含产品实现：误差状态 EKF ✓）
 pub struct AnyEstimator {
-    /// 实际实现 ✓（ESKF ✓）
-    pub inner: EskfEstimator,
+    /// 实际实现 ✓（默认 ESKF；`fcalg-est` 开启时为新栈估计器 ✓）
+    pub inner: InnerEst,
 }
 
 impl Default for AnyEstimator {
@@ -24,33 +35,74 @@ impl Default for AnyEstimator {
 impl AnyEstimator {
     /// ★**产品默认**：ESKF ✓
     pub fn default_product() -> Self {
-        AnyEstimator { inner: EskfEstimator::default_quad() }
+        #[cfg(not(feature = "fcalg-est"))]
+        {
+            AnyEstimator { inner: EskfEstimator::default_quad() }
+        }
+        #[cfg(feature = "fcalg-est")]
+        {
+            AnyEstimator { inner: FcalgEstimator::new() }
+        }
     }
     /// ★§5.132：设置观测噪声（直接转发 ✓）
     pub fn set_observation_noise(&mut self, r_gps_p: f32, r_gps_v: f32, r_baro: f32) {
+        #[cfg(not(feature = "fcalg-est"))]
         self.inner.set_observation_noise(r_gps_p, r_gps_v, r_baro);
+        #[cfg(feature = "fcalg-est")]
+        self.inner.set_observation_noise3(r_gps_p, r_gps_v, r_baro);
     }
     /// ★§5.136 诊断用：冻结零偏修正 ✓
     pub fn set_freeze_bias(&mut self, v: bool) {
-        self.inner.filter_mut().freeze_bias = v;
+        #[cfg(not(feature = "fcalg-est"))]
+        {
+            self.inner.filter_mut().freeze_bias = v;
+        }
+        // ★fcalg **无此旋钮** ⇒ 显式拒绝 + 计数（绝不静默丢弃 —— 否则调用方以为生效 ✗）
+        #[cfg(feature = "fcalg-est")]
+        {
+            let _ = v;
+            let _ = self.inner.refuse_freeze_bias();
+        }
     }
     /// ✗§5.249【已删 ✓】原 `legacy()`/`legacy_with_alpha()`/平移补偿 oracle 注入 ✗
     ///   保留为**显式拒绝** ✓（避免调用方**静默**以为仍在配置 ✗）：
     pub fn set_world_accel(&mut self, _a: [f32; 3]) {}
     /// 与 [`Self::set_world_accel`] 配套的历史计数 ✓（现恒 0 ✓）
     pub fn world_accel_refused(&self) -> u32 {
-        0
+        #[cfg(not(feature = "fcalg-est"))]
+        {
+            0
+        }
+        #[cfg(feature = "fcalg-est")]
+        self.inner.not_impl_calls
     }
     /// ★§5.249【磁参考/硬铁设置 ✓】原 Legacy `set_mag_ref3d`/`set_mag_hard_iron` 的等价 ✓
     pub fn set_mag_reference(&mut self, mag_i: [f32; 3]) {
-        self.inner.filter_mut().mag_i = mag_i;
+        #[cfg(not(feature = "fcalg-est"))]
+        {
+            self.inner.filter_mut().mag_i = mag_i;
+        }
+        #[cfg(feature = "fcalg-est")]
+        self.inner.set_mag_ref(mag_i);
     }
     pub fn set_mag_hard_iron(&mut self, mag_b: [f32; 3]) {
-        self.inner.filter_mut().mag_b = mag_b;
+        #[cfg(not(feature = "fcalg-est"))]
+        {
+            self.inner.filter_mut().mag_b = mag_b;
+        }
+        #[cfg(feature = "fcalg-est")]
+        self.inner.set_mag_bias(mag_b);
     }
     /// 估计器种类自证 ✓（本仓头号纪律：机制必须在运行 ✓）
     pub fn kind(&self) -> &'static str {
-        "eskf"
+        #[cfg(not(feature = "fcalg-est"))]
+        {
+            "eskf"
+        }
+        #[cfg(feature = "fcalg-est")]
+        {
+            "fcalg-eskf"
+        }
     }
 }
 
