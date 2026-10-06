@@ -219,3 +219,50 @@ fn bridge_level_static_keeps_attitude() {
         "水平静止 400 步后姿态必须仍水平：worst |w| = {worst_abs_w}；首次越界 = {first_bad:?}"
     );
 }
+
+/// ★装配层判据 #2（2026-10-05）：**加磁观测**后水平静止仍须水平。
+///
+/// 动因（嫌疑 #1）：真链路 `q.w = −0.664`（≈150°）✗，而判据 #1 已排除 predict+重力 ✓
+/// ⇒ 嫌疑转向**磁观测路径**（`update_mag` → `mag_yaw`）。依据：L9b 是 yaw-only，
+/// 但 **roll/pitch 有物理耦合（H 为精确导数）** ✓；且固件路径**无人设置**
+/// `set_mag_ref`/`set_mag_bias` ✗ ⇒ 未标定的参考可经耦合污染倾角 ✓
+///
+/// 做法：用**桥接自己的磁参考** `mag_i()` 当"水平姿态下应有的机体测量" ✓
+///（`R = I` ⇒ `mag_body = mag_i` ⇒ 创新应为 0 ⇒ 正确行为是**姿态不动** ✓）。
+/// 若姿态被拉走 ⇒ 磁路径有缺陷 ✓；若不动 ⇒ 嫌疑 #1 排除，转向位置/GPS 路径 ✓。
+#[test]
+fn bridge_level_static_with_mag_keeps_attitude() {
+    use flyctrl_core::estimator::fcalg_bridge::FcalgEstimator;
+    use flyctrl_core::estimator::trait_def::*;
+    use flyctrl_core::units::{MeterPerSecondSquared, RadianPerSecond, Second};
+    use flyctrl_core::vehicle::ImuSample;
+
+    let mut est = FcalgEstimator::new();
+    let m = est.mag_i(); // 桥接持有的磁参考（水平姿态下应有的机体测量 ✓）
+    let dt = Second(0.013);
+    let mut worst_abs_w = 1.0f32;
+    let mut first_bad = None;
+    for k in 0..400 {
+        let imu = ImuSample {
+            accel: [
+                MeterPerSecondSquared(0.0),
+                MeterPerSecondSquared(0.0),
+                MeterPerSecondSquared(-9.81),
+            ],
+            gyro: [RadianPerSecond(0.0); 3],
+        };
+        let st = est.step(dt, imu, None, None);
+        est.update_mag(Some(m));
+        let st2 = est.state();
+        let aw = st2.att.w.abs();
+        let _ = st;
+        if aw < 0.9 && first_bad.is_none() {
+            first_bad = Some((k, st2.att.w, st2.att.x, st2.att.y, st2.att.z));
+        }
+        worst_abs_w = worst_abs_w.min(aw);
+    }
+    assert!(
+        worst_abs_w > 0.9,
+        "加磁观测后水平静止 400 步仍须水平：worst |w| = {worst_abs_w}；首次越界 = {first_bad:?}"
+    );
+}
