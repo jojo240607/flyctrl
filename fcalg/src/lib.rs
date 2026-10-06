@@ -7,6 +7,7 @@
 
 pub mod align;
 pub mod biquad;
+pub mod covariance;
 pub mod error_state;
 pub mod finite;
 pub mod imu_delta;
@@ -18,6 +19,7 @@ pub mod transition;
 pub mod units;
 
 pub use align::{align_static, AlignConfig, AlignError, AlignResult};
+pub use covariance::{is_positive_definite, is_symmetric_exact, propagate_covariance, Cov, CovError};
 pub use error_state::{boxminus, boxplus, I_ATT, I_BA, I_BG, I_MAGB, I_MAGI, I_POS, I_VEL, N};
 pub use finite::{gate, gate_all, violations, violations_total, Stage, Violation};
 pub use imu_delta::{DeltaBuilder, ImuDelta, Reject};
