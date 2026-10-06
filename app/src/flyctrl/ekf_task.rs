@@ -101,6 +101,15 @@ pub extern "C" fn ekf_entry(_arg: *mut c_void) {
         }
 
         st.sample(st.tick().wrapping_sub(t0));
+        // ★2026-10-05 诊断出口（一次性）：判定"重力观测到底有没有在起作用" ✗
+        //   判据 #7 已证：姿态残差永久冻结的直接原因是【重力观测被拒】✗ ⇒
+        //   这里把采用数/被门掉数/丢帧数打出来，真链路跑一次即可判定 ✓
+        if it == 250 {
+            info!(tag: "diag",
+                "grav_a={} grav_g={} imu_rej={} imu_out={} step={}",
+                hil.est.inner.n_grav_applied, hil.est.inner.n_grav_gated,
+                hil.n_imu_rejected, hil.n_imu_step_outlier, hil.est.inner.n_step);
+        }
         it = it.wrapping_add(1);
         if it % 250 == 0 { st.report_and_reset(); } // ★P1-2 可观测
         if first {
