@@ -118,6 +118,8 @@ pub struct Eskf {
     pub sigma_gravity: f32,
     /// 量级门容差（相对；与静止对齐共用 `align.g_tol_frac`）。
     pub g_tol_frac: f32,
+    /// NIS 门的置信度（千分比；门限由 `params::nis_threshold(dof, α)` **导出**）。
+    pub nis_alpha_milli: u32,
     /// 各通道已接受更新的 **NIS 累计与计数**（NIS 一致性标定用）。
     /// 期望平均 NIS = 该通道的**有效观测轴数**（气压 1、GPS位 3、GPS速 2、磁航向 1）——
     /// 由 L9 的 `NO_INFO` 设计决定，不是拍的数。
@@ -144,6 +146,7 @@ impl Eskf {
             gravity_guard: ChannelGuard::new(max_consecutive_rejects),
             sigma_gravity: 0.3,
             g_tol_frac: 0.06,
+            nis_alpha_milli: 997,
             rejects_total: 0,
             rejects_gate: 0,
             rejects_numeric: 0,
@@ -184,7 +187,13 @@ impl Eskf {
         gate_sigma: f32,
         reflate_floor: f32,
     ) -> Result<(), FilterError> {
-        match update(&self.p, &o.h, &o.resid, &o.r, gate_sigma) {
+        // 门限：**dof 感知**（override > 0 时按 override，供测试显式放开）
+        let thr = if gate_sigma > 0.0 {
+            gate_sigma
+        } else {
+            crate::params::nis_threshold(o.dof, self.nis_alpha_milli)
+        };
+        match update(&self.p, &o.h, &o.resid, &o.r, thr) {
             Ok(out) => {
                 let st_new = boxplus(&self.st, &out.dx).ok_or(FilterError::State(Violation::Nan))?;
                 self.p = out.p;

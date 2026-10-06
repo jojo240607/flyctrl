@@ -84,7 +84,7 @@ fn noisy_with_outliers_stays_within_2sigma_and_gate_fires() {
         // 气压：真值 0 + 噪声
         let alt = 0.0 + prm.sigma_baro * rng.g();
         let ob = baro(alt, &f.st, &prm);
-        let _ = f.fuse(&ob, Channel::Baro, 3.0, 1.0);
+        let _ = f.fuse(&ob, Channel::Baro, 0.0, 1.0);
         if k % 10 == 0 {
             // 1% 拍注入 50σ 坏值
             let spike = if k % 1000 == 0 {
@@ -99,14 +99,14 @@ fn noisy_with_outliers_stays_within_2sigma_and_gate_fires() {
                 prm.sigma_gps_p * rng.g(),
             ];
             let ob = gps_pos(pp, &f.st, &prm);
-            let _ = f.fuse(&ob, Channel::GpsPos, 3.0, 1.0);
+            let _ = f.fuse(&ob, Channel::GpsPos, 0.0, 1.0);
             let vv = [
                 prm.sigma_gps_v * rng.g(),
                 prm.sigma_gps_v * rng.g(),
                 prm.sigma_gps_v * rng.g(),
             ];
             let ob = gps_vel(vv, &f.st, &prm);
-            let _ = f.fuse(&ob, Channel::GpsVel, 3.0, 1.0);
+            let _ = f.fuse(&ob, Channel::GpsVel, 0.0, 1.0);
         }
         if k >= WARM {
             let mut ep = 0.0f64;
@@ -171,9 +171,9 @@ fn blackout_then_recovery_reanchors_in_driven_loop() {
         };
         f.predict(&d, GRAVITY_NED).unwrap();
         let ob = baro(0.0, &f.st, &prm);
-        let _ = f.fuse(&ob, Channel::Baro, 3.0, 1.0);
+        let _ = f.fuse(&ob, Channel::Baro, 0.0, 1.0);
         let ob = gps_pos([0.0; 3], &f.st, &prm);
-        let _ = f.fuse(&ob, Channel::GpsPos, 3.0, 1.0);
+        let _ = f.fuse(&ob, Channel::GpsPos, 0.0, 1.0);
     }
     // 黑障：GPS 断 600 拍（3 s），且**故意让状态被推偏**（模拟无锚定漂移）
     for _ in 0..600 {
@@ -202,7 +202,7 @@ fn blackout_then_recovery_reanchors_in_driven_loop() {
         f.predict(&d, GRAVITY_NED).unwrap();
         let pp = [prm.sigma_gps_p * rng.g(), 0.0, 0.0];
         let ob = gps_pos(pp, &f.st, &prm);
-        let _ = f.fuse(&ob, Channel::GpsPos, 3.0, 1.0);
+        let _ = f.fuse(&ob, Channel::GpsPos, 0.0, 1.0);
     }
     eprintln!(
         "[disc] 黑障漂移 {drifted:.3} m ⇒ 恢复后 |p_x|={:.4} ≤ {b_pos}；重灌={}",
@@ -250,7 +250,7 @@ fn nis_consistency_scan_over_q_scale() {
             };
             f.predict(&d, GRAVITY_NED).unwrap();
             let ob = baro(prm.sigma_baro * rng.g(), &f.st, &prm);
-            let _ = f.fuse(&ob, Channel::Baro, 3.0, 1.0);
+            let _ = f.fuse(&ob, Channel::Baro, 0.0, 1.0);
             if k % 10 == 0 {
                 let pp = [
                     prm.sigma_gps_p * rng.g(),
@@ -258,14 +258,14 @@ fn nis_consistency_scan_over_q_scale() {
                     prm.sigma_gps_p * rng.g(),
                 ];
                 let ob = gps_pos(pp, &f.st, &prm);
-                let _ = f.fuse(&ob, Channel::GpsPos, 3.0, 1.0);
+                let _ = f.fuse(&ob, Channel::GpsPos, 0.0, 1.0);
                 let vv = [
                     prm.sigma_gps_v * rng.g(),
                     prm.sigma_gps_v * rng.g(),
                     prm.sigma_gps_v * rng.g(),
                 ];
                 let ob = gps_vel(vv, &f.st, &prm);
-                let _ = f.fuse(&ob, Channel::GpsVel, 3.0, 1.0);
+                let _ = f.fuse(&ob, Channel::GpsVel, 0.0, 1.0);
             }
         }
         let mean = |i: usize| -> f64 {

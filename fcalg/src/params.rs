@@ -150,6 +150,14 @@ pub const PARAMS: &[Meta] = &[
         source: Source::Primary("flyctrl app/src/flyctrl/wq_tasks.rs: G_ESKF_MAG_HDG_GATE = 2.0（旧栈磁航向门限）"),
     },
     Meta {
+        name: "gate.confidence_milli",
+        value: 997.0,
+        unit: Unit::Ratio,
+        lo: 900.0,
+        hi: 999.0,
+        source: Source::Derived("χ² 上尾 0.997 ⇒ 门限由 sqrt(χ²_dof(α)) 导出（数学常数，非整定）"),
+    },
+    Meta {
         name: "gate.nis_sigma",
         value: 3.0,
         unit: Unit::Ratio,
@@ -230,6 +238,24 @@ pub const PARAMS: &[Meta] = &[
         source: Source::Primary("flyctrl core/src/estimator/eskf.rs::predict 的 Q（q[MAGB]=1e-3·dt）—— 同上 caveat"),
     },
 ];
+/// **NIS 门限**：按"置信度 + 有效观测轴数"导出 `sqrt(χ²_dof(α))`。
+///
+/// ★为何不再用"σ 倍数"：`sqrt(NIS) ≤ σ` 只在 **1 个自由度**时才等价于"σ 倍"；
+///   对 dof=3 用 3.0 会**天然过紧**（3σ 对 χ²₃ 只覆盖 ~97%，会丢掉 ~3% 的健康观测；
+///   实测在 dof=3 通道上丢掉了 12~16%）。本会话实测证据见此。
+/// 表中是 **χ² 上尾分位数的平方根**（数学常数，不是整定值）：
+///   α=0.997: dof1 √8.807=2.968 / dof2 √11.983=3.462 / dof3 √14.156=3.763
+///   α=0.990: dof1 √6.635=2.576 / dof2 √9.210=3.035 / dof3 √11.345=3.368
+/// ⇒ dof=1 时退化为 ≈3.0，**与旧栈的标量约定一致**（这正是它"看起来对"的原因）。
+pub fn nis_threshold(dof: u8, alpha_milli: u32) -> f32 {
+    let d = dof.clamp(1, 3) as usize - 1;
+    match alpha_milli {
+        990 => [2.5758, 3.0349, 3.3682][d],
+        0 | 997 => [2.9677, 3.4616, 3.7626][d],
+        _ => [2.9677, 3.4616, 3.7626][d],
+    }
+}
+
 /// 按名查参数。
 pub fn param(name: &str) -> Option<&'static Meta> {
     PARAMS.iter().find(|m| m.name == name)

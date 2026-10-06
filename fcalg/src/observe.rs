@@ -44,6 +44,9 @@ pub const NO_INFO: f32 = 1e12;
 /// 观测三元组。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Obs {
+    /// **有效观测轴数**（决定 NIS 门限；由 NO_INFO 设计决定，不是拍的数）：
+    /// baro 1 / GPS位 3 / GPS速 2（垂直无信息）/ 磁航向 1 / 重力 3。
+    pub dof: u8,
     pub h: [[f32; N]; 3],
     /// 新息 `ν = z − h(x)`。
     pub resid: [f32; 3],
@@ -72,7 +75,7 @@ pub fn baro(alt_meas: f32, st: &State, prm: &ObsParams) -> Obs {
     h[0][I_POS + 2] = -1.0; // 模型：alt == −p_z
     let resid = [alt_meas - (-st.p[2]), 0.0, 0.0];
     let s = prm.sigma_baro * prm.sigma_baro;
-    Obs { h, resid, r: diag(s, NO_INFO, NO_INFO) }
+    Obs { dof: 1, h, resid, r: diag(s, NO_INFO, NO_INFO) }
 }
 /// GPS 位置（NED，三轴全有效）。
 pub fn gps_pos(meas: [f32; 3], st: &State, prm: &ObsParams) -> Obs {
@@ -82,7 +85,7 @@ pub fn gps_pos(meas: [f32; 3], st: &State, prm: &ObsParams) -> Obs {
     }
     let resid = [meas[0] - st.p[0], meas[1] - st.p[1], meas[2] - st.p[2]];
     let s = prm.sigma_gps_p * prm.sigma_gps_p;
-    Obs { h, resid, r: diag(s, s, s) }
+    Obs { dof: 3, h, resid, r: diag(s, s, s) }
 }
 /// GPS 速度（NED）：**水平有效、垂直无信息**（RMC 只给水平 Doppler）。
 pub fn gps_vel(meas: [f32; 3], st: &State, prm: &ObsParams) -> Obs {
@@ -92,7 +95,7 @@ pub fn gps_vel(meas: [f32; 3], st: &State, prm: &ObsParams) -> Obs {
     }
     let resid = [meas[0] - st.v[0], meas[1] - st.v[1], meas[2] - st.v[2]];
     let s = prm.sigma_gps_v * prm.sigma_gps_v;
-    Obs { h, resid, r: diag(s, s, NO_INFO) }
+    Obs { dof: 2, h, resid, r: diag(s, s, NO_INFO) }
 }
 /// `R(q)` 的行（与 L6 同一实现方式：对基向量取像）。
 fn rot_matrix(q: crate::quat::Quat) -> [[f32; 3]; 3] {
@@ -136,7 +139,7 @@ pub fn gravity(f_b_meas: [f32; 3], st: &State, sigma: f32) -> Obs {
         }
     }
     let s = sigma * sigma;
-    Obs { h, resid, r: diag(s, s, s) }
+    Obs { dof: 3, h, resid, r: diag(s, s, s) }
 }
 
 /// 量级门：`| ‖f_b_meas‖ − g | / g ≤ tol`（与静止对齐同一判据）。
@@ -194,5 +197,5 @@ pub fn mag_yaw(mag_body_meas: [f32; 3], st: &State, sigma: f32) -> Obs {
         h[0][I_MAGI + 1] = st.mag_i[0] / hi2;
     }
     let s = sigma * sigma;
-    Obs { h, resid: [nu, 0.0, 0.0], r: diag(s, NO_INFO, NO_INFO) }
+    Obs { dof: 1, h, resid: [nu, 0.0, 0.0], r: diag(s, NO_INFO, NO_INFO) }
 }
