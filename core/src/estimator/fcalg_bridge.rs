@@ -113,6 +113,27 @@ impl FcalgEstimator {
         }
     }
 
+    /// `AnyEstimator::set_observation_noise(r_gps_p, r_gps_v, r_baro)` 的对应 ✓
+    /// （注意：fcalg 另有 `sigma_mag`，旧签名不含 ⇒ 保留默认 ✓）
+    pub fn set_observation_noise3(&mut self, r_gps_p: f32, r_gps_v: f32, r_baro: f32) {
+        self.prm.sigma_gps_p = r_gps_p;
+        self.prm.sigma_gps_v = r_gps_v;
+        self.prm.sigma_baro = r_baro;
+    }
+    /// `set_mag_reference` / `set_mag_hard_iron` 的对应 ✓（写进标称态）
+    pub fn set_mag_ref(&mut self, mag_i: [f32; 3]) {
+        self.f.st.mag_i = mag_i;
+    }
+    pub fn set_mag_bias(&mut self, mag_b: [f32; 3]) {
+        self.f.st.mag_b = mag_b;
+    }
+    /// ★`set_freeze_bias` 在 fcalg **无对应**（旧 ESKF 的磁两态冻结旋钮）⇒
+    ///   **显式拒绝并计数**，绝不静默丢弃（否则调用方以为生效 ✗）。
+    pub fn refuse_freeze_bias(&mut self) -> u32 {
+        self.not_impl_calls = self.not_impl_calls.wrapping_add(1);
+        self.not_impl_calls
+    }
+
     fn fuse_track(&mut self, o: &Obs, ch: Channel) {
         if self.f.fuse(o, ch, self.gate_sigma, self.reflate_floor).is_err() {
             self.fuse_rejects = self.fuse_rejects.wrapping_add(1);
