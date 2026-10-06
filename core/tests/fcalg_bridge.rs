@@ -543,3 +543,53 @@ fn hil_accel_z_sign_init_probe() {
         );
     }
 }
+
+/// ★装配层判据 #7（2026-10-05）：**坏初始化之后能否恢复**（机制判定 ✓）。
+///
+/// 来源：帧内比力已**测得**为 −9.81 ✓（harness 注入 `st.imu_acc=[0,0,-9.81]` ✓，
+/// 外设纯单位换算 ✓，驱动解码 ✓）⇒ 边界/仿真侧全部无罪 ✓ ⇒ 171° 另有其处 ✗。
+/// 新机制假设（与全部事实自洽 ✓，本判据判定）：
+///   ① 初始化的那一拍比力若方向错（IIR 瞬态/首帧垃圾 ✗）⇒ 初值被格成 ~180° ✗
+///   ② 之后靠重力观测**修不回来** ✗ —— 修正量约 2g，远超 NIS 门限 ⇒ **每拍被拒** ✗
+///   ③ 偏航本就不可观测（磁参考为零 ⇒ 按契约拒 ✓）⇒ 永久冻结 ✓
+/// 本判据：第一帧 `az=+9.81`（照判据 #6 的 180° 签名 ✓），其后全部 `az=−9.81`。
+///   · 姿态长期冻在翻转 ⇒ ② 成立 ✓（修法：持续性大创新时放行一次重灌/重对齐 ✓）
+///   · 姿态恢复水平 ⇒ ② 不成立 ✗
+/// **只打印**（不制造红灯 ✓）。
+#[test]
+fn hil_bad_init_then_good_probe() {
+    use flyctrl_core::controller::PidController;
+    use flyctrl_core::estimator::select::AnyEstimator;
+    use flyctrl_core::hil::{HilContext, SimImu};
+    use flyctrl_core::units::{MeterPerSecondSquared, RadianPerSecond, Second};
+    use flyctrl_core::vehicle::ImuSample;
+
+    let mut hil = HilContext::new(
+        AnyEstimator::default_product(),
+        PidController::default_quad(),
+        Second(4.0 / 1000.0),
+    );
+    let mut sim = SimImu::new();
+    let sp = unsafe { core::mem::zeroed() };
+    let frame = |az: f32| ImuSample {
+        accel: [
+            MeterPerSecondSquared(0.0),
+            MeterPerSecondSquared(0.0),
+            MeterPerSecondSquared(az),
+        ],
+        gyro: [RadianPerSecond(0.0); 3],
+    };
+    for k in 0..1300 {
+        // 第 0 拍（首个被接受的帧，触发初始化）给 +9.81 ⇒ 坏初值；其后一律 −9.81 ✓
+        let az = if k == 0 { 9.81 } else { -9.81 };
+        let imu = if k % 3 == 0 { Some(frame(az)) } else { None };
+        let _ = hil.ekf_hil(imu, None, None, None, None, None, &sp, false, false, true, &mut sim);
+        if k == 0 || k == 9 || k == 99 || k == 399 || k == 1299 {
+            let q = hil.est.state().att;
+            eprintln!(
+                "[recov] 第 {:4} 拍（az={:+.2}）：wxyz = [{:.4}, {:.4}, {:.4}, {:.4}]",
+                k + 1, az, q.w, q.x, q.y, q.z
+            );
+        }
+    }
+}
