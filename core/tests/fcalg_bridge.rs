@@ -487,3 +487,59 @@ fn hil_gate_passing_gyro_spike_probe() {
         }
     }
 }
+
+/// ★装配层判据 #6（2026-10-05）：**比力 z 符号**对姿态初始化的影响（带对照组 ✓）。
+///
+/// 来源（`hil.rs:512-520` 自记载的缺陷 + 本轮真链路签名）：
+///   真链路 `est wxyz = [-0.0814, …]`（**w≈0 ⇒ 旋转≈171°** ✗）—— 而 `±π`（w≈0）只需
+///   一个条件：`a[2] > 0` ✗（`roll = atan2(−a[1], −a[2])` 在该条件下给出 ±π ✓，
+///   与量纲无关 ✓）。而 fcalg 全体（`State::level()`、`update_gravity`、
+///   `observe.rs:112` 的 `h = Rᵀ(−GRAVITY_NED)+ba`）都假设 **z 向下、静止 `a_z=−9.81`** ✓。
+/// 故本判据做**对照实验**：
+///   · A 组（对照 ✓）：`accel = (0,0,−9.81)` ⇒ 期望 `w ≈ ±1`（水平 ✓）
+///   · B 组（假设 ✗）：`accel = (0,0,+9.81)` ⇒ 若签名成立，应得 `w ≈ 0`（±π ✗）
+/// **只打印**（不制造红灯 ✓）；B 组复现 ⇒ 假设坐实 ✓。
+#[test]
+fn hil_accel_z_sign_init_probe() {
+    use flyctrl_core::controller::PidController;
+    use flyctrl_core::estimator::select::AnyEstimator;
+    use flyctrl_core::hil::{HilContext, SimImu};
+    use flyctrl_core::units::{MeterPerSecondSquared, RadianPerSecond, Second};
+    use flyctrl_core::vehicle::ImuSample;
+
+    for (label, az) in [("A 对照 az=-9.81", -9.81f32), ("B 假设 az=+9.81", 9.81f32)] {
+        let mut hil = HilContext::new(
+            AnyEstimator::default_product(),
+            PidController::default_quad(),
+            Second(4.0 / 1000.0),
+        );
+        let mut sim = SimImu::new();
+        let sp = unsafe { core::mem::zeroed() };
+        for k in 0..1300 {
+            let imu = if k % 3 == 0 {
+                Some(ImuSample {
+                    accel: [
+                        MeterPerSecondSquared(0.0),
+                        MeterPerSecondSquared(0.0),
+                        MeterPerSecondSquared(az),
+                    ],
+                    gyro: [RadianPerSecond(0.0); 3],
+                })
+            } else {
+                None
+            };
+            let _ = hil.ekf_hil(imu, None, None, None, None, None, &sp, false, false, true, &mut sim);
+        }
+        // 从四元数取姿态（`Quaternion` 有 w/x/y/z ✓）
+        let q = hil.est.state().att;
+        eprintln!(
+            "[sign] {} ⇒ att wxyz = [{:.4}, {:.4}, {:.4}, {:.4}]  (yaw={:.2} deg)",
+            label,
+            q.w,
+            q.x,
+            q.y,
+            q.z,
+            hil.est.inner.yaw_rad().to_degrees()
+        );
+    }
+}
