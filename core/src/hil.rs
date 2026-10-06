@@ -72,6 +72,11 @@ impl Default for SimImu {
 }
 
 /// 单步闭环上下文（跨步持久状态）。
+/// ★§5.134 配套：上一【被接受】帧的陀螺（用于**离群/连续性**判据 ✓）。
+/// `static mut` 与本文件既有的 `G_ESKF_*` 风格一致 ✓（诊断级守卫，跨实例共享可接受 ✓）。
+static mut LAST_ACCEPTED_GYRO: [f32; 3] = [0.0; 3];
+static mut LAST_ACCEPTED_GYRO_SEEN: bool = false;
+
 pub struct HilContext<E, C>
 where
     E: Estimator,
@@ -81,6 +86,8 @@ where
     pub ctrl: C,
     /// ★§5.134 IMU 输入合理性门控拒收计数（诊断/验收用 ✓）
     pub n_imu_rejected: u32,
+    /// ★因**离群/连续性**判据被拒的帧数（区别于量级门 ✓）—— 验收用：真链路应 ≈0 ✓
+    pub n_imu_step_outlier: u32,
     pub fdir: Fdir,
     /// 固定控制周期。
     pub dt: Second,
@@ -171,6 +178,7 @@ where
         // ★design.md §5：IMU 预处理抽为可复用 `ImuFilters`（后续归 `wq:sensors`）
         let imu_f = crate::imu_filters::ImuFilters::new(fs);
         let mut ctx = Self {
+            n_imu_step_outlier: 0,
             est,
             ctrl,
             n_imu_rejected: 0,
@@ -436,12 +444,44 @@ where
                 let an = crate::math::sqrt(an2);
                 let gn = crate::math::sqrt(gn2);
                 let finite = a.iter().chain(g.iter()).all(|v| v.is_finite());
-                if !finite || gn > 100.0 || an > 200.0 {
+                // ★★2026-10-05 根因修复：**门内陀螺尖峰**（判据 #5 实测坐实 ✓）
+                //   缺陷：旧门只拦 >100 rad/s ✗ ⇒ 50 rad/s 级垃圾【放行并积分】⇒ 单帧
+                //   0.2 rad=11.46°；且该样本被 sample-and-hold 继续积分（实测 3 拍）
+                //   ⇒ 单帧影响放大 ~3× ✗；偏航不可观测（磁参考为零 ⇒ 按契约拒绝 ✓）
+                //   ⇒ 跳变【永久保留】✗✗（真链路实测：纯偏航 ~111°，health=0/armed=0 ✓）
+                //   修法：**连续性/离群**判据（垃圾=阶跃 ✓、真实机动=连续 ✓）——
+                //   不用绝对上界（当年 35 rad/s 绝对门误伤 a6 滚转/a8 湍流/a10 桨洗 ✗）。
+                //   阈值 20 rad/s/帧（4 ms ⇒ 5000 rad/s²；真实四旋翼 <1000 rad/s² ⇒ 5× 余量）
+                //   ⚠**启发式**（§7 `Source::Chosen` ✗）：应由实测 α_max 取代 ⇒ 欠债待记 ✗
+                let gyro_step_outlier = {
+                    let mut d2 = 0.0f32;
+                    for i in 0..3 {
+                        let prev = unsafe {
+                            core::ptr::read_volatile(core::ptr::addr_of!(LAST_ACCEPTED_GYRO[i]))
+                        };
+                        let dd = g[i] - prev;
+                        d2 += dd * dd;
+                    }
+                    let seen = unsafe {
+                        core::ptr::read_volatile(core::ptr::addr_of!(LAST_ACCEPTED_GYRO_SEEN))
+                    };
+                    seen && d2 > 20.0 * 20.0
+                };
+                if gyro_step_outlier {
+                    self.n_imu_rejected = self.n_imu_rejected.wrapping_add(1);
+                    self.n_imu_step_outlier = self.n_imu_step_outlier.wrapping_add(1);
+                    self.last_real_imu
+                        .unwrap_or_else(|| sim_imu.next(self.dt.0))
+                } else if !finite || gn > 100.0 || an > 200.0 {
                     self.n_imu_rejected = self.n_imu_rejected.wrapping_add(1);
                     self.last_real_imu
                         .unwrap_or_else(|| sim_imu.next(self.dt.0))
                 } else {
                     raw_accel = Some(a);
+                    unsafe {
+                        LAST_ACCEPTED_GYRO = g;
+                        LAST_ACCEPTED_GYRO_SEEN = true;
+                    }
                     // ★★★2026-10-04【消除双重滤波（PX4：一份数据、一条链 ✓）】：
                     //   滤波已上移到 **L0 ISR**（`imu_sample_step` ✓ 在构造 `ImuDelta` 之前 ✓），
                     //   且帧里存的样本已是【accel 滤波后 + gyro 原始】✓（与 `ImuRing` 同口径 ✓）。
