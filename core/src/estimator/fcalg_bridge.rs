@@ -13,6 +13,27 @@
 //! （新栈无对应观测模型）—— 三者都计入 [`NOT_IMPLEMENTED_CALLS`]，
 //! 集成验收可直接断言它，**而不是让人误以为它们在起作用**。
 //!
+//! # ★★接线待办：`AnyEstimator`（装配层收口类型）的接口差异清单
+//!
+//! 核对自 `core/src/estimator/select.rs`（**已逐条比对，勿再重查**）。
+//! 装配层要从 `struct AnyEstimator { pub inner: EskfEstimator }` 改成
+//! **按 feature 选择实现的枚举**（`fcalg-est` 开启时含 `FcalgEstimator` 变体），
+//! 届时下列方法要逐条处置：
+//!
+//! | `AnyEstimator` 方法 | fcalg 侧 | 处置 |
+//! |---|---|---|
+//! | `set_observation_noise(r_gps_p, r_gps_v, r_baro)` | `ObsParams` | **可映射** ✓（注意 fcalg 另有 `sigma_mag`，签名不含 ⇒ 保留默认） |
+//! | `set_mag_reference(mag_i)` | `State.mag_i` | **可映射** ✓ |
+//! | `set_mag_hard_iron(mag_b)` | `State.mag_b` | **可映射** ✓ |
+//! | `set_world_accel(a)` | 无 | 旧实现已是**显式拒绝** ⇒ fcalg 侧同样显式 + 计数 ✓ |
+//! | `world_accel_refused()` | 无 | 计数读出：需**新设一个计数器**（旧实现恒 0） |
+//! | **`set_freeze_bias(v)`** | **无对应** | ★**必须显式 no-op + 计数** —— 它直接改 `inner.filter_mut().freeze_bias`（旧 ESKF 的磁两态冻结旋钮）；fcalg **无此旋钮** ⇒ **绝不能静默丢弃**（否则调用方以为生效 ✗） |
+//! | `kind()` | — | 返回不同串（如 `"fcalg-eskf"`）⇒ 机制自证 ✓ |
+//!
+//! 另有 **控制器侧**：`app/src/flyctrl/mod.rs` 的 `spawn_flyctrl` 现直接装配
+//! `PidController`/`IndiController` 等具体类型；`fcalg-ctrl` 开启时需在此按 feature 选型
+//! （控制器侧无 `AnyXxx` 收口类型 ⇒ 只需一处 cfg）。
+//!
 //! # ★接口新增点
 //! `omega`（机体角速度）**不在滤波器状态里**（它是控制器侧的量）⇒ 桥接自持一份，
 //! 由 `step`/`predict_delta` 的输入更新。这一点在 L17 映射表里已登记。
