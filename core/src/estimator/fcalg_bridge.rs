@@ -178,6 +178,21 @@ impl FcalgEstimator {
         }
     }
 
+    /// 磁诊断（**新栈实际有的那几项**）：地球磁场（NED）与机体磁偏置。
+    /// ⚠旧的另外 6 项（yaw_aligned/mag_field_disturbed/mag_applied/mag_skipped/
+    ///   mag_hdg_innov_lpf/last_mag_yaw_innov）是**旧 ESKF 特定实现**的内部量，
+    ///   fcalg 的磁通路结构不同（yaw-only + 无冻结旋钮）⇒ **无对应，也不编造**。
+    pub fn mag_i(&self) -> [f32; 3] {
+        self.f.st.mag_i
+    }
+    pub fn mag_b(&self) -> [f32; 3] {
+        self.f.st.mag_b
+    }
+    /// 估计偏航角（rad）——旧栈由 `filter().st.q.yaw()` 提供 ✓。
+    pub fn yaw_rad(&self) -> f32 {
+        self.f.st.q.to_euler_zyx()[2]
+    }
+
     /// 旧栈 `world_accel()` 的对应 ✓（app 的 `HIL_DIAG.world_accel` 读它）。
     pub fn world_accel(&self) -> [f32; 3] {
         self.last_world_accel

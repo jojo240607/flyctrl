@@ -142,6 +142,12 @@ extern "C" fn estimator_work(_arg: *mut c_void) {
         }
     }
     unsafe { IT_EXEC_EKF = rtos_app_sdk::rtos::cycle_now().wrapping_sub(t_it); }
+    // ★★★接线（fcalg-est）：旧栈 8 项磁场诊断里，**新栈只暴露 mag_i / mag_b / yaw_rad**。
+    //   其余 6 项（yaw_aligned / mag_field_disturbed / mag_applied / mag_skipped /
+    //   mag_hdg_innov_lpf / last_mag_yaw_innov）是**旧 ESKF 特定实现**的内部量；
+    //   fcalg 的磁通路结构不同（yaw-only + 无冻结旋钮）⇒ **无对应**。
+    //   ⇒ 按"选择 (b)"：**不编造替代值**，那 6 项保持 HIL_DIAG 的默认（0），并在此注明。
+    #[cfg(not(feature = "fcalg-est"))]
     unsafe {
         let fl = hil.est.inner.filter();
         let wa = hil.est.inner.world_accel();
@@ -157,6 +163,22 @@ extern "C" fn estimator_work(_arg: *mut c_void) {
         d.last_mag_yaw_innov = fl.last_mag_yaw_innov;
         d.yaw_rad = fl.st.q.yaw();
         d.gated = gated as u32;
+    #[cfg(feature = "fcalg-est")]
+    unsafe {
+        let d = &mut *core::ptr::addr_of_mut!(HIL_DIAG);
+        d.world_accel = hil.est.inner.world_accel();
+        d.mag_i = hil.est.inner.mag_i();
+        d.mag_b = hil.est.inner.mag_b();
+        d.yaw_rad = hil.est.inner.yaw_rad();
+        // 旧栈的另外 6 项磁场诊断：新栈未暴露 ⇒ **保持默认 0**（不编造）
+        d.yaw_aligned = 0;
+        d.mag_disturbed = 0;
+        d.mag_applied = 0.0;
+        d.mag_skipped = 0.0;
+        d.mag_hdg_innov_lpf = 0.0;
+        d.last_mag_yaw_innov = 0.0;
+        d.gated = gated as u32;
+    }
     }
 }
 
