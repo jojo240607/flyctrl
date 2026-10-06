@@ -80,7 +80,10 @@ pub mod reexport {
 pub struct FcalgEstimator {
     f: Eskf,
     prm: ObsParams,
-    /// NIS 门限（σ）。取自参数表 `gate.nis_sigma` 的当前值。
+    /// NIS 门限**覆写值**：`0.0` ⇒ 使用 **dof 感知的导出门限**
+    /// （`params::nis_threshold(dof, α)`；气压 1 / GPS位 3 / GPS速 2 / 磁航向 1）。
+    /// ⚠**不要填"σ 倍数"** —— 那会绕过 dof 感知、把 1-dof 的阈值套到 3-dof 通道上
+    ///   （本会话实测：那样会丢掉 12~16% 的健康观测）。首版默认填了 3.0，正是这个错。
     gate_sigma: f32,
     /// 重灌地板。取自参数表 `gate.reflate_floor`。
     reflate_floor: f32,
@@ -88,6 +91,20 @@ pub struct FcalgEstimator {
     omega_body: [f32; 3],
     /// 融合被拒的次数（诊断；不等于"重灌"，重灌计数在 `f.guards` 里）。
     pub fuse_rejects: u32,
+    /// ★**诊断兼容字段**（app 侧 12 处读数里 10 个计数器的直接对应）。
+    /// 语义与旧栈同名量对齐：`n_gps_pos` = **接受**次数、`n_gps_pos_rejected` = **拒收**次数 …
+    /// 它们与 fcalg 自身的按通道总数（`chan_acc/chan_rej`）由**闭合判据**保证一致。
+    pub n_step: u64,
+    pub n_gps_pos: u32,
+    pub n_gps_pos_rejected: u32,
+    pub n_gps_vel: u32,
+    pub n_gps_vel_rejected: u32,
+    pub n_grav_applied: u32,
+    pub n_grav_gated: u32,
+    pub n_mag: u32,
+    pub n_mag_rejected: u32,
+    /// ⚠**恒 0**：旧栈的"磁重锚"在 fcalg **无对应** ⇒ 显式登记（绝不假装有数）。
+    pub n_mag_reanchored: u32,
     /// **本实例**被调用但未实现的次数（按实例计数 ⇒ 并行安全；
     /// 全局 `NOT_IMPLEMENTED_CALLS` 仅作跨实例聚合，不作为单测断言对象）。
     pub not_impl_calls: u32,
@@ -104,12 +121,22 @@ impl FcalgEstimator {
         let prm = ObsParams::default();
         Self {
             f: Eskf::new(State::level(), diag_cov(P_INIT), 10),
-            gate_sigma: 3.0,
+            gate_sigma: 0.0, // ⇒ 用 dof 感知的导出门限（见字段注释）
             reflate_floor: 1.0,
             prm,
             omega_body: [0.0; 3],
             fuse_rejects: 0,
             not_impl_calls: 0,
+            n_step: 0,
+            n_gps_pos: 0,
+            n_gps_pos_rejected: 0,
+            n_gps_vel: 0,
+            n_gps_vel_rejected: 0,
+            n_grav_applied: 0,
+            n_grav_gated: 0,
+            n_mag: 0,
+            n_mag_rejected: 0,
+            n_mag_reanchored: 0,
         }
     }
 
@@ -148,7 +175,17 @@ impl FcalgEstimator {
     }
 
     fn fuse_track(&mut self, o: &Obs, ch: Channel) {
-        if self.f.fuse(o, ch, self.gate_sigma, self.reflate_floor).is_err() {
+        let ok = self.f.fuse(o, ch, self.gate_sigma, self.reflate_floor).is_ok();
+        match (ch, ok) {
+            (Channel::GpsPos, true) => self.n_gps_pos += 1,
+            (Channel::GpsPos, false) => self.n_gps_pos_rejected += 1,
+            (Channel::GpsVel, true) => self.n_gps_vel += 1,
+            (Channel::GpsVel, false) => self.n_gps_vel_rejected += 1,
+            (Channel::MagYaw, true) => self.n_mag += 1,
+            (Channel::MagYaw, false) => self.n_mag_rejected += 1,
+            (Channel::Baro, _) => {}
+        }
+        if !ok {
             self.fuse_rejects = self.fuse_rejects.wrapping_add(1);
         }
     }
@@ -188,8 +225,13 @@ impl Estimator for FcalgEstimator {
             ts_ticks: 0,
         };
         let _ = self.f.predict(&d, fcalg::GRAVITY_NED);
+        self.n_step += 1;
         // 重力（倾角）观测：紧接 predict（IMU 驱动）。量级门不过则**显式**返回 false 并计数。
-        let _ = self.f.update_gravity(a);
+        match self.f.update_gravity(a) {
+            Ok(true) => self.n_grav_applied += 1,
+            Ok(false) => self.n_grav_gated += 1,
+            Err(_) => self.n_grav_gated += 1,
+        }
         self.fuse_pos(pos);
         self.state()
     }
@@ -204,10 +246,15 @@ impl Estimator for FcalgEstimator {
         let d = ImuDelta { delta_ang, delta_vel, dt_ang, dt_vel, ts_ticks: 0 };
         let _ = self.f.predict(&d, fcalg::GRAVITY_NED);
         // 重力（倾角）观测：紧接 predict。比力由本拍速度增量还原（量纲：m/s²）。
+        self.n_step += 1;
         if dt_vel > 0.0 {
             let inv = 1.0 / dt_vel;
             let f_b = [delta_vel[0] * inv, delta_vel[1] * inv, delta_vel[2] * inv];
-            let _ = self.f.update_gravity(f_b);
+            match self.f.update_gravity(f_b) {
+                Ok(true) => self.n_grav_applied += 1,
+                Ok(false) => self.n_grav_gated += 1,
+                Err(_) => self.n_grav_gated += 1,
+            }
         }
     }
 

@@ -98,3 +98,52 @@ fn reset_returns_to_usable_initial_state() {
     }
     assert!(s.att.w.abs() > 0.999, "reset 后姿态必须为单位");
 }
+
+/// ★**闭合判据**：桥接的诊断计数器必须与**实际调用次数**一致
+/// （app 侧的诊断日志读的正是这些数 —— 漏计会静默地误导）。
+#[test]
+fn diagnostic_counters_close_with_actual_calls() {
+    let mut e = FcalgEstimator::new();
+    e.set_initial_attitude(Quaternion { w: 1.0, x: 0.0, y: 0.0, z: 0.0 });
+    let dt = 0.005f32;
+    let f_b = [0.0f32, 0.0, -G];
+    let n_pred = 100;
+    let n_fuse = 10;
+    for k in 0..n_pred {
+        e.predict_delta([0.0; 3], [f_b[0] * dt, f_b[1] * dt, f_b[2] * dt], dt, dt);
+        if k % (n_pred / n_fuse) == 0 {
+            e.update_fusion(
+                Some(PosSample { pos: [Meter(0.0); 3], vel: Some([MeterPerSecond(0.0); 3]) }),
+                None,
+            );
+        }
+    }
+    assert_eq!(e.n_step, n_pred as u64, "步数计数必须闭合");
+    assert_eq!(e.n_gps_pos, n_fuse, "GPS 位接受数必须闭合");
+    assert_eq!(e.n_gps_vel, n_fuse, "GPS 速接受数必须闭合");
+    assert_eq!(e.n_gps_pos_rejected, 0);
+    assert_eq!(e.n_gps_vel_rejected, 0);
+    // 重力：每拍都试 ⇒ 应用 + 门控必须恰好等于步数
+    assert_eq!(
+        e.n_grav_applied + e.n_grav_gated,
+        n_pred as u32,
+        "重力路每拍必计数（applied={} gated={}）",
+        e.n_grav_applied,
+        e.n_grav_gated
+    );
+    assert!(e.n_grav_applied > 0, "静止悬停的比力应通过量级门");
+    // 无对应项必须恒 0（登记为"不假装有数"）
+    assert_eq!(e.n_mag_reanchored, 0);
+    // 磁路未喂 ⇒ 两计数都应为 0（不得凭空增加）
+    assert_eq!((e.n_mag, e.n_mag_rejected), (0, 0));
+
+    // 喂一个荒谬 GPS ⇒ 拒收计数必须 +1，而接受数不变（闭合仍然成立）
+    let before = (e.n_gps_pos, e.n_gps_pos_rejected);
+    let bogus = PosSample {
+        pos: [Meter(1e5), Meter(-1e5), Meter(1e5)],
+        vel: None,
+    };
+    e.update_fusion(Some(bogus), None);
+    assert_eq!(e.n_gps_pos, before.0, "被拒不得计入接受数");
+    assert_eq!(e.n_gps_pos_rejected, before.1 + 1, "被拒必须计入拒收数");
+}
