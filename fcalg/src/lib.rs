@@ -17,6 +17,7 @@ pub mod propagate;
 pub mod quat;
 pub mod transition;
 pub mod units;
+pub mod update;
 
 pub use align::{align_static, AlignConfig, AlignError, AlignResult};
 pub use covariance::{is_positive_definite, is_symmetric_exact, propagate_covariance, Cov, CovError};
@@ -28,3 +29,4 @@ pub use propagate::{propagate, State};
 pub use quat::{specific_force_at_rest, Quat, GRAVITY_NED};
 pub use transition::{skew, transition_matrix};
 pub use units::{Meters, Mps, Radians, Rps, Seconds};
+pub use update::{update, UpdateError, UpdateOut};
