@@ -7,3 +7,9 @@ license.workspace = true
 description = "重建的飞控算法核心（L0 契约 / L1 有限性纪律 起）—— 与旧 flyctrl-core 零耦合"
 
 [dependencies]
+
+[target.'cfg(target_os = "none")'.dependencies]
+fpmath = "0.1.1"
+
+[target.'cfg(not(target_os = "none"))'.dependencies]
+libm = "0.2"

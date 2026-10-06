@@ -8,6 +8,9 @@
 //!    由上层显式决定如何处理（并计数）。**绝不静默修正**。
 //! 3. 性能：本实现是直白的 O(N³)，是拍内热点。**优化必须走"同一组判据"**
 //!    （稀疏化/ILP 只允许改耗时，不允许改语义 —— 本文件的 6 条判据就是那条线）。
+#[allow(unused_imports)]
+use crate::math::F32Ext;
+
 use crate::error_state::N;
 use core::sync::atomic::AtomicU32;
 use crate::finite::{gate_all, Stage, Violation};
@@ -40,6 +43,8 @@ pub fn is_symmetric_exact(a: &Cov) -> bool {
 ///   却判 F·P·Fᵗ 非正定 —— 数学上不可能 ⇒ 是判据不可靠）。
 ///   ⇒ 硬门限改为只拒"**实质性**坏方差"（负对角/非有限）；正定只作**诊断**，
 ///     PD 的**维持**靠构造（Joseph + 上三角镜像），不靠事后门限。
+/// `predict` 入口发现 P 已不正定的次数（**计数而非打印** —— 库不得依赖 std）。
+pub static PD_ENTRY_VIOLATIONS: AtomicU32 = AtomicU32::new(0);
 /// 负对角被显式抬高的次数（**绝不静默** —— 集成验收应断言它为 0）。
 pub static NEG_DIAG_FIXED: AtomicU32 = AtomicU32::new(0);
 /// 抬高到的最小正值（地板）。

@@ -4,6 +4,9 @@
 //! 方差钳位写的是 `if !(x > 1e-6) { x = 1e-6 }`，而 `!(NaN > 1e-6)` **也为真**
 //! ⇒ NaN 被悄悄变成"看起来正常的地板值" ⇒ 既丢证据、又制造虚假的正常。
 
+#[allow(unused_imports)]
+use crate::math::F32Ext;
+
 use core::sync::atomic::{AtomicU32, Ordering};
 
 /// 阶段编号（按模块固定分配；`Unnamed` 保留）。

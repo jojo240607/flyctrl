@@ -20,6 +20,9 @@
 //!
 //! **预算量级**：3 轴 ×(1 陷波) + 3 轴 ×(1 陷波 + 1 低通) ≈ 9 个 biquad/样本。
 
+#[allow(unused_imports)]
+use crate::math::F32Ext;
+
 use crate::biquad::{Biquad, Coeffs};
 use crate::finite::{gate_all, Stage, Violation};
 

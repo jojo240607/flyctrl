@@ -5,6 +5,9 @@
 //! # 为何只给 P/I 而把 D 留给调用方
 //! 微分通常作用在**测量值**上（避免设定值阶跃产生微分冲击）。把 D 的取法留给调用方
 //! 是显式决定，而不是在这里悄悄选一种。
+#[allow(unused_imports)]
+use crate::math::F32Ext;
+
 use crate::finite::{gate, Stage, Violation};
 /// 速率环增益。
 #[derive(Debug, Clone, Copy, PartialEq)]

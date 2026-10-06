@@ -7,6 +7,9 @@
 //! - 直流增益可解析验证（低通 = 1；陷波在 f0 处 = 0）；
 //! - 状态独立（每轴一个实例，见 `imu_filter`）。
 
+#[allow(unused_imports)]
+use crate::math::F32Ext;
+
 use crate::math;
 
 /// 归一化后的系数（约定 `a0 = 1`）：

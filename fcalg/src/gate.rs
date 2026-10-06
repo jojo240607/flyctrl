@@ -13,6 +13,9 @@
 //! 连续拒收达阈值即重灌，并计一次 `recoveries`；此后继续拒收**不再重复重灌**
 //! （否则每次拒收都把方差抬满 ⇒ 退化成"永远不收敛"）。收到一次有效融合即 `accepted()`
 //! 复位，下一回合重新计数。
+#[allow(unused_imports)]
+use crate::math::F32Ext;
+
 use crate::covariance::Cov;
 use crate::error_state::{I_ATT, I_MAGB, I_MAGI, I_POS, I_VEL};
 use crate::finite::{gate_all, Stage, Violation};

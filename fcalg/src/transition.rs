@@ -5,6 +5,9 @@
 //!   `δṗ = δv`；零偏与磁两态为常量（导数为 0）
 //! 离散：`F = I + A·dt`（一阶；判据由 FD 裁判给出，见 `tests/l6_transition.rs`）。
 //! 变量含义：`ω = Δang/dt_ang − bg`（机体，零偏已扣）、`f_b = Δvel/dt_vel − ba`（机体）。
+#[allow(unused_imports)]
+use crate::math::F32Ext;
+
 use crate::error_state::{I_ATT, I_BA, I_BG, I_POS, I_VEL, N};
 use crate::quat::Quat;
 /// 反对称阵 `[v×]`（满足 `[v×]u = v × u`）。

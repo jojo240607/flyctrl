@@ -10,6 +10,9 @@
 //! # 与旧栈的对比
 //! 旧栈把这些散在任务函数里（"记得在拒绝时不 apply"是**约定**）；
 //! 这里"拒收不动状态"由**函数式 update + 显式提交点**保证（L8 设计）。
+#[allow(unused_imports)]
+use crate::math::F32Ext;
+
 use crate::covariance::{propagate_covariance, Cov, CovError};
 use crate::error_state::{boxplus, I_ATT, I_POS, I_VEL, N};
 use crate::finite::{gate, Stage, Violation};
@@ -35,12 +38,6 @@ fn ch_idx(ch: Channel) -> usize {
         Channel::MagYaw => 3,
     }
 }
-/// **P 不变量守卫**：在每个写入点之后立刻检查 —— 让"哪一处写坏了 P"自己暴露。
-fn assert_pd(tag: &'static str, p: &Cov) {
-    if !crate::covariance::is_positive_definite(p) {
-        eprintln!("[pd] ✗ 写入点 [{tag}] 之后 P 不再正定");
-    }
-}
 /// 最小 ESKF 编排器。
 pub struct Eskf {
     pub st: State,
@@ -64,34 +61,14 @@ impl Eskf {
             d.delta_vel[1] / d.dt_vel - self.st.ba[1],
             d.delta_vel[2] / d.dt_vel - self.st.ba[2],
         ];
-        // ★A：在**入口**检查不变量。失败时打印 P 的对角（含最小值所在维），
-        //   并让调用方看到是谁把 P 交进来的。
         if !crate::covariance::is_positive_definite(&self.p) {
-            let mut dmin = f32::INFINITY;
-            let mut imin = 0usize;
-            for i in 0..N {
-                if self.p[i][i] < dmin { dmin = self.p[i][i]; imin = i; }
-            }
-            eprintln!("[pd] ✗ predict 入口：P 已不正定（最小对角 @{imin} = {dmin:e}）");
+            crate::covariance::PD_ENTRY_VIOLATIONS
+                .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
         let f = transition_matrix(self.st.q, w, f_b, d.dt_vel);
         let q = [[0.0f32; N]; N];
-        let pd_entry = crate::covariance::is_positive_definite(&self.p);
-        let p_new = match propagate_covariance(&self.p, &f, &q) {
-            Ok(v) => v,
-            Err(e) => {
-                let mut eye = [[0.0f32; N]; N];
-                for i in 0..N { eye[i][i] = 1.0; }
-                let ident_ok = propagate_covariance(&eye, &f, &q).is_ok();
-                eprintln!(
-                    "[pd] propagate_covariance 失败 {e:?} | 入口PD={pd_entry} | 此刻PD={} | **P=单位阵是否通过={ident_ok}**（false ⇒ F 奇异）",
-                    crate::covariance::is_positive_definite(&self.p)
-                );
-                return Err(FilterError::Prop(e));
-            }
-        };
+        let p_new = propagate_covariance(&self.p, &f, &q).map_err(FilterError::Prop)?;
         self.p = p_new;
-        assert_pd("predict", &self.p);
         propagate(&mut self.st, d, g_ned).map_err(FilterError::State)
     }
     /// 融合一路观测。失败时**不动状态与 P**（但会推进门控/必要时重灌）。
@@ -106,7 +83,6 @@ impl Eskf {
             Ok(out) => {
                 let st_new = boxplus(&self.st, &out.dx).ok_or(FilterError::State(Violation::Nan))?;
                 self.p = out.p;
-                assert_pd("fuse-ok", &self.p);
                 self.st = st_new;
                 self.guards[ch_idx(ch)].accepted();
                 Ok(())
@@ -116,7 +92,6 @@ impl Eskf {
                     // 达阈值 ⇒ 重灌该通道可观测的方差（L10）。重灌失败（非有限）也**不掩盖**：
                     // 直接放弃本拍，让调用方看到 Err。
                     let _ = reflate_diag(&mut self.p, channel_indices(ch), reflate_floor);
-                    assert_pd("fuse-reflate", &self.p);
                 }
                 Err(FilterError::Update(e))
             }

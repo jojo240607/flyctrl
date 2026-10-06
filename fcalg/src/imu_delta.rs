@@ -23,6 +23,9 @@
 //! 而 `WrapAmbiguous`（戳倒退/回绕，不可分辨）**不自动重锚** —— 由上层用 [`DeltaBuilder::rebuild`]
 //! 显式重建（上层才知道计数是否真的回绕了）。
 
+#[allow(unused_imports)]
+use crate::math::F32Ext;
+
 use crate::finite::{gate_all, Stage, Violation};
 
 /// 单拍增量（机体系）。

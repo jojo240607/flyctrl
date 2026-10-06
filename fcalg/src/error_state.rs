@@ -2,6 +2,9 @@
 //! 误差态定义（**右乘**，与 L5 传播的右乘一致）：
 //!   `q_true = q_nom ⊗ exp(δθ)`，`v_true = v_nom + δv`，`p_true = p_nom + δp`，其余为加法。
 //! 这两个算子是 FD 裁判的前提：没有它们就无法把"解析 F"与"实际传播"对上。
+#[allow(unused_imports)]
+use crate::math::F32Ext;
+
 use crate::math;
 use crate::propagate::State;
 use crate::quat::Quat;

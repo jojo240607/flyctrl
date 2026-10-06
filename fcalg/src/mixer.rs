@@ -16,6 +16,9 @@
 //! 2. 若可行 ⇒ 把 `thrust` **夹进该区间**（**力矩不被改动**，均值尽量保持）；
 //! 3. 若不可行（力矩本身放不下）⇒ 把 d **等比缩小**到恰好放得下（`thrust` 取 0.5），
 //!    **保证不产生反向力矩**（这是比"直接夹"重要的性质）。
+#[allow(unused_imports)]
+use crate::math::F32Ext;
+
 use crate::error_state::N;
 /// 三行符号表（滚转/俯仰/偏航）。
 pub const X4SIGNS: [[f32; 4]; 3] = [

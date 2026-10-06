@@ -8,6 +8,9 @@
 //! # 为什么在构造时就求逆
 //! `M` 奇异 ⇒ 反解会**放大**而不是校正 ⇒ 必须在构造时**显式拒绝**，
 //! 而不是等到运行时把噪声放大成"貌似合理的姿态"。
+#[allow(unused_imports)]
+use crate::math::F32Ext;
+
 use crate::finite::{gate_all, Stage, Violation};
 use crate::update::inv3;
 /// 标定参数（机体系）。

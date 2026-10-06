@@ -21,6 +21,9 @@
 //! `f_b = g·(sinθ, −cosθ·sinφ, −cosθ·cosφ)`，故
 //! `θ = asin(a_x/g)`，`φ = atan2(−a_y, −a_z)`。
 
+#[allow(unused_imports)]
+use crate::math::F32Ext;
+
 use crate::finite::{gate_all, Stage, Violation};
 use crate::math;
 use crate::quat::{gate_quat, Quat, GRAVITY_NED};

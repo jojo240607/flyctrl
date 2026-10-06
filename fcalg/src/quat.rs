@@ -1,5 +1,8 @@
 //! L0 · 姿态核心（四元数 + 帧约定）。约定见 `CONTRACT.md` §2，本文件是其唯一实现处。
 
+#[allow(unused_imports)]
+use crate::math::F32Ext;
+
 use crate::finite::{gate_all, Stage};
 use crate::math;
 

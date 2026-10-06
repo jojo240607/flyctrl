@@ -13,6 +13,9 @@
 //! 判据 `cross_module_consistency` 断言各模块的默认值**必须与本表一致** ——
 //! 使"表"与"代码"不能各说一套。
 /// 单位标签（**没有"未知"变体** ⇒ 漏标在类型上不可能）。
+#[allow(unused_imports)]
+use crate::math::F32Ext;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unit {
     Sec,

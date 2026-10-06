@@ -10,6 +10,9 @@
 //! # 纪律
 //! 全程过 L1 门；非有限 ⇒ `Err`；`S` 奇异 ⇒ `Err`；结果非正定 ⇒ `Err`。
 //! 应用 `dx` 到标称态（`boxplus`）由调用方负责 —— 本层是**纯线性代数**。
+#[allow(unused_imports)]
+use crate::math::F32Ext;
+
 use crate::covariance::{has_negative_variance, Cov};
 use crate::error_state::N;
 use crate::finite::{gate_all, Stage, Violation};

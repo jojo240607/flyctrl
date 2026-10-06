@@ -22,6 +22,9 @@
 //! # 纪律
 //! 入口过 L1 有限性门；**任何非有限输入 ⇒ `Err` 且状态逐位不变**（不得留下半传播状态）。
 
+#[allow(unused_imports)]
+use crate::math::F32Ext;
+
 use crate::finite::{gate, gate_all, Stage, Violation};
 use crate::imu_delta::ImuDelta;
 use crate::math;

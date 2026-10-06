@@ -23,6 +23,9 @@
 //!    （那会让 H 与模型不一致，判据必然失败）。
 //! 3. 若将来要**禁止** roll/pitch 被磁修正，那是**换模型**（把误差投影到世界竖直轴上），
 //!    必须同时改模型与判据，不能只改 H。
+#[allow(unused_imports)]
+use crate::math::F32Ext;
+
 use crate::error_state::{I_ATT, I_MAGB, I_MAGI, I_POS, I_VEL, N};
 use crate::propagate::State;
 /// 「无信息」的对角 R（必须对角）。

@@ -3,6 +3,9 @@
 //! 契约 §1：不做隐式数值转换。混合量纲必须显式转换，
 //! 使"把角速度当角度用"这类错误在编译期暴露。
 
+#[allow(unused_imports)]
+use crate::math::F32Ext;
+
 macro_rules! quantity {
     ($name:ident, $doc:literal) => {
         #[doc = $doc]

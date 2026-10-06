@@ -7,6 +7,9 @@
 //! `log` 必须取短弧（`w<0` 先整体取反）—— 否则在 180° 附近会出现 **±π 跳变**，
 //! 表现为姿态指令瞬间反向（旧栈实测过 "roll 翻 π" 这类现象）。
 //! 复用 `error_state::log_rot`，保证与滤波器侧**同一实现**（约定不可能分叉）。
+#[allow(unused_imports)]
+use crate::math::F32Ext;
+
 use crate::error_state::log_rot;
 use crate::quat::Quat;
 /// 姿态误差 → 机体角速率设定值（rad/s）。

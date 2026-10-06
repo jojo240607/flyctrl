@@ -11,6 +11,9 @@
 //! - baro：模型 `alt == −p_z` ⇒ `alt = −p_z`
 //! - GPS 位置 / 速度：直接取 `p` / `v`
 //! - 磁航向：`meas = R(q)ᵀ·mag_i + mag_b`（⇒ 零偏扣除后转世界恰为 `mag_i`）
+#[allow(unused_imports)]
+use crate::math::F32Ext;
+
 use crate::imu_delta::ImuDelta;
 use crate::observe::{baro, gps_pos, gps_vel, mag_yaw, Obs, ObsParams};
 use crate::propagate::State;
