@@ -644,3 +644,29 @@ fn hil_app_config_repro_probe() {
         }
     }
 }
+
+/// ★直流增益探针（2026-10-05）：查固件 accel 滤波链是否保持单位直流增益 ✓
+///
+/// 动因：真链路实测残差 ≈**0.6 m/s² ≈ 6% g** ✗（判据 #8 的轨迹：650 ms 速度已 −0.27 m/s）
+/// ⇒ 若滤波链的直流增益不是 1 ✗ ⇒ 比力被整体缩放 ⇒ **每拍残留固定的虚假加速度** ✓✓
+/// 而 `hil.rs:124-125` 只**声称**"直流增益 1" ✓，从未验证 ✗。
+/// 链：`Biquad::notch(40.0, fs, 5.0)` → `Biquad::low_pass(20.0, fs, 0.7071)`（`imu_filters.rs:32-33` ✓）
+/// 直流增益与 fs 无关 ✓ ⇒ 扫多个 fs 一并排除"设计公式含 fs 缺陷"✗。
+/// **只打印**（不制造红灯 ✓）。
+#[test]
+fn firmware_accel_filter_dc_gain_probe() {
+    use flyctrl_core::filter::Biquad;
+    for fs in [100.0f32, 250.0, 500.0, 1000.0, 8000.0] {
+        let mut n = Biquad::notch(40.0, fs, 5.0);
+        let mut l = Biquad::low_pass(20.0, fs, 0.7071);
+        let (mut yn, mut yl) = (0.0f32, 0.0f32);
+        for _ in 0..50000 {
+            yn = n.process(1.0);
+            yl = l.process(1.0);
+        }
+        eprintln!(
+            "[dcgain] fs={:8.1}  notch={:.6}  lpf={:.6}  **串联={:.6}**（偏离 1.0 即为虚假加速度源 ✗）",
+            fs, yn, yl, yn * yl
+        );
+    }
+}
