@@ -33,6 +33,10 @@ libm = "0.2"
 [features]
 # ★§5.221 悬垂缓冲守卫（默认关）
 buf-guard = ["flyctrl-core/buf-guard"]
+# ★★接线（本会话）：新栈 fcalg 的两侧开关，**默认关 ⇒ 现有装配/行为零影响**。
+#   开启后才由 select 层/装配层选用 FcalgEstimator / FcalgController。
+fcalg-est = ["flyctrl-core/fcalg-est"]
+fcalg-ctrl = ["flyctrl-core/fcalg-ctrl"]
 # ★★§5.202：**`usb-link` 设为默认** —— 数据集裁掉 ~60KB 后空间足够 ✓；
 #   恢复**地面站链路**（上行 DO_SET_MODE/PARAM + 遥测下行 ✓）。
 #   ⚠️历史：曾因 ① 固件超 app slot（128KB）② "用 usb0 后控制任务 8~10s 阻塞（机制待查）"
