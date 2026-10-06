@@ -11,6 +11,8 @@
 //! 旧栈把这些散在任务函数里（"记得在拒绝时不 apply"是**约定**）；
 //! 这里"拒收不动状态"由**函数式 update + 显式提交点**保证（L8 设计）。
 #[allow(unused_imports)]
+use crate::covariance::propagate_covariance_into;
+use crate::update::update_into;
 use crate::math::F32Ext;
 
 use crate::covariance::{propagate_covariance, Cov, CovError};
@@ -185,7 +187,8 @@ impl Eskf {
         }
         let f = transition_matrix(self.st.q, w, f_b, d.dt_vel);
         let q = self.q.matrix(d.dt_vel);
-        let p_new = propagate_covariance(&self.p, &f, &q).map_err(FilterError::Prop)?;
+        let mut p_new = [[0.0f32; N]; N];
+        propagate_covariance_into(&self.p, &f, &q, &mut p_new).map_err(FilterError::Prop)?;
         self.p = p_new;
         propagate(&mut self.st, d, g_ned).map_err(FilterError::State)
     }
@@ -203,13 +206,15 @@ impl Eskf {
         } else {
             crate::params::nis_threshold(o.dof, self.nis_alpha_milli)
         };
-        match update(&self.p, &o.h, &o.resid, &o.r, thr) {
-            Ok(out) => {
-                let st_new = boxplus(&self.st, &out.dx).ok_or(FilterError::State(Violation::Nan))?;
-                self.p = out.p;
+        let mut p_new = [[0.0f32; N]; N];
+        let mut dx = [0.0f32; N];
+        match update_into(&self.p, &o.h, &o.resid, &o.r, thr, &mut p_new, &mut dx) {
+            Ok(nis_sigma) => {
+                let st_new = boxplus(&self.st, &dx).ok_or(FilterError::State(Violation::Nan))?;
+                self.p = p_new;
                 self.st = st_new;
                 let i = ch_idx(ch);
-                self.nis_sum[i] += out.nis_sigma as f64;
+                self.nis_sum[i] += nis_sigma as f64;
                 self.nis_n[i] = self.nis_n[i].saturating_add(1);
                 self.chan_acc[i] = self.chan_acc[i].saturating_add(1);
                 self.guards[i].accepted();
@@ -258,10 +263,12 @@ impl Eskf {
             return Ok(false);
         }
         let o = crate::observe::gravity(f_b_meas, &self.st, self.sigma_gravity);
-        match update(&self.p, &o.h, &o.resid, &o.r, 1e9) {
-            Ok(out) => {
-                let st_new = boxplus(&self.st, &out.dx).ok_or(FilterError::State(Violation::Nan))?;
-                self.p = out.p;
+        let mut p_new = [[0.0f32; N]; N];
+        let mut dx = [0.0f32; N];
+        match update_into(&self.p, &o.h, &o.resid, &o.r, 1e9, &mut p_new, &mut dx) {
+            Ok(_nis_sigma) => {
+                let st_new = boxplus(&self.st, &dx).ok_or(FilterError::State(Violation::Nan))?;
+                self.p = p_new;
                 self.st = st_new;
                 self.gravity_guard.accepted();
                 Ok(true)

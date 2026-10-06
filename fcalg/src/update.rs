@@ -66,13 +66,18 @@ pub(crate) fn inv3(a: &[[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
     ])
 }
 /// 通用 3 轴更新。
-pub fn update(
+/// **写入口**：`P` 与 `dx` 写进调用方缓冲，返回 `nis_sigma` ——
+/// **不再按值返回 `UpdateOut`**（其 `p: Cov` = 1,764 B 的返回临时量 ✗，
+/// 是实测栈溢出 4,128 B 的另一来源）✓。
+pub fn update_into(
     p: &Cov,
     h: &[[f32; N]; 3],
     resid: &[f32; 3],
     r: &[[f32; 3]; 3],
     gate_sigma: f32,
-) -> Result<UpdateOut, UpdateError> {
+    out_p: &mut Cov,
+    out_dx: &mut [f32; N],
+) -> Result<f32, UpdateError> {
     // ① 入口门
     for row in p.iter() {
         gate_all(Stage::L8Update, row).map_err(UpdateError::NonFinite)?;
@@ -139,7 +144,6 @@ pub fn update(
     }
     // ⑤ K = PHᵀ·S⁻¹；dx = K·ν
     let mut k = [[0.0f32; 3]; N];
-    let mut dx = [0.0f32; N];
     for i in 0..N {
         for b in 0..3 {
             let mut s = 0.0f32;
@@ -152,7 +156,7 @@ pub fn update(
         for a in 0..3 {
             d += k[i][a] * resid[a];
         }
-        dx[i] = d;
+        out_dx[i] = d;
     }
     // ⑥ Joseph：(I−KH)·P → ·(I−KH)ᵀ → + K·R·Kᵀ（上三角 + 镜像）
     let mut hp = [[0.0f32; N]; 3];
@@ -185,7 +189,6 @@ pub fn update(
             ph2[i][b] = acc;
         }
     }
-    let mut out = [[0.0f32; N]; N];
     for i in 0..N {
         for j in 0..=i {
             let mut s = newp[i][j];
@@ -195,16 +198,30 @@ pub fn update(
                     s += k[i][a] * r[a][b] * k[j][b];
                 }
             }
-            out[i][j] = s;
-            out[j][i] = s;
+            out_p[i][j] = s;
+            out_p[j][i] = s;
         }
     }
     // ⑦ 后置
-    for row in out.iter() {
+    for row in out_p.iter() {
         gate_all(Stage::L8Update, row).map_err(UpdateError::NonFinite)?;
     }
-    if has_negative_variance(&out) {
+    if has_negative_variance(out_p) {
         return Err(UpdateError::NotPositiveDefinite);
     }
-    Ok(UpdateOut { p: out, dx, nis_sigma })
+    Ok(nis_sigma)
+}
+
+/// **按值版本**（薄包装）—— 保留给调用方与既有测试 ✓（零波及）。
+pub fn update(
+    p: &Cov,
+    h: &[[f32; N]; 3],
+    resid: &[f32; 3],
+    r: &[[f32; 3]; 3],
+    gate_sigma: f32,
+) -> Result<UpdateOut, UpdateError> {
+    let mut outp = [[0.0f32; N]; N];
+    let mut dx = [0.0f32; N];
+    let nis_sigma = update_into(p, h, resid, r, gate_sigma, &mut outp, &mut dx)?;
+    Ok(UpdateOut { p: outp, dx, nis_sigma })
 }

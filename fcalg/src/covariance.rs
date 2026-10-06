@@ -123,7 +123,16 @@ fn gate_cov(a: &Cov) -> Result<(), Violation> {
     Ok(())
 }
 /// 协方差预测。失败时**不返回任何部分结果**（调用方状态不受影响）。
-pub fn propagate_covariance(p: &Cov, f: &[[f32; N]; N], q: &Cov) -> Result<Cov, CovError> {
+/// **写入口**：结果写进调用方的 `&mut Cov` —— **不再按值返回 `Cov`** ✓
+/// 动因（实测）：真固件里 L2 worker 栈溢出 4,128 B，其中一个来源就是
+/// `→ Cov` 的**按值返回临时量**（1,764 B/次，本函数与 `update` 各一次）✓。
+/// 索引对 `&mut Cov` 同样有效 ⇒ **函数体与原来逐字一致** ✓（零语义改动）。
+pub fn propagate_covariance_into(
+    p: &Cov,
+    f: &[[f32; N]; N],
+    q: &Cov,
+    out: &mut Cov,
+) -> Result<(), CovError> {
     // ① 入口门（契约 §4）：非有限一律显式拒绝，**不做任何钳位**
     gate_cov(p).map_err(CovError::NonFinite)?;
     gate_cov(q).map_err(CovError::NonFinite)?;
@@ -143,8 +152,7 @@ pub fn propagate_covariance(p: &Cov, f: &[[f32; N]; N], q: &Cov) -> Result<Cov, 
             }
         }
     }
-    // ③ 上三角：out = FP·Fᵀ + Q，随后镜像 ⇒ 逐位对称
-    let mut out = [[0.0f32; N]; N];
+    // ③ 上三角：out = FP·Fᵀ + Q，随后镜像 ⇒ 逐位对称（写入调用方缓冲 ✓）
     for i in 0..N {
         for j in 0..=i {
             let mut s = q[i][j];
@@ -175,8 +183,15 @@ pub fn propagate_covariance(p: &Cov, f: &[[f32; N]; N], q: &Cov) -> Result<Cov, 
             return Err(CovError::NotPositiveDefinite);
         }
     }
-    if has_negative_variance(&out) {
-        fix_negative_diagonals(&mut out);
+    if has_negative_variance(out) {
+        fix_negative_diagonals(out);
     }
+    Ok(())
+}
+
+/// **按值版本**（薄包装）—— 保留给调用方与既有测试 ✓（零波及）。
+pub fn propagate_covariance(p: &Cov, f: &[[f32; N]; N], q: &Cov) -> Result<Cov, CovError> {
+    let mut out = [[0.0f32; N]; N];
+    propagate_covariance_into(p, f, q, &mut out)?;
     Ok(out)
 }
