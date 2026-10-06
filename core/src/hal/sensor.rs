@@ -92,13 +92,20 @@ impl Default for MockImu { fn default() -> Self { Self::new() } }
 impl ImuSensor for MockImu {
     fn read(&mut self) -> ImuSample {
         self.t += 0.005;
-        // 悬停：加速度计受重力（机体 -Z 向下）≈ +g 在 z；轻微振荡模拟振动。
+        // ★★2026-10-05 修复：**静止水平时比力 z = −9.81**（FRD，z 向下 ✓）。
+        //   原为 `+9.81` ✗ —— 与同一份数据的文档契约**直接矛盾**：
+        //   `mcu_simulater/.../data_source.rs:454`："机体系加速度（比力，m/s²；
+        //   FRD z 向下，静止水平时 **z=-9.81**）" ✓
+        //   后果（判据 #6 对照实验实测 ✓）：比力 z 为正 ⇒ `hil.rs` 的
+        //   `roll = atan2(-a[1], -a[2])` 给出 **±π** ✗ ⇒ 姿态初值 **精确 180° 翻转**
+        //   （实测量化：`az=+9.81 ⇒ att wxyz = [-0.0000, -1.0000, 0, 0]` ✓）
+        //   ⇒ 与真链路残余误差 `w ≈ -0.081`（≈171°）**签名一致** ✓✓
         let vib = crate::math::sin(self.t * 120.0) * 0.02;
         ImuSample {
             accel: [
                 MeterPerSecondSquared(vib),
                 MeterPerSecondSquared(vib * 0.8),
-                MeterPerSecondSquared(9.81 + vib),
+                MeterPerSecondSquared(-9.81 + vib),
             ],
             gyro: [
                 RadianPerSecond(crate::math::sin(self.t * 0.7) * 0.01),
