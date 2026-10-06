@@ -15,6 +15,25 @@ use core::mem::MaybeUninit;
 
 use flyctrl_core::config::VehicleConfig;
 use flyctrl_core::controller::PidController;
+
+/// **控制器实现类型（按 feature 选择）** —— 与 `select.rs` 的 `InnerEst` 同一手法：
+/// 两种类型都实现了 `Controller` ⇒ 构造与用法**一行都不用改** ✓
+/// ⚠默认（无 feature）**逐位不变** ✓。
+#[cfg(not(feature = "fcalg-ctrl"))]
+pub type CtrlImpl = PidController;
+#[cfg(feature = "fcalg-ctrl")]
+pub type CtrlImpl = flyctrl_core::estimator::fcalg_ctrl_bridge::FcalgController;
+
+/// ★**构造子随类型不同**（旧栈是 `PidController::default_quad()`，新栈是 `FcalgController::new()`）
+/// ⇒ 用 cfg 工厂收口，调用点保持一行 ✓。默认路径**逐位不变** ✓。
+#[cfg(not(feature = "fcalg-ctrl"))]
+fn make_ctrl() -> CtrlImpl {
+    PidController::default_quad()
+}
+#[cfg(feature = "fcalg-ctrl")]
+fn make_ctrl() -> CtrlImpl {
+    flyctrl_core::estimator::fcalg_ctrl_bridge::FcalgController::new()
+}
 use flyctrl_core::estimator::select::AnyEstimator;
 use flyctrl_core::estimator::Estimator as _; // ★诊断：`accel_bias()` 是 trait 方法，须导入 ✓
 use flyctrl_core::hil::{HilContext, SimImu};
@@ -39,7 +58,7 @@ static mut L2_WQ_STACK: WqStack<12288> = WqStack([0; 12288]);
 static mut L3_WQ_STACK: WqStack<2048> = WqStack([0; 2048]);
 
 // ---- estimator item 状态 ----
-static mut EKF_HIL: MaybeUninit<HilContext<AnyEstimator, PidController>> = MaybeUninit::uninit();
+static mut EKF_HIL: MaybeUninit<HilContext<AnyEstimator, CtrlImpl>> = MaybeUninit::uninit();
 static mut EKF_IMU: MaybeUninit<SimImu> = MaybeUninit::uninit();
 static mut EKF_LAST_SEQ: u32 = 0;
 static mut EKF_LAST_TICKS: u32 = 0;
@@ -228,7 +247,7 @@ pub fn setup() {
         // estimator 静态状态
         let mut hil = HilContext::new(
             AnyEstimator::default_product(),
-            PidController::default_quad(),
+            make_ctrl(),
             Second(4.0 / 1000.0),
         );
         hil.est.set_observation_noise(0.25, 0.01, 0.09);
