@@ -593,3 +593,54 @@ fn hil_bad_init_then_good_probe() {
         }
     }
 }
+
+/// ★装配层判据 #8（2026-10-05）：**按真链路配置 + 真链路帧流**复现 111°（最直接的复现尝试 ✗）。
+///
+/// 缺口（此前从未测过 ✗）：所有既有判据都用 fcalg 的**默认**观测噪声
+/// （`ObsParams::default()` = 0.5 / 0.1 / 0.3），而真链路 `ekf_task.rs:35` 显式设
+/// **`set_observation_noise(0.25, 0.01, 0.09)`** ✗（R 小 2~10× ⇒ NIS 大得多 ⇒ 拒收更多 ✗）；
+/// 且真链路每拍还喂 **GPS 位置 / 气压 / 磁** ✓，既有判据多为 `None` ✗。
+/// 本判据按真链路配齐，看能否在 host 上复现真链路的**偏航主导大角误差** ✓。
+/// **只打印**（不制造红灯 ✓）。
+#[test]
+fn hil_app_config_repro_probe() {
+    use flyctrl_core::controller::PidController;
+    use flyctrl_core::estimator::select::AnyEstimator;
+    use flyctrl_core::hil::{HilContext, SimImu};
+    use flyctrl_core::units::{Meter, MeterPerSecondSquared, RadianPerSecond, Second};
+    use flyctrl_core::vehicle::{ImuSample, PosSample};
+
+    let mut hil = HilContext::new(
+        AnyEstimator::default_product(),
+        PidController::default_quad(),
+        Second(4.0 / 1000.0),
+    );
+    // ★真链路配置（ekf_task.rs:35 ✓）
+    hil.est.set_observation_noise(0.25, 0.01, 0.09);
+    let mut sim = SimImu::new();
+    let sp = unsafe { core::mem::zeroed() };
+    let frame = ImuSample {
+        accel: [
+            MeterPerSecondSquared(0.0),
+            MeterPerSecondSquared(0.0),
+            MeterPerSecondSquared(-9.81),
+        ],
+        gyro: [RadianPerSecond(0.0); 3],
+    };
+    for k in 0..1300 {
+        // 真链路帧流：IMU（≈77Hz ✓）+ 每拍 GPS 位置(0,0,0 ✓)+ 气压 0 ✓+ 磁 ✓
+        let imu = if k % 3 == 0 { Some(frame) } else { None };
+        let pos = Some(PosSample::pos_only([Meter(0.0); 3]));
+        let _ = hil.ekf_hil(
+            imu, pos, Some(0.0), None, None, Some([0.45, 0.0, -0.28]),
+            &sp, false, false, true, &mut sim,
+        );
+        if k == 399 || k == 1299 {
+            let q = hil.est.state().att;
+            eprintln!(
+                "[repro] 第 {:4} 拍：wxyz = [{:.4}, {:.4}, {:.4}, {:.4}] | yaw = {:.2}°",
+                k + 1, q.w, q.x, q.y, q.z, hil.est.inner.yaw_rad().to_degrees()
+            );
+        }
+    }
+}
