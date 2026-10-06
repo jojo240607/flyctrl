@@ -52,13 +52,16 @@ impl Rng {
         self.0 = x;
         (x as i32 as f32) / 2147483648.0
     }
-    /// 近似高斯（12 个均匀之和，Irwin–Hall）⇒ 均值 0、方差 1
+    /// 近似高斯（Irwin–Hall）—— **必须除 2**：
+    /// `u()` 是均匀(-1,1)（方差 1/3），12 个之和方差 = 12/3 = **4** ⇒ 标准差 2。
+    /// ★首版漏了这个 2 倍 ⇒ 注入了 **2×名义 σ** 的噪声 ⇒ 新息被放大 ⇒ 门限多拒
+    ///   ⇒ 我据此连续否掉了三个"听起来合理"的假设 —— 它们全都在解释**这个 artifact**。
     fn g(&mut self) -> f32 {
         let mut s = 0.0f32;
         for _ in 0..12 {
             s += self.u();
         }
-        s
+        s * 0.5
     }
 }
 
@@ -277,7 +280,7 @@ fn nis_consistency_scan_over_q_scale() {
         };
         let rej = f.rejects_total as f64 / (f.nis_n.iter().map(|x| *x as f64).sum::<f64>() + f.rejects_total as f64);
         eprintln!(
-            "[nis] Q×{scale:<7} 平均NIS: baro={:.2}(期望1) gpsP={:.2}(期望3) gpsV={:.2}(期望2) | 拒收率={:.1}% | 拆分: gate={} numeric={} singular={} nonfinite={}",
+            "[nis] Q×{scale:<7} 【未截断】平均NIS: baro={:.2}(期望1) gpsP={:.2}(期望3) gpsV={:.2}(期望2) | 拒收率={:.1}% | 拆分: gate={} numeric={} singular={} nonfinite={}",
             mean(0),
             mean(1),
             mean(2),

@@ -155,7 +155,7 @@ pub const PARAMS: &[Meta] = &[
         unit: Unit::Ratio,
         lo: 900.0,
         hi: 999.0,
-        source: Source::Derived("χ² 上尾 0.997 ⇒ 门限由 sqrt(χ²_dof(α)) 导出（数学常数，非整定）"),
+        source: Source::Derived("解析推导：χ² 上尾分位数（0.997）⇒ 门限 = sqrt(χ²_dof(α))；dof=1 时 = 2.968，与旧栈标量 3σ 一致"),
     },
     Meta {
         name: "gate.nis_sigma",

@@ -120,7 +120,10 @@ pub struct Eskf {
     pub g_tol_frac: f32,
     /// NIS 门的置信度（千分比；门限由 `params::nis_threshold(dof, α)` **导出**）。
     pub nis_alpha_milli: u32,
-    /// 各通道已接受更新的 **NIS 累计与计数**（NIS 一致性标定用）。
+    /// 各通道**全部尝试**（接受 + 被拒）的 **NIS 累计与计数**（NIS 一致性标定用）。
+    /// ★**必须在被拒分支也累计** —— 只统计被接受的样本会得到**截断分布**（门限切掉尾部），
+    ///   均值天然偏低 ⇒ 用它判一致性在方法上就不成立（本会话实测踩到：
+    ///   gpsV 均值 0.93 而期望 2，正是截断偏倚的产物，还因此连续否掉了三个假设）。
     /// 期望平均 NIS = 该通道的**有效观测轴数**（气压 1、GPS位 3、GPS速 2、磁航向 1）——
     /// 由 L9 的 `NO_INFO` 设计决定，不是拍的数。
     pub nis_sum: [f64; 4],
@@ -207,8 +210,12 @@ impl Eskf {
             Err(e) => {
                 self.rejects_total = self.rejects_total.wrapping_add(1);
                 match e {
-                    UpdateError::Rejected { .. } => {
-                        self.rejects_gate = self.rejects_gate.wrapping_add(1)
+                    UpdateError::Rejected { nis_sigma } => {
+                        self.rejects_gate = self.rejects_gate.wrapping_add(1);
+                        // ★被拒样本也计入 ⇒ 分布**不截断**（见字段注释）
+                        let i = ch_idx(ch);
+                        self.nis_sum[i] += nis_sigma as f64;
+                        self.nis_n[i] = self.nis_n[i].saturating_add(1);
                     }
                     UpdateError::NotPositiveDefinite => {
                         self.rejects_numeric = self.rejects_numeric.wrapping_add(1)
