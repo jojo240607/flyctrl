@@ -123,7 +123,7 @@ mod tests {
     use super::*;
 
     fn d(ts: u32) -> ImuDelta {
-        ImuDelta { delta_ang: [0.0, 0.0, ts as f32], delta_vel: [0.0, 0.0, 9.81], dt: 0.001, ts_cyc: ts }
+        ImuDelta { delta_ang: [0.0, 0.0, ts as f32], delta_vel: [0.0, 0.0, 9.81], dt_ang: 0.001, dt_vel: 0.001, ts_cyc: ts }
     }
 
     #[test]
@@ -154,7 +154,7 @@ mod tests {
 
     #[test]
     fn delta_derives_instantaneous() {
-        let x = ImuDelta { delta_ang: [0.002, 0.0, 0.0], delta_vel: [0.0, 0.0, 0.00981], dt: 0.001, ts_cyc: 0 };
+        let x = ImuDelta { delta_ang: [0.002, 0.0, 0.0], delta_vel: [0.0, 0.0, 0.00981], dt_ang: 0.001, dt_vel: 0.001, ts_cyc: 0 };
         assert!((x.gyro()[0] - 2.0).abs() < 1e-5);
         assert!((x.accel()[2] - 9.81).abs() < 1e-3);
     }

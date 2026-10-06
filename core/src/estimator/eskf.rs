@@ -633,6 +633,37 @@ fn inv3(m: &[[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
 /// **三维量测更新 + NIS 卡方门**（GPS 位置/速度 ✓ —— H 已数值验证 ✓）
 ///
 /// 与 `update_scalar` 同一纪律 ✓：**被拒绝时 P【逐位不变】** ✓；门用 NIS（σ ✓）
+/// **检测 `h` 是否为选择矩阵**（每行**恰一个**非零）⇒ 返回 `Some([(列号, 值); 3])` ✓
+///
+/// 为何重要：【实测】现役每个调用点（`update_gps_pos` 的 `h[a][I_POS+a]=1`、
+/// `update_gps_vel` 的 `h[a][I_VEL+a]=1`）都是选择矩阵 ⇒ `PHᵀ` / `H·P` / `P·Hᵀ`
+/// 三条 **1323 MAC** 的乘法可**整体塔缩为按行/列的拷贝**（`hp`+`ph2` 实测
+/// 23,442+22,555 计数/次 × 2 次/拍 ⇒ 约占拍内 0.5 ms ✗）。
+/// 非选择矩阵（如磁航向梯度的 `H`）⇒ 返回 `None`，调用方走原通用循环 ✓（语义不变 ✓）。
+#[inline]
+fn h_select(h: &[[f32; N]; 3]) -> Option<[(usize, f32); 3]> {
+    let mut sel = [(0usize, 0.0f32); 3];
+    for a in 0..3 {
+        let mut idx = usize::MAX;
+        let mut val = 0.0f32;
+        for k in 0..N {
+            let hk = h[a][k];
+            if hk != 0.0 {
+                if idx != usize::MAX {
+                    return None; // 该行多于一个非零 ⇒ 非选择矩阵 ✓
+                }
+                idx = k;
+                val = hk;
+            }
+        }
+        if idx == usize::MAX {
+            return None; // 全零行 ⇒ H 退化，交通用路径判奇异 ✓
+        }
+        sel[a] = (idx, val);
+    }
+    Some(sel)
+}
+
 pub fn update_vec3(
     p: &mut Cov,
     h: &[[f32; N]; 3],
@@ -640,29 +671,56 @@ pub fn update_vec3(
     r: &[[f32; 3]; 3],
     gate_sigma: f32,
 ) -> Result<f32, &'static str> {
-    // PHᵀ（15×3）
+    // ★选择矩阵快路径（实测占拍内 ~0.5 ms ✗）—— `pht[i][j] = p[i][s_j.0] * s_j.1` ✓
+    let sel = h_select(h);
     let mut pht = [[0.0f32; 3]; N];
-    for i in 0..N {
-        for j in 0..3 {
-            let mut s = 0.0f32;
-            for k in 0..N {
-                s += p[i][k] * h[j][k];
+    match sel {
+        Some(s) => {
+            for i in 0..N {
+                let pi = &p[i];
+                for j in 0..3 {
+                    pht[i][j] = pi[s[j].0] * s[j].1;
+                }
             }
-            pht[i][j] = s;
+        }
+        None => {
+            for i in 0..N {
+                for j in 0..3 {
+                    let mut s = 0.0f32;
+                    for k in 0..N {
+                        s += p[i][k] * h[j][k];
+                    }
+                    pht[i][j] = s;
+                }
+            }
         }
     }
-    // S = H·PHᵀ + R（3×3）
+    crate::perf::probe(24); // uv3: PHᵀ 完
+    // S = H·PHᵀ + R（3×3）—— 选择矩阵时 `Σ_k h[a][k]·pht[k][b] = v_a·pht[s_a][b]` ✓
     let mut s_mat = *r;
-    for a in 0..3 {
-        for b in 0..3 {
-            let mut s = 0.0f32;
-            for k in 0..N {
-                s += h[a][k] * pht[k][b];
+    match sel {
+        Some(s) => {
+            for a in 0..3 {
+                let (ka, va) = s[a];
+                for b in 0..3 {
+                    s_mat[a][b] += va * pht[ka][b];
+                }
             }
-            s_mat[a][b] += s;
+        }
+        None => {
+            for a in 0..3 {
+                for b in 0..3 {
+                    let mut s = 0.0f32;
+                    for k in 0..N {
+                        s += h[a][k] * pht[k][b];
+                    }
+                    s_mat[a][b] += s;
+                }
+            }
         }
     }
     let s_inv = inv3(&s_mat).ok_or("C1: S 奇异/非正 ⇒ 拒绝更新 ✓")?;
+    crate::perf::probe(25); // uv3: S 组装 + inv3 完
     // NIS = νᵀ S⁻¹ ν（3 DOF ⇒ 门限按 sqrt(NIS) ≤ gate_sigma ✓，与参照同口径 ✓）
     let mut tmp = [0.0f32; 3];
     for a in 0..3 {
@@ -721,6 +779,7 @@ pub fn update_vec3(
             k[i][b] = s;
         }
     }
+    crate::perf::probe(26); // uv3: 增益 K 完
     // ★★★2026-10-04【对齐 PX4 一手 `ekf_helper.cpp:1059-1087` 的 **Joseph 稳定化更新**】：
     //   原实现是简化式 `P ← (I−K·H)·P` ✗ —— 代数上等价，但**当 K 不是最优时**（PX4 原注：
     //   "P is now not symmetric if K is not optimal (e.g.: some gains have been zeroed)" ✓）
@@ -735,16 +794,31 @@ pub fn update_vec3(
     //
     // 一次算好 (H·P)（3×N² ✓）—— 必须【循环外】算 ✗
     //   （曾把它放在 (i,j,a) 最内层 ⇒ 每对 (i,j) 重算 N 次 ⇒ **又是 N³** ✗✓）
+    // ★选择矩阵：`hp[a][j] = v_a · p[s_a][j]`（63 次拷贝 vs 1323 MAC ✓）
     let mut hp = [[0.0f32; N]; 3];
-    for a in 0..3 {
-        for j in 0..N {
-            let mut acc = 0.0f32;
-            for kk in 0..N {
-                acc += h[a][kk] * p[kk][j];
+    match sel {
+        Some(s) => {
+            for a in 0..3 {
+                let (ka, va) = s[a];
+                let pk = &p[ka];
+                for j in 0..N {
+                    hp[a][j] = va * pk[j];
+                }
             }
-            hp[a][j] = acc;
+        }
+        None => {
+            for a in 0..3 {
+                for j in 0..N {
+                    let mut acc = 0.0f32;
+                    for kk in 0..N {
+                        acc += h[a][kk] * p[kk][j];
+                    }
+                    hp[a][j] = acc;
+                }
+            }
         }
     }
+    crate::perf::probe(27); // uv3: (H·P) 完
     // Step 1：P ← (I − K·H)·P
     let mut newp = [[0.0f32; N]; N];
     for i in 0..N {
@@ -756,32 +830,61 @@ pub fn update_vec3(
             newp[i][j] = s;
         }
     }
+    crate::perf::probe(28); // uv3: Step1 (I−KH)P 完
     // Step 2：PH2 = P_temp·Hᵀ（N×3 ✓，由 hp 转置得到：hp[a][j] = (H·P)[a][j]
     //         ⇒ P_temp·Hᵀ 的第 (i,b) 元素 = Σ_j newp[i][j]·h[b][j] ✓）
+    // ★选择矩阵：`ph2[i][b] = v_b · newp[i][s_b]`（63 次拷贝 vs 1323 MAC ✓）
     let mut ph2 = [[0.0f32; 3]; N];
-    for i in 0..N {
-        for b in 0..3 {
-            let mut acc = 0.0f32;
-            for j in 0..N {
-                acc += newp[i][j] * h[b][j];
+    match sel {
+        Some(s) => {
+            for i in 0..N {
+                let ni = &newp[i];
+                for b in 0..3 {
+                    ph2[i][b] = s[b].1 * ni[s[b].0];
+                }
             }
-            ph2[i][b] = acc;
+        }
+        None => {
+            for i in 0..N {
+                for b in 0..3 {
+                    let mut acc = 0.0f32;
+                    for j in 0..N {
+                        acc += newp[i][j] * h[b][j];
+                    }
+                    ph2[i][b] = acc;
+                }
+            }
         }
     }
+    crate::perf::probe(29); // uv3: P_temp·Hᵀ 完
     // P ← P_temp − PH2·Kᵀ + K·R·Kᵀ（只算上三角 j≤i，再镜像 ✓ —— PX4 同款 ✓）
+    //
+    // ★★【实测靶点】原实现把 `Σ_a Σ_b k[i][a]·r[a][b]·k[j][b]` 放在 (i,j) 最内层
+    //   ⇒ 每对 (i,j) 花 **9×2 = 18 次乘** ✗（实测本段 73,104 计数/次，是 `update_vec3` 里最大项 ✗）。
+    //   先把 `kr = K·R`（N×3，189 MAC）**算一次** ✓ ⇒ 该项 = `Σ_b kr[i][b]·k[j][b]`
+    //   （3 乘/对 ✓）⇒ **4851 → 1764 MAC（3× 操作数下降）** ✓。
+    //   代数恒等（只是乘积结合律重排 ⟂ 不进算法 ✗）；护栏单测把关 ✓。
+    let mut kr = [[0.0f32; 3]; N];
+    for i in 0..N {
+        let (k0, k1, k2) = (k[i][0], k[i][1], k[i][2]);
+        kr[i][0] = k0 * r[0][0] + k1 * r[1][0] + k2 * r[2][0];
+        kr[i][1] = k0 * r[0][1] + k1 * r[1][1] + k2 * r[2][1];
+        kr[i][2] = k0 * r[0][2] + k1 * r[1][2] + k2 * r[2][2];
+    }
     for i in 0..N {
         for j in 0..=i {
             let mut s = newp[i][j];
             for a in 0..3 {
                 s -= ph2[i][a] * k[j][a];
-                for b in 0..3 {
-                    s += k[i][a] * r[a][b] * k[j][b];
-                }
+            }
+            for b in 0..3 {
+                s += kr[i][b] * k[j][b];
             }
             newp[i][j] = s;
             newp[j][i] = s; // ★强制对称 ✓（PX4 `P(j,i) = P(i,j)` ✓）
         }
     }
+    crate::perf::probe(30); // uv3: Step2 (−PH2·Kᵀ + KRKᵀ) 完
     // ★对角方差钳位（PX4 `constrainStateVariances()` ✓，其原注：last resort、不应依赖 ✓）
     //   vel/pos：1e-6..1e6（PX4 同值 ✓）；这里统一给全部状态一个下界 eps ✓
     for i in 0..N {
@@ -792,6 +895,7 @@ pub fn update_vec3(
         }
     }
     *p = newp;
+    crate::perf::probe(31); // uv3: 方差钳位 + 拷回 P 完
     Ok(nis_sigma)
 }
 
@@ -1012,6 +1116,7 @@ impl Eskf {
         ];
         let r = rot_of(self.st.q);
         let fm = transition_matrix(self.st.q, w, dt, &r, f_body).expect("F 已定形 ✓");
+        crate::perf::probe(22); // predict: F 构建完（含 w/f_body/rot_of ✓）
         // 过程噪声 Q（简化对角 ✓；量级按 dt 缩放 ✓）
         let mut q = [[0.0f32; N]; N];
         // ★Q 标定（2026-09-21 第一轮）：由 NIS 一致性反推（非试错 ✓）
@@ -1051,7 +1156,9 @@ impl Eskf {
             q[I_MAGI + i][I_MAGI + i] = if frz { 0.0 } else { 1e-3 * dt };
             q[I_MAGB + i][I_MAGB + i] = if frz { 0.0 } else { 1e-3 * dt };
         }
+        crate::perf::probe(23); // predict: Q 构建完
         self.p = predict_covariance(&self.p, &fm, &q);
+        crate::perf::probe(32); // predict: 协方差传播（F·P·Fᵀ+Q）完
         // ★**过程噪声方差地板**（照参照 `cov.cpp` 的条件式 ✓；§3.5 的根因修复 ✓✓）
         //   参照参数：ekf2_mag_e_noise 1e-3 · ekf2_mag_b_noise 1e-4 · ekf2_gyr_noise 1.5e-2 ✓
         //   语义：某状态方差低于【噪声量级】⇒ 补足过程噪声 ⇒ 协方差不会塌陷 ⇒

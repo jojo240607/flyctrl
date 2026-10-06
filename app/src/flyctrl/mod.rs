@@ -304,6 +304,16 @@ static mut STACK_TELEM_BUF: [u8; STACK_TELEM] = [0u8; STACK_TELEM];
 static mut STACK_UPLINK_BUF: [u8; STACK_UPLINK] = [0u8; STACK_UPLINK];
 #[link_section = ".app_stacks"]
 static mut STACK_ALLOC_BUF: [u8; STACK_ALLOC] = [0u8; STACK_ALLOC];
+// ★★★§5.226【根因修复 ✓】本行原先**漏了 `#[link_section = ".app_stacks"]`** ✗
+//   （四个兄弟栈都有，唯独它没有 ⇒ 复制粘贴遗漏）
+//   ⇒ 它落进普通 `.bss`，对齐只按 `[u8; N]` 的 **1** ⇒ 实测被放到 `0x20010ce9`（≡1 mod 8 ✗）
+//   ⇒ Cortex-M 异常入栈（带 FPU 时为 S0–S15+FPSCR 共 72B）**要求 8 字节对齐**
+//   ⇒ 上下文框架落在代码预期之外 ⇒ 保存的返回地址被 0 覆盖 ⇒ 之后 `pop {…,pc}` 弹回 0
+//   ⇒ `pc=0x00000000` ⇒ 后续写落到未映射地址 ⇒ `UC_ERR_WRITE_UNMAPPED`
+//   （而 `SCB CFSR/HFSR/MMFAR/BFAR=0` —— "跳回 0"在架构上完全合法，故长期无前兆 ✓）
+//   实测证据：`JOC_MSPWATCH` 抓到写者 `PC=0x08000276 ∈ PendSV_Handler`、handler 模式
+//   （LR=0xffffffed、SP∈MSP）向 `STACK_RATE_BUF` 内部**非对齐**地址（0x20011a49/4d/51…）写值。
+#[link_section = ".app_stacks"]
 static mut STACK_RATE_BUF: [u8; STACK_RATE] = [0u8; STACK_RATE];
 #[link_section = ".app_stacks"]
 static mut STACK_SAFETY_BUF: [u8; STACK_SAFETY] = [0u8; STACK_SAFETY];
