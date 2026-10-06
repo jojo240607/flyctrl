@@ -430,3 +430,60 @@ fn hil_garbage_frame_yaw_drift_probe() {
         worst_yaw.to_degrees()
     );
 }
+
+/// ★装配层判据 #5（2026-10-05）：**门内陀螺尖峰** ⇒ 偏航跳变探针（**非空转** ✓）。
+///
+/// 修正判据 #4 的空转 ✗：#4 的真帧陀螺全 0 ⇒ 保持到的也是 0 ⇒ 没东西可积分 ✗。
+/// 本判据按**收敛结论**设计（见 #4 与本文件上文）：
+///   · 111° 量级 ⇒ 只能来自**一次大事件** ✓（采样保持已用算术否证 ✗）
+///   · `§5.134` 门只拦 **>100 rad/s** ✗ ⇒ **50 rad/s 的垃圾帧会被放行并直接积分** ✓
+///   · 偏航**不可观测**（磁参考为零 ⇒ 按契约拒绝 ✓；重力观测对偏航无感 ✓）
+///     ⇒ 一旦积分偏了就**永久保留** ✓
+/// 预期（若机制成立）：单帧 50 rad/s ⇒ 0.2 rad/拍；该样本随后被 sample-and-hold
+///   继续积分约 3 拍（下一真帧到达前）⇒ 约 **0.6 rad ≈ 34°/帧** ✗ ⇒ 3 帧即 ~100° ✓
+///
+/// **只打印**（不制造红灯 ✓）；若偏航确实跳变 ⇒ 机制坐实 ✓。
+#[test]
+fn hil_gate_passing_gyro_spike_probe() {
+    use flyctrl_core::controller::PidController;
+    use flyctrl_core::estimator::select::AnyEstimator;
+    use flyctrl_core::hil::{HilContext, SimImu};
+    use flyctrl_core::units::{MeterPerSecondSquared, RadianPerSecond, Second};
+    use flyctrl_core::vehicle::ImuSample;
+
+    let mut hil = HilContext::new(
+        AnyEstimator::default_product(),
+        PidController::default_quad(),
+        Second(4.0 / 1000.0),
+    );
+    let mut sim = SimImu::new();
+    let sp = unsafe { core::mem::zeroed() };
+    let frame = |gz: f32| ImuSample {
+        accel: [
+            MeterPerSecondSquared(0.0),
+            MeterPerSecondSquared(0.0),
+            MeterPerSecondSquared(-9.81),
+        ],
+        gyro: [RadianPerSecond(0.0), RadianPerSecond(0.0), RadianPerSecond(gz)],
+    };
+    // 三个"门内尖峰"帧：50 rad/s（< 100 ⇒ **不会被 §5.134 拒** ✓）
+    let spikes = [500usize, 700, 900];
+    for k in 0..1300 {
+        let imu = if spikes.contains(&k) {
+            Some(frame(50.0))
+        } else if k % 3 == 0 {
+            Some(frame(0.0))
+        } else {
+            None
+        };
+        let _ = hil.ekf_hil(imu, None, None, None, None, None, &sp, false, false, true, &mut sim);
+        if spikes.contains(&(k + 1)) || k == 1299 {
+            eprintln!(
+                "[spike] 第 {} 拍：yaw = {:.4} rad = {:.2} deg",
+                k + 1,
+                hil.est.inner.yaw_rad(),
+                hil.est.inner.yaw_rad().to_degrees()
+            );
+        }
+    }
+}
