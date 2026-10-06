@@ -13,6 +13,7 @@ pub mod finite;
 pub mod imu_delta;
 pub mod imu_filter;
 pub mod math;
+pub mod observe;
 pub mod propagate;
 pub mod quat;
 pub mod transition;
@@ -26,6 +27,7 @@ pub use finite::{gate, gate_all, violations, violations_total, Stage, Violation}
 pub use imu_delta::{DeltaBuilder, ImuDelta, Reject};
 pub use imu_filter::{ImuFilter, ImuFiltered};
 pub use propagate::{propagate, State};
+pub use observe::{baro, gps_pos, gps_vel, Obs, ObsParams, NO_INFO};
 pub use quat::{specific_force_at_rest, Quat, GRAVITY_NED};
 pub use transition::{skew, transition_matrix};
 pub use units::{Meters, Mps, Radians, Rps, Seconds};
