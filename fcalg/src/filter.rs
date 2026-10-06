@@ -128,6 +128,11 @@ pub struct Eskf {
     /// 由 L9 的 `NO_INFO` 设计决定，不是拍的数。
     pub nis_sum: [f64; 4],
     pub nis_n: [u32; 4],
+    /// **按通道的接受/拒收总数**（诊断门面的原材料）。
+    /// ⚠注意与 `guards[i].rejects()` 的区别：后者是**连续**拒收（接受即清零，用于触发重灌），
+    /// 不是总数 ✗ —— 旧栈诊断读的正是"总数"语义，故这里单独累计。
+    pub chan_acc: [u32; 4],
+    pub chan_rej: [u32; 4],
     /// 拒收**按原因拆分**（诊断用：混在一起会误导 —— 本会话就误导过一次）：
     /// 门限拒收 / 数值非正定 / S 奇异 / 非有限。
     pub rejects_gate: u32,
@@ -151,6 +156,8 @@ impl Eskf {
             g_tol_frac: 0.06,
             nis_alpha_milli: 997,
             rejects_total: 0,
+            chan_acc: [0; 4],
+            chan_rej: [0; 4],
             rejects_gate: 0,
             rejects_numeric: 0,
             rejects_singular: 0,
@@ -204,11 +211,13 @@ impl Eskf {
                 let i = ch_idx(ch);
                 self.nis_sum[i] += out.nis_sigma as f64;
                 self.nis_n[i] = self.nis_n[i].saturating_add(1);
+                self.chan_acc[i] = self.chan_acc[i].saturating_add(1);
                 self.guards[i].accepted();
                 Ok(())
             }
             Err(e) => {
                 self.rejects_total = self.rejects_total.wrapping_add(1);
+                self.chan_rej[ch_idx(ch)] = self.chan_rej[ch_idx(ch)].saturating_add(1);
                 match e {
                     UpdateError::Rejected { nis_sigma } => {
                         self.rejects_gate = self.rejects_gate.wrapping_add(1);

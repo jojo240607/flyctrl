@@ -134,6 +134,19 @@ impl FcalgEstimator {
         self.not_impl_calls
     }
 
+    /// 诊断门面的原材料（`AnyEstimator` 改选型后，app 侧 12 处读数映射到这些）：
+    /// 各通道的**接受/拒收总数**（`ch` 0..3 = baro/gpsP/gpsV/magYaw）。
+    pub fn chan_acc(&self, ch: usize) -> u32 {
+        self.f.chan_acc.get(ch).copied().unwrap_or(0)
+    }
+    pub fn chan_rej(&self, ch: usize) -> u32 {
+        self.f.chan_rej.get(ch).copied().unwrap_or(0)
+    }
+    /// 估计器内部"步数"（对应于旧栈的 `n_step`：predict 调用次数）。
+    pub fn hist_len(&self) -> usize {
+        self.f.st.p.len()
+    }
+
     fn fuse_track(&mut self, o: &Obs, ch: Channel) {
         if self.f.fuse(o, ch, self.gate_sigma, self.reflate_floor).is_err() {
             self.fuse_rejects = self.fuse_rejects.wrapping_add(1);
