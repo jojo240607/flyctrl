@@ -133,6 +133,8 @@ impl Estimator for FcalgEstimator {
             ts_ticks: 0,
         };
         let _ = self.f.predict(&d, fcalg::GRAVITY_NED);
+        // 重力（倾角）观测：紧接 predict（IMU 驱动）。量级门不过则**显式**返回 false 并计数。
+        let _ = self.f.update_gravity(a);
         self.fuse_pos(pos);
         self.state()
     }
@@ -146,6 +148,12 @@ impl Estimator for FcalgEstimator {
         }
         let d = ImuDelta { delta_ang, delta_vel, dt_ang, dt_vel, ts_ticks: 0 };
         let _ = self.f.predict(&d, fcalg::GRAVITY_NED);
+        // 重力（倾角）观测：紧接 predict。比力由本拍速度增量还原（量纲：m/s²）。
+        if dt_vel > 0.0 {
+            let inv = 1.0 / dt_vel;
+            let f_b = [delta_vel[0] * inv, delta_vel[1] * inv, delta_vel[2] * inv];
+            let _ = self.f.update_gravity(f_b);
+        }
     }
 
     fn update_fusion(

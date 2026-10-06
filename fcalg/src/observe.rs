@@ -36,7 +36,8 @@
 #[allow(unused_imports)]
 use crate::math::F32Ext;
 
-use crate::error_state::{I_ATT, I_MAGB, I_MAGI, I_POS, I_VEL, N};
+use crate::error_state::{I_ATT, I_BA, I_MAGB, I_MAGI, I_POS, I_VEL, N};
+use crate::quat::GRAVITY_NED;
 use crate::propagate::State;
 /// 「无信息」的对角 R（必须对角）。
 pub const NO_INFO: f32 = 1e12;
@@ -103,6 +104,50 @@ fn rot_matrix(q: crate::quat::Quat) -> [[f32; 3]; 3] {
 fn skew3(v: [f32; 3]) -> [[f32; 3]; 3] {
     [[0.0, -v[2], v[1]], [v[2], 0.0, -v[0]], [-v[1], v[0], 0.0]]
 }
+/// **重力（倾角）观测** —— 旧栈 `update_gravity` 的对应物（本轮补上的缺口）。
+///
+/// 模型：`h(x) = R(q)ᵀ·(−GRAVITY_NED) + ba`（预测的**机体比力**，含加计零偏估计）
+/// ⇒ `H_att = [Rᵀ(−g)×]`（右乘误差态，与 L0/L5/L6/L9b 同一约定），`H_ba = I`。
+///
+/// # 量级门（**关键安全门**）
+/// 只有"只有重力"时才可信：`| ‖f‖ − g | / g ≤ tol`。
+/// 机动中加计测的是比力而非重力 ⇒ 融进去会把 tilt 拉坏。
+/// `tol` 复用参数表 `align.g_tol_frac` —— 与静止对齐是**同一个物理判据**（一处定义）。
+/// 不满足时**不融合**（由调用方显式计数，绝不静默）。
+pub fn gravity(f_b_meas: [f32; 3], st: &State, sigma: f32) -> Obs {
+    let g_body = st.q.conj().rotate(GRAVITY_NED); // Rᵀ·g
+    let h_pred = [
+        -g_body[0] + st.ba[0],
+        -g_body[1] + st.ba[1],
+        -g_body[2] + st.ba[2],
+    ];
+    let resid = [
+        f_b_meas[0] - h_pred[0],
+        f_b_meas[1] - h_pred[1],
+        f_b_meas[2] - h_pred[2],
+    ];
+    // H_att = [−(Rᵀ g)×] = skew(−g_body)（零偏不影响姿态块）
+    let sw = crate::transition::skew([-g_body[0], -g_body[1], -g_body[2]]);
+    let mut h = [[0.0f32; N]; 3];
+    for a in 0..3 {
+        for b in 0..3 {
+            h[a][I_ATT + b] = sw[a][b];
+            h[a][I_BA + b] = if a == b { 1.0 } else { 0.0 };
+        }
+    }
+    let s = sigma * sigma;
+    Obs { h, resid, r: diag(s, s, s) }
+}
+
+/// 量级门：`| ‖f_b_meas‖ − g | / g ≤ tol`（与静止对齐同一判据）。
+pub fn gravity_magnitude_ok(f_b_meas: [f32; 3], tol: f32) -> bool {
+    let n = crate::math::sqrt(
+        f_b_meas[0] * f_b_meas[0] + f_b_meas[1] * f_b_meas[1] + f_b_meas[2] * f_b_meas[2],
+    );
+    let g = GRAVITY_NED[2];
+    n.is_finite() && ((n - g).abs() / g) <= tol
+}
+
 /// 磁航向（**yaw-only**，标量观测占据 0 号轴）。
 /// # 模型（显式，含符号约定）
 /// `m_b = meas − mag_b`（机体零偏已扣）、`m_w = R(q)·m_b`（转 NED），

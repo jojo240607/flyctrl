@@ -112,6 +112,12 @@ pub struct Eskf {
     pub p: Cov,
     /// 过程噪声（**必须非零** —— 见 `ProcessNoise::matrix` 的注释）。
     pub q: ProcessNoise,
+    /// 重力通道的独立守卫（与四路外部观测分开 —— 它是 IMU 驱动的，不共用 `guards`）。
+    pub gravity_guard: ChannelGuard,
+    /// 重力观测的单轴 σ（m/s²）。
+    pub sigma_gravity: f32,
+    /// 量级门容差（相对；与静止对齐共用 `align.g_tol_frac`）。
+    pub g_tol_frac: f32,
     pub guards: [ChannelGuard; 4],
 }
 impl Eskf {
@@ -121,6 +127,9 @@ impl Eskf {
             p,
             q: ProcessNoise::default(),
             guards: [ChannelGuard::new(max_consecutive_rejects); 4],
+            gravity_guard: ChannelGuard::new(max_consecutive_rejects),
+            sigma_gravity: 0.3,
+            g_tol_frac: 0.06,
         }
     }
     /// 预测：先推协方差（用解析 F），再推标称态。任一失败 ⇒ `Err`（调用方不得提交）。
@@ -172,6 +181,30 @@ impl Eskf {
             }
         }
     }
+    /// **重力（倾角）观测**：旧栈 `update_gravity` 的对应物。
+    ///
+    /// 调用时机：紧接 `predict` 之后（IMU 驱动，与外部观测不同类）。
+    /// - 量级门不过 ⇒ **不融合**，`gravity_guard` 计数，返回 `Ok(false)`（**显式**，非静默）；
+    /// - 门过但融合失败 ⇒ `Err`（交给上层的门控/重灌）。
+    pub fn update_gravity(&mut self, f_b_meas: [f32; 3]) -> Result<bool, FilterError> {
+        if !crate::observe::gravity_magnitude_ok(f_b_meas, self.g_tol_frac) {
+            // 只计数、不重灌（"正在机动"不是通道故障，不该抬方差）
+            let _ = self.gravity_guard.rejected();
+            return Ok(false);
+        }
+        let o = crate::observe::gravity(f_b_meas, &self.st, self.sigma_gravity);
+        match update(&self.p, &o.h, &o.resid, &o.r, 1e9) {
+            Ok(out) => {
+                let st_new = boxplus(&self.st, &out.dx).ok_or(FilterError::State(Violation::Nan))?;
+                self.p = out.p;
+                self.st = st_new;
+                self.gravity_guard.accepted();
+                Ok(true)
+            }
+            Err(e) => Err(FilterError::Update(e)),
+        }
+    }
+
     /// 方便的自检：状态与协方差是否仍然有限（集成验收用）。
     pub fn healthy(&self) -> bool {
         let qf = self.st.q.is_finite();
