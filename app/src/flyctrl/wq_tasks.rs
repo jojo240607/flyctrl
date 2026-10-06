@@ -53,7 +53,7 @@ pub const Q_L3: u8 = 2;
 #[repr(C, align(8))]
 struct WqStack<const N: usize>([u8; N]);
 #[link_section = ".app_stacks"]
-static mut L2_WQ_STACK: WqStack<24576> = WqStack([0; 24576]);
+static mut L2_WQ_STACK: WqStack<12288> = WqStack([0; 12288]);
 #[link_section = ".app_stacks"]
 static mut L3_WQ_STACK: WqStack<2048> = WqStack([0; 2048]);
 
@@ -373,7 +373,7 @@ pub fn setup() {
 
     if let Some(f) = slot().workq_create {
         f(Q_L2, b"wql2\0".as_ptr() as *const _, 5, // ★design.md §4：L2 必须低于全部 L1（rate2/alloc3/safety4）
-          unsafe { core::ptr::addr_of_mut!(L2_WQ_STACK).cast::<u8>() }, 24576);
+          unsafe { core::ptr::addr_of_mut!(L2_WQ_STACK).cast::<u8>() }, 12288);
         f(Q_L3, b"wql3\0".as_ptr() as *const _, 10,
           unsafe { core::ptr::addr_of_mut!(L3_WQ_STACK).cast::<u8>() }, 2048);
     }

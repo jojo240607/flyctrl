@@ -31,6 +31,8 @@ def main():
     ap.add_argument("--features", default="", help="cargo features（逗号分隔；默认空=正式飞控）")
     ap.add_argument("--out", default=os.path.join(ROOT, "app.bin"), help="输出 app.bin 路径")
     ap.add_argument("--check", action="store_true", help="仅校验工具链")
+    ap.add_argument("--no-sync", action="store_true",
+                    help="★不同步到 M 场标准产物路径（新旧固件并存时必用，避免静默替换被测固件）")
     args = ap.parse_args()
 
     for t in ("cargo", "arm-none-eabi-gcc", "arm-none-eabi-objcopy"):
@@ -69,7 +71,10 @@ def main():
     run(["arm-none-eabi-objcopy", "-O", "binary", app_elf, args.out])
     sz = os.path.getsize(args.out)
     print(f"[OK] app.bin 产出: {args.out} ({sz} bytes, 须 < {APP_FLASH_BUDGET})")
-    sync_to_test_artifact(args.out, app_elf, args.features)
+    if not args.no_sync:
+        sync_to_test_artifact(args.out, app_elf, args.features)
+    else:
+        print("[variant] --no-sync：未同步到标准产物路径 ✓")
     if sz > APP_FLASH_BUDGET:
         print(f"[ERR] App 镜像超过 APP_FLASH {APP_FLASH_BUDGET // 1024}K 预算", file=sys.stderr)
         sys.exit(1)
