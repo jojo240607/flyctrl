@@ -147,3 +147,30 @@ fn diagnostic_counters_close_with_actual_calls() {
     assert_eq!(e.n_gps_pos, before.0, "被拒不得计入接受数");
     assert_eq!(e.n_gps_pos_rejected, before.1 + 1, "被拒必须计入拒收数");
 }
+
+/// ★`world_accel()` 的**定义性判据**：静止悬停（水平 + 比力 (0,0,−g)）时世界系加速度必须 ≈ 0
+/// （推力恰好抵消重力）。这也是它当初存在的理由：给 HIL 诊断一个"净加速度"读数。
+#[test]
+fn world_accel_is_zero_at_static_hover() {
+    let mut e = FcalgEstimator::new();
+    e.set_initial_attitude(Quaternion { w: 1.0, x: 0.0, y: 0.0, z: 0.0 });
+    let dt = 0.005f32;
+    let f_b = [0.0f32, 0.0, -G];
+    for _ in 0..50 {
+        e.predict_delta([0.0; 3], [f_b[0] * dt, f_b[1] * dt, f_b[2] * dt], dt, dt);
+    }
+    let wa = e.world_accel();
+    for a in 0..3 {
+        assert!(
+            wa[a].abs() < 0.05,
+            "静止悬停下世界系加速度应 ≈ 0: {wa:?}（推力未抵消重力？）"
+        );
+    }
+    // 对照：比力**大于** G（推得比悬停更用力）⇒ 净加速度**向上**（NED 里 z 为**负**）。
+    // ★首版写成 `-G + 1.0`（= −8.8，**比悬停更轻**）却断言向上 ✗ —— 模块给的 +1.0
+    //   才是对的（推得轻 ⇒ 向下加速）。**又一次是我的直觉错、模块对**（同 NED 的 p_z 那次）。
+    let f_up = [0.0f32, 0.0, -G - 1.0];
+    e.predict_delta([0.0; 3], [f_up[0] * dt, f_up[1] * dt, f_up[2] * dt], dt, dt);
+    let wa2 = e.world_accel();
+    assert!(wa2[2] < -0.5, "净上行比力应给出向上的（NED −z）加速度: {wa2:?}");
+}

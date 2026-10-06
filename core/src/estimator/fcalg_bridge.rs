@@ -89,6 +89,9 @@ pub struct FcalgEstimator {
     reflate_floor: f32,
     /// 控制器侧滤波陀螺（见模块头"接口新增点"）。
     omega_body: [f32; 3],
+    /// **最近一次世界系加速度估计** = `R(q)·f_b + g_ned`（`f_b = Δv/dt_vel − ba`）。
+    /// 对应旧栈 `world_accel()`（app 的诊断用它）✓。静止悬停时 ≈ 0（有判据）。
+    last_world_accel: [f32; 3],
     /// 融合被拒的次数（诊断；不等于"重灌"，重灌计数在 `f.guards` 里）。
     pub fuse_rejects: u32,
     /// ★**诊断兼容字段**（app 侧 12 处读数里 10 个计数器的直接对应）。
@@ -125,6 +128,7 @@ impl FcalgEstimator {
             reflate_floor: 1.0,
             prm,
             omega_body: [0.0; 3],
+            last_world_accel: [0.0; 3],
             fuse_rejects: 0,
             not_impl_calls: 0,
             n_step: 0,
@@ -159,6 +163,24 @@ impl FcalgEstimator {
     pub fn refuse_freeze_bias(&mut self) -> u32 {
         self.not_impl_calls = self.not_impl_calls.wrapping_add(1);
         self.not_impl_calls
+    }
+
+    /// `R(q)·(f_b − ba) + g_ned` —— 世界系加速度估计（诊断用；静止悬停 ≈ 0）。
+    fn update_world_accel(&mut self, f_b_raw: [f32; 3]) {
+        let f_b = [
+            f_b_raw[0] - self.f.st.ba[0],
+            f_b_raw[1] - self.f.st.ba[1],
+            f_b_raw[2] - self.f.st.ba[2],
+        ];
+        let aw = self.f.st.q.rotate(f_b);
+        for a in 0..3 {
+            self.last_world_accel[a] = aw[a] + fcalg::GRAVITY_NED[a];
+        }
+    }
+
+    /// 旧栈 `world_accel()` 的对应 ✓（app 的 `HIL_DIAG.world_accel` 读它）。
+    pub fn world_accel(&self) -> [f32; 3] {
+        self.last_world_accel
     }
 
     /// 诊断门面的原材料（`AnyEstimator` 改选型后，app 侧 12 处读数映射到这些）：
@@ -226,6 +248,7 @@ impl Estimator for FcalgEstimator {
         };
         let _ = self.f.predict(&d, fcalg::GRAVITY_NED);
         self.n_step += 1;
+        self.update_world_accel(a);
         // 重力（倾角）观测：紧接 predict（IMU 驱动）。量级门不过则**显式**返回 false 并计数。
         match self.f.update_gravity(a) {
             Ok(true) => self.n_grav_applied += 1,
@@ -250,6 +273,7 @@ impl Estimator for FcalgEstimator {
         if dt_vel > 0.0 {
             let inv = 1.0 / dt_vel;
             let f_b = [delta_vel[0] * inv, delta_vel[1] * inv, delta_vel[2] * inv];
+            self.update_world_accel(f_b);
             match self.f.update_gravity(f_b) {
                 Ok(true) => self.n_grav_applied += 1,
                 Ok(false) => self.n_grav_gated += 1,
