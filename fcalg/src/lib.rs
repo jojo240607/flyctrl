@@ -8,6 +8,7 @@
 pub mod align;
 pub mod attitude;
 pub mod biquad;
+pub mod calib;
 pub mod covariance;
 pub mod error_state;
 pub mod finite;
@@ -28,6 +29,7 @@ pub mod update;
 pub use align::{align_static, AlignConfig, AlignError, AlignResult};
 pub use attitude::attitude_rate_setpoint;
 pub use covariance::{is_positive_definite, is_symmetric_exact, propagate_covariance, Cov, CovError};
+pub use calib::{CalibError, SensorCalib};
 pub use error_state::{boxminus, boxplus, I_ATT, I_BA, I_BG, I_MAGB, I_MAGI, I_POS, I_VEL, N};
 pub use finite::{gate, gate_all, violations, violations_total, Stage, Violation};
 pub use gate::{channel_indices, reflate_diag, Channel, ChannelGuard};

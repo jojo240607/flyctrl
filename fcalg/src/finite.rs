@@ -25,6 +25,7 @@ pub enum Stage {
     L11CtrlAtt = 12,
     L11CtrlRate = 13,
     L11Mixer = 14,
+    L13Calib = 15,
 }
 
 pub const N_STAGES: usize = 16;
