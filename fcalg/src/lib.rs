@@ -20,6 +20,7 @@ pub mod observe;
 pub mod propagate;
 pub mod rate;
 pub mod quat;
+pub mod sim;
 pub mod transition;
 pub mod units;
 pub mod update;
@@ -37,6 +38,9 @@ pub use propagate::{propagate, State};
 pub use rate::{rate_p_step, RateGains};
 pub use observe::{baro, gps_pos, gps_vel, Obs, ObsParams, NO_INFO};
 pub use quat::{specific_force_at_rest, Quat, GRAVITY_NED};
+pub use sim::{
+    baro_from_truth, gps_pos_from_truth, gps_vel_from_truth, imu_from_truth, mag_yaw_from_truth,
+};
 pub use transition::{skew, transition_matrix};
 pub use units::{Meters, Mps, Radians, Rps, Seconds};
 pub use update::{update, UpdateError, UpdateOut};
