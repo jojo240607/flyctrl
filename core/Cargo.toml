@@ -41,3 +41,5 @@ stm32f407 = ["dep:stm32f4", "dep:cortex-m", "dep:cortex-m-rt"]
 cost-probe = []
 # ★接线开关：启用后 flyctrl-core 可依赖 fcalg 的新估计器（渐进接线，默认关）
 fcalg-est = ["dep:fcalg"]
+# ★接线开关：控制器侧（姿态环/速率环/混控）走 fcalg，默认关
+fcalg-ctrl = ["dep:fcalg"]
