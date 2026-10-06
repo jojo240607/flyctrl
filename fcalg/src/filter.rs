@@ -118,6 +118,9 @@ pub struct Eskf {
     pub sigma_gravity: f32,
     /// 量级门容差（相对；与静止对齐共用 `align.g_tol_frac`）。
     pub g_tol_frac: f32,
+    /// **本估计器**累计被拒的观测数（含门限拒收与量级门拒收）。
+    /// 估计器应当能自报这个数 —— 否则"H 场绿"无法区分"观测都很好"与"观测全被拒"。
+    pub rejects_total: u32,
     pub guards: [ChannelGuard; 4],
 }
 impl Eskf {
@@ -130,6 +133,7 @@ impl Eskf {
             gravity_guard: ChannelGuard::new(max_consecutive_rejects),
             sigma_gravity: 0.3,
             g_tol_frac: 0.06,
+            rejects_total: 0,
         }
     }
     /// 预测：先推协方差（用解析 F），再推标称态。任一失败 ⇒ `Err`（调用方不得提交）。
@@ -172,6 +176,7 @@ impl Eskf {
                 Ok(())
             }
             Err(e) => {
+                self.rejects_total = self.rejects_total.wrapping_add(1);
                 if self.guards[ch_idx(ch)].rejected() {
                     // 达阈值 ⇒ 重灌该通道可观测的方差（L10）。重灌失败（非有限）也**不掩盖**：
                     // 直接放弃本拍，让调用方看到 Err。
@@ -189,6 +194,7 @@ impl Eskf {
     pub fn update_gravity(&mut self, f_b_meas: [f32; 3]) -> Result<bool, FilterError> {
         if !crate::observe::gravity_magnitude_ok(f_b_meas, self.g_tol_frac) {
             // 只计数、不重灌（"正在机动"不是通道故障，不该抬方差）
+            self.rejects_total = self.rejects_total.wrapping_add(1);
             let _ = self.gravity_guard.rejected();
             return Ok(false);
         }
