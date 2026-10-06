@@ -48,6 +48,13 @@ fn diag_cov(d: f32) -> fcalg::covariance::Cov {
     p
 }
 
+/// 供集成测试与宿主使用的**薄重导出**（零逻辑）：集成测试只链接被测 crate 及其
+/// dev-dependency，而 `fcalg` 只是本 crate 的普通依赖 ⇒ 必须经此处转出。
+pub mod reexport {
+    pub use fcalg::params::{param, Source};
+    pub use fcalg::quat::{specific_force_at_rest, Quat, GRAVITY_NED};
+}
+
 /// 新栈估计器的 `Estimator` 适配器。
 pub struct FcalgEstimator {
     f: Eskf,
