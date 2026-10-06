@@ -78,7 +78,7 @@ pub const PARAMS: &[Meta] = &[
         unit: Unit::Ratio,
         lo: 0.5,
         hi: 10.0,
-        source: Source::Chosen("本重建选定；待振动实测标定"),
+        source: Source::Chosen("需振动实测（频谱峰与带宽）才能定 Q；旧栈只记了 40Hz 中心频率"),
     },
     Meta {
         name: "imu.accel_lp_fc",
@@ -98,11 +98,11 @@ pub const PARAMS: &[Meta] = &[
     },
     Meta {
         name: "delta.max_dt",
-        value: 0.02,
+        value: 0.05,
         unit: Unit::Sec,
         lo: 0.001,
         hi: 0.5,
-        source: Source::Chosen("本重建选定（取名义周期的数倍）"),
+        source: Source::Primary("flyctrl app/src/flyctrl/wq_tasks.rs: dt_ms.clamp(1, 50) ⇒ 50ms 上限"),
     },
     Meta {
         name: "align.g_tol_frac",
@@ -110,7 +110,7 @@ pub const PARAMS: &[Meta] = &[
         unit: Unit::Ratio,
         lo: 0.01,
         hi: 0.3,
-        source: Source::Chosen("本重建选定；旧栈只用\"比力>1.0\"的松判据（已证会拉飞姿态）"),
+        source: Source::Chosen("需与本重建的观测噪声量级联标；旧栈只用\"比力>1.0\"的松判据，不可照搬"),
     },
     Meta {
         name: "obs.sigma_baro",
@@ -118,7 +118,7 @@ pub const PARAMS: &[Meta] = &[
         unit: Unit::Meters,
         lo: 0.01,
         hi: 10.0,
-        source: Source::Derived("旧栈 set_observation_noise(_,_,0.09) 的量级；待实测替换"),
+        source: Source::Derived("flyctrl core/src/hil.rs set_observation_noise(_,_,0.09) 的量级；待实测替换"),
     },
     Meta {
         name: "obs.sigma_gps_p",
@@ -126,7 +126,7 @@ pub const PARAMS: &[Meta] = &[
         unit: Unit::Meters,
         lo: 0.05,
         hi: 20.0,
-        source: Source::Derived("旧栈 set_observation_noise(0.25,_,_) 的量级；待实测替换"),
+        source: Source::Derived("flyctrl core/src/hil.rs set_observation_noise(0.25,_,_) 的量级；待实测替换"),
     },
     Meta {
         name: "obs.sigma_gps_v",
@@ -134,23 +134,23 @@ pub const PARAMS: &[Meta] = &[
         unit: Unit::Mps,
         lo: 0.01,
         hi: 5.0,
-        source: Source::Derived("旧栈 set_observation_noise(_,0.01,_) 的量级；待实测替换"),
+        source: Source::Derived("flyctrl core/src/hil.rs set_observation_noise(_,0.01,_) 的量级；待实测替换"),
     },
     Meta {
         name: "obs.sigma_mag",
-        value: 0.3,
+        value: 2.0,
         unit: Unit::Ratio,
         lo: 0.01,
         hi: 3.0,
-        source: Source::Chosen("本重建选定（航向新息的门限σ）"),
+        source: Source::Primary("flyctrl app/src/flyctrl/wq_tasks.rs: G_ESKF_MAG_HDG_GATE = 2.0（旧栈磁航向门限）"),
     },
     Meta {
         name: "gate.nis_sigma",
-        value: 6.0,
+        value: 3.0,
         unit: Unit::Ratio,
         lo: 1.0,
         hi: 12.0,
-        source: Source::Chosen("本重建选定；接真传感器后须按 NIS 一致性重标"),
+        source: Source::Primary("flyctrl core/src/estimator/eskf.rs: 参照 mag 3.0σ 门限（sqrt(NIS) ≤ gate_sigma）"),
     },
     Meta {
         name: "gate.max_consecutive_rejects",
@@ -158,7 +158,7 @@ pub const PARAMS: &[Meta] = &[
         unit: Unit::Count,
         lo: 2.0,
         hi: 200.0,
-        source: Source::Chosen("本重建选定（旧栈缺失该机制）"),
+        source: Source::Chosen("需过载降级实测才能定；不能照搬 bh.c 的 miss_count>=5（那是 work-item 预算机制，与本层语义不同）"),
     },
     Meta {
         name: "gate.reflate_floor",
@@ -166,7 +166,7 @@ pub const PARAMS: &[Meta] = &[
         unit: Unit::Ratio,
         lo: 0.01,
         hi: 100.0,
-        source: Source::Chosen("本重建选定；须与观测噪声量级自洽"),
+        source: Source::Chosen("需与观测噪声量级自洽才能定；取大了等价于无门控，取小了会频繁重灌"),
     },
 ];
 /// 按名查参数。

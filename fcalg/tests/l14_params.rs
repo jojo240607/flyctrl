@@ -84,3 +84,52 @@ fn lookup_works_and_unit_is_always_tagged() {
         }
     }
 }
+/// **欠债棘轮**：`Chosen`（本重建选定）的条数**只应下降**。
+/// 修完一条就把下面的常数改小（并说明为何能兑现）；**上升则必须显式改大并写理由**。
+/// 目的：让“没依据的值”的数字既**诚实**、又**不会悄悄增长**。
+const RECORDED_DEBT: usize = 4;
+#[test]
+fn debt_is_ratcheted() {
+    let c = chosen_count();
+    assert!(
+        c.debt <= RECORDED_DEBT,
+        "欠债增加了：{} > 记录值 {RECORDED_DEBT}（若要增加必须显式改这个常数并写理由）",
+        c.debt
+    );
+    // 本轮兑现了 3 条（均为本仓一手物证），债务由 7 降到 4
+    assert_eq!(c.debt, RECORDED_DEBT, "兑现后请同步下调常数（已兑现就必须记账）");
+    assert_eq!(c.total, PARAMS.len());
+}
+/// **非欠债条目必须指到具体物证**（文件/行、台账条目、或可解析推导）——
+/// 不让"有依据"退化成一句模糊的说法。
+#[test]
+fn repaid_entries_cite_a_concrete_artifact() {
+    const MARKERS: [&str; 7] = [".rs", ".c", ".yaml", "§", "台账", "解析", "源码"];
+    for m in PARAMS {
+        if m.source.is_debt() {
+            continue;
+        }
+        let n = m.source.note();
+        assert!(
+            MARKERS.iter().any(|k| n.contains(k)),
+            "{} 声称有依据，但出处未指到具体物证（文件/行、台账、或解析推导）：{n}",
+            m.name
+        );
+    }
+}
+/// **欠债必须可行动**：每条 `Chosen` 都要写清"需要什么才能兑现"，不能只写"待定"。
+#[test]
+fn every_chosen_entry_states_its_blocker() {
+    const BLOCKERS: [&str; 3] = ["需", "待", "不可"];
+    for m in PARAMS {
+        if !m.source.is_debt() {
+            continue;
+        }
+        let n = m.source.note();
+        assert!(
+            BLOCKERS.iter().any(|k| n.contains(k)),
+            "{} 是欠债，但没写清兑现条件（需/待/不可）：{n}",
+            m.name
+        );
+    }
+}
