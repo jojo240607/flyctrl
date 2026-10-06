@@ -23,3 +23,7 @@ pub fn atan2(y: f32, x: f32) -> f32 {
 pub fn sqrt(x: f32) -> f32 {
     x.sqrt()
 }
+#[inline]
+pub fn exp(x: f32) -> f32 {
+    x.exp()
+}
