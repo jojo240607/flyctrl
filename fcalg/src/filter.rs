@@ -14,7 +14,7 @@
 use crate::math::F32Ext;
 
 use crate::covariance::{propagate_covariance, Cov, CovError};
-use crate::error_state::{boxplus, I_ATT, I_POS, I_VEL, N};
+use crate::error_state::{boxplus, I_ATT, I_BA, I_BG, I_MAGB, I_MAGI, I_POS, I_VEL, N};
 use crate::finite::{gate, Stage, Violation};
 use crate::gate::{channel_indices, reflate_diag, Channel, ChannelGuard};
 use crate::imu_delta::ImuDelta;
@@ -22,6 +22,74 @@ use crate::observe::Obs;
 use crate::propagate::{propagate, State};
 use crate::transition::transition_matrix;
 use crate::update::{update, UpdateError};
+/// **过程噪声**（Q 的对角系数；按 dt 积分为方差）。
+/// 出处：旧栈 `flyctrl core/src/estimator/eskf.rs::predict` 的 Q 构造
+/// （`q[ATT]=qa·dt`、`q[VEL]=2·dt`、`q[POS]=1e-4·dt`、`q[BG]=1e-6·dt`、
+///  `q[BA]=1e-4·dt`、`q[MAGI]=q[MAGB]=1e-3·dt`）—— **一手物证**。
+/// ⚠caveat（写进出处而非藏起来）：那些值是在**旧 R** 下标定的 ⇒ 与本重建的 R 未必匹配，
+///   属"继承来的起点"，接真传感器后须按 NIS 一致性重标。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ProcessNoise {
+    pub q_att: f32,
+    pub q_vel: f32,
+    pub q_pos: f32,
+    pub q_bg: f32,
+    pub q_ba: f32,
+    pub q_mag_i: f32,
+    pub q_mag_b: f32,
+}
+
+impl Default for ProcessNoise {
+    fn default() -> Self {
+        Self {
+            q_att: 1e-4,
+            q_vel: 2.0,
+            q_pos: 1e-4,
+            q_bg: 1e-6,
+            q_ba: 1e-4,
+            q_mag_i: 1e-3,
+            q_mag_b: 1e-3,
+        }
+    }
+}
+
+impl ProcessNoise {
+    /// 按 dt 展开成 Q 矩阵（对角）。
+    /// ★**Q=0 是个陷阱**（本会话实测踩到）：没有过程噪声 ⇒ 协方差被观测反复收缩到退化
+    ///   ⇒ `propagate_covariance` 判非正定（**正确行为**）⇒ 表现为"某天 predict 突然 Err"。
+    pub fn matrix(&self, dt: f32) -> Cov {
+        let mut q = [[0.0f32; N]; N];
+        for i in 0..3 {
+            q[I_ATT + i][I_ATT + i] = self.q_att * dt;
+            q[I_VEL + i][I_VEL + i] = self.q_vel * dt;
+            q[I_POS + i][I_POS + i] = self.q_pos * dt;
+            q[I_BG + i][I_BG + i] = self.q_bg * dt;
+            q[I_BA + i][I_BA + i] = self.q_ba * dt;
+            q[I_MAGI + i][I_MAGI + i] = self.q_mag_i * dt;
+            q[I_MAGB + i][I_MAGB + i] = self.q_mag_b * dt;
+        }
+        q
+    }
+    /// 第 i 个状态的过程噪声系数（供"P 不得塌陷"判据导出下界）。
+    pub fn coeff(&self, i: usize) -> f32 {
+        if i < I_VEL {
+            self.q_att
+        } else if i < I_POS {
+            self.q_vel
+        } else if i < I_BG {
+            self.q_pos
+        } else if i < I_BA {
+            self.q_bg
+        } else if i < I_MAGI {
+            self.q_ba
+        } else if i < I_MAGB {
+            self.q_mag_i
+        } else {
+            self.q_mag_b
+        }
+    }
+}
+
 /// 编排层错误。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum FilterError {
@@ -42,11 +110,18 @@ fn ch_idx(ch: Channel) -> usize {
 pub struct Eskf {
     pub st: State,
     pub p: Cov,
+    /// 过程噪声（**必须非零** —— 见 `ProcessNoise::matrix` 的注释）。
+    pub q: ProcessNoise,
     pub guards: [ChannelGuard; 4],
 }
 impl Eskf {
     pub fn new(st: State, p: Cov, max_consecutive_rejects: u32) -> Self {
-        Self { st, p, guards: [ChannelGuard::new(max_consecutive_rejects); 4] }
+        Self {
+            st,
+            p,
+            q: ProcessNoise::default(),
+            guards: [ChannelGuard::new(max_consecutive_rejects); 4],
+        }
     }
     /// 预测：先推协方差（用解析 F），再推标称态。任一失败 ⇒ `Err`（调用方不得提交）。
     pub fn predict(&mut self, d: &ImuDelta, g_ned: [f32; 3]) -> Result<(), FilterError> {
@@ -66,7 +141,7 @@ impl Eskf {
                 .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         }
         let f = transition_matrix(self.st.q, w, f_b, d.dt_vel);
-        let q = [[0.0f32; N]; N];
+        let q = self.q.matrix(d.dt_vel);
         let p_new = propagate_covariance(&self.p, &f, &q).map_err(FilterError::Prop)?;
         self.p = p_new;
         propagate(&mut self.st, d, g_ned).map_err(FilterError::State)

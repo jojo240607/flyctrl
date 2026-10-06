@@ -129,3 +129,46 @@ fn bounds_are_functions_of_the_param_table() {
         );
     }
 }
+
+/// **P 不得塌到退化**（本会话踩过的坑：Q=0 ⇒ 协方差被反复收缩 ⇒ predict 某天突然 Err）。
+/// 下界**由 Q 导出**（`0.1 × q_i × dt`），不是魔数 —— Q 变则下界跟着变。
+#[test]
+fn covariance_does_not_collapse_when_process_noise_is_nonzero() {
+    let t = truth();
+    let prm = ObsParams::default();
+    let mut f = Eskf::new(t, diag_cov(0.2), 10);
+    let f_b = specific_force_at_rest(t.q);
+    // 长时间"完美观测"驱动（最容易把 P 收死的场景）
+    for k in 0..1500 {
+        let d = ImuDelta {
+            delta_ang: [0.0; 3],
+            delta_vel: [f_b[0] * DT, f_b[1] * DT, f_b[2] * DT],
+            dt_ang: DT,
+            dt_vel: DT,
+            ts_ticks: 0,
+        };
+        f.predict(&d, GRAVITY_NED).expect("有 Q 之后 predict 不应再失败");
+        let ob = baro(-t.p[2], &f.st, &prm);
+        let _ = f.fuse(&ob, Channel::Baro, 1e6, 1.0);
+        if k % 10 == 0 {
+            let op = gps_pos(t.p, &f.st, &prm);
+            let _ = f.fuse(&op, Channel::GpsPos, 1e6, 1.0);
+            let ov = gps_vel(t.v, &f.st, &prm);
+            let _ = f.fuse(&ov, Channel::GpsVel, 1e6, 1.0);
+        }
+    }
+    let qn = fcalg::filter::ProcessNoise::default();
+    let mut worst = f32::INFINITY;
+    let mut worst_i = 0usize;
+    for i in 0..N {
+        let lo = 0.1 * qn.coeff(i) * DT; // 下界由 Q 导出
+        if f.p[i][i] < lo {
+            worst = f.p[i][i];
+            worst_i = i;
+        }
+    }
+    assert!(
+        worst.is_infinite(),
+        "状态 {worst_i} 的方差塌到 {worst}（Q 未起作用？下界由 q.coeff×dt 导出）"
+    );
+}

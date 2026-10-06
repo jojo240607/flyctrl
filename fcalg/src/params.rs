@@ -32,6 +32,8 @@ pub enum Unit {
     Ratio,
     /// 计数
     Count,
+    /// 状态量²/s（过程噪声系数；按 dt 积分为方差）
+    VarPerSec,
 }
 /// 出处（必填）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,6 +172,62 @@ pub const PARAMS: &[Meta] = &[
         lo: 0.01,
         hi: 100.0,
         source: Source::Chosen("需与观测噪声量级自洽才能定；取大了等价于无门控，取小了会频繁重灌"),
+    },
+    Meta {
+        name: "q.att",
+        value: 1e-4,
+        unit: Unit::VarPerSec,
+        lo: 1e-9,
+        hi: 1.0,
+        source: Source::Primary("flyctrl core/src/estimator/eskf.rs::predict 的 Q（q[ATT]=qa·dt）—— 原值在旧 R 下标定，须按 NIS 一致性重标"),
+    },
+    Meta {
+        name: "q.vel",
+        value: 2.0,
+        unit: Unit::VarPerSec,
+        lo: 1e-6,
+        hi: 1e3,
+        source: Source::Primary("flyctrl core/src/estimator/eskf.rs::predict 的 Q（q[VEL]=2·dt）—— 同上 caveat"),
+    },
+    Meta {
+        name: "q.pos",
+        value: 1e-4,
+        unit: Unit::VarPerSec,
+        lo: 1e-9,
+        hi: 1.0,
+        source: Source::Primary("flyctrl core/src/estimator/eskf.rs::predict 的 Q（q[POS]=1e-4·dt）—— 同上 caveat"),
+    },
+    Meta {
+        name: "q.bg",
+        value: 1e-6,
+        unit: Unit::VarPerSec,
+        lo: 1e-12,
+        hi: 1e-2,
+        source: Source::Primary("flyctrl core/src/estimator/eskf.rs::predict 的 Q（q[BG]=1e-6·dt）—— 同上 caveat"),
+    },
+    Meta {
+        name: "q.ba",
+        value: 1e-4,
+        unit: Unit::VarPerSec,
+        lo: 1e-9,
+        hi: 1.0,
+        source: Source::Primary("flyctrl core/src/estimator/eskf.rs::predict 的 Q（q[BA]=1e-4·dt）—— 同上 caveat"),
+    },
+    Meta {
+        name: "q.mag_i",
+        value: 1e-3,
+        unit: Unit::VarPerSec,
+        lo: 1e-9,
+        hi: 1.0,
+        source: Source::Primary("flyctrl core/src/estimator/eskf.rs::predict 的 Q（q[MAGI]=1e-3·dt）—— 同上 caveat"),
+    },
+    Meta {
+        name: "q.mag_b",
+        value: 1e-3,
+        unit: Unit::VarPerSec,
+        lo: 1e-9,
+        hi: 1.0,
+        source: Source::Primary("flyctrl core/src/estimator/eskf.rs::predict 的 Q（q[MAGB]=1e-3·dt）—— 同上 caveat"),
     },
 ];
 /// 按名查参数。

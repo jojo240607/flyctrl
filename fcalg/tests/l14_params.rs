@@ -65,6 +65,15 @@ fn table_agrees_with_module_defaults() {
     assert_eq!(param("obs.sigma_mag").unwrap().value, o.sigma_mag);
     let a = AlignConfig::default();
     assert_eq!(param("align.g_tol_frac").unwrap().value, a.g_tol_frac);
+    // 过程噪声也必须"表=代码"（否则 Q 会变成第二个真值源）
+    let q = fcalg::filter::ProcessNoise::default();
+    assert_eq!(param("q.att").unwrap().value, q.q_att);
+    assert_eq!(param("q.vel").unwrap().value, q.q_vel);
+    assert_eq!(param("q.pos").unwrap().value, q.q_pos);
+    assert_eq!(param("q.bg").unwrap().value, q.q_bg);
+    assert_eq!(param("q.ba").unwrap().value, q.q_ba);
+    assert_eq!(param("q.mag_i").unwrap().value, q.q_mag_i);
+    assert_eq!(param("q.mag_b").unwrap().value, q.q_mag_b);
 }
 /// 查表接口 + 单位必填（`Unit` 无"未知"变体 ⇒ 漏标在类型上不可能，这里只验查得到）。
 #[test]
@@ -83,7 +92,8 @@ fn lookup_works_and_unit_is_always_tagged() {
             | fcalg::params::Unit::RpsPerS
             | fcalg::params::Unit::PerSec
             | fcalg::params::Unit::Ratio
-            | fcalg::params::Unit::Count => {}
+            | fcalg::params::Unit::Count
+            | fcalg::params::Unit::VarPerSec => {}
         }
     }
 }
