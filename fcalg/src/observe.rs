@@ -44,10 +44,12 @@ pub struct ObsParams {
     pub sigma_baro: f32,
     pub sigma_gps_p: f32,
     pub sigma_gps_v: f32,
+    /// 磁航向的门限 σ（出处见参数表 obs.sigma_mag）。
+    pub sigma_mag: f32,
 }
 impl Default for ObsParams {
     fn default() -> Self {
-        Self { sigma_baro: 0.3, sigma_gps_p: 0.5, sigma_gps_v: 0.1 }
+        Self { sigma_baro: 0.3, sigma_gps_p: 0.5, sigma_gps_v: 0.1, sigma_mag: 2.0 }
     }
 }
 fn diag(a: f32, b: f32, c: f32) -> [[f32; 3]; 3] {

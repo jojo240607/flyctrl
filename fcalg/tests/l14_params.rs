@@ -60,6 +60,9 @@ fn table_agrees_with_module_defaults() {
     assert_eq!(param("obs.sigma_baro").unwrap().value, o.sigma_baro);
     assert_eq!(param("obs.sigma_gps_p").unwrap().value, o.sigma_gps_p);
     assert_eq!(param("obs.sigma_gps_v").unwrap().value, o.sigma_gps_v);
+    // ★这一条本该在 L17 之前就存在：表里有 obs.sigma_mag，而结构体里没有对应字段
+    //   ⇒ 表与代码"各说一套"而判据放过去了。补上，使这类缺口不可能再漏。
+    assert_eq!(param("obs.sigma_mag").unwrap().value, o.sigma_mag);
     let a = AlignConfig::default();
     assert_eq!(param("align.g_tol_frac").unwrap().value, a.g_tol_frac);
 }

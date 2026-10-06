@@ -102,7 +102,7 @@ fn baro_only_affects_altitude_variance() {
 #[test]
 fn conservative_observation_barely_moves_state() {
     let st = base_state();
-    let prm = ObsParams { sigma_baro: 1e4, sigma_gps_p: 1e4, sigma_gps_v: 1e4 };
+    let prm = ObsParams { sigma_baro: 1e4, sigma_gps_p: 1e4, sigma_gps_v: 1e4, sigma_mag: 1e4 };
     let o = baro(-st.p[2] + 100.0, &st, &prm);
     let out = update(&pd_cov(), &o.h, &o.resid, &o.r, 1e9).unwrap();
     assert!(out.dx[I_POS + 2].abs() < 1e-3, "几乎无信息 ⇒ 修正必须极小: {}", out.dx[I_POS + 2]);

@@ -31,6 +31,7 @@ pub mod sim;
 pub mod transition;
 pub mod units;
 pub mod update;
+pub mod wire;
 
 pub use align::{align_static, AlignConfig, AlignError, AlignResult};
 pub use attitude::attitude_rate_setpoint;
@@ -54,3 +55,4 @@ pub use sim::{
 pub use transition::{skew, transition_matrix};
 pub use units::{Meters, Mps, Radians, Rps, Seconds};
 pub use update::{update, UpdateError, UpdateOut};
+pub use wire::{fuse_fw, to_fw, FwEstimate, FwObservation, FwFuseResult};
