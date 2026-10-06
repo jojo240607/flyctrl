@@ -82,11 +82,14 @@ pub fn reflate_diag(p: &mut Cov, idx: &[usize], floor: f32) -> Result<u32, Viola
     if !(floor.is_finite() && floor > 0.0) {
         return Err(if floor.is_nan() { Violation::Nan } else { Violation::Inf });
     }
+    // ★**先全量校验、再统一写入** —— 原实现边走边写，中途 Err 会留下"写了一半"的 P
+    //   （部分写入 + 调用处 `let _ =` 吞错误 = 绕过检查的写入，必须消掉）
+    for &i in idx {
+        gate_all(Stage::L10Gate, &[p[i][i]])?;
+    }
     let mut n = 0;
     for &i in idx {
-        let v = p[i][i];
-        gate_all(Stage::L10Gate, &[v])?;
-        if v < floor {
+        if p[i][i] < floor {
             p[i][i] = floor;
             n += 1;
         }

@@ -97,8 +97,12 @@ fn converges_from_wrong_initial_state() {
             let p_pd_before = fcalg::covariance::is_positive_definite(&f.p);
             panic!("predict 失败 {e:?} | P 对角 min={dmin:e} max={dmax:e} | **predict 前 P 是否已不正定**={p_pd_before}");
         }
-        let _ = f.fuse(&gps_pos_from_truth(&t, &prm), Channel::GpsPos, 1e6, 1.0);
-        let _ = f.fuse(&baro_from_truth(&t, &prm), Channel::Baro, 1e6, 1.0);
+        // ★观测必须对**滤波器当前状态**构造（测量值取自真值）——
+        //   否则新息恒为 0，什么都不会发生（首版就是这么错的）
+        let og = gps_pos(t.p, &f.st, &prm);
+        let _ = f.fuse(&og, Channel::GpsPos, 1e6, 1.0);
+        let ob = baro(-t.p[2], &f.st, &prm);
+        let _ = f.fuse(&ob, Channel::Baro, 1e6, 1.0);
     }
     assert!(
         (f.st.p[0]).abs() < 0.5 && (f.st.p[2]).abs() < 0.5,
@@ -146,7 +150,8 @@ fn blackout_then_recovery_re_anchors() {
     // ② 恢复：喂正确气压观测 ⇒ 必须能拉回来（若未重灌，增益≈0 会卡死）
     let mut last = f.st.p[2].abs();
     for _ in 0..300 {
-        let _ = f.fuse(&baro_from_truth(&t, &prm), Channel::Baro, 1e6, 1.0);
+        let ob = baro(-t.p[2], &f.st, &prm);
+        let _ = f.fuse(&ob, Channel::Baro, 1e6, 1.0);
         last = f.st.p[2].abs();
     }
     assert!(last < 1.0, "重灌后必须能重新锚定高度: |p_z|={last}");

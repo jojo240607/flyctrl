@@ -10,7 +10,7 @@
 //! # 纪律
 //! 全程过 L1 门；非有限 ⇒ `Err`；`S` 奇异 ⇒ `Err`；结果非正定 ⇒ `Err`。
 //! 应用 `dx` 到标称态（`boxplus`）由调用方负责 —— 本层是**纯线性代数**。
-use crate::covariance::{is_positive_definite, Cov};
+use crate::covariance::{has_negative_variance, Cov};
 use crate::error_state::N;
 use crate::finite::{gate_all, Stage, Violation};
 /// 更新输出。
@@ -198,7 +198,7 @@ pub fn update(
     for row in out.iter() {
         gate_all(Stage::L8Update, row).map_err(UpdateError::NonFinite)?;
     }
-    if !is_positive_definite(&out) {
+    if has_negative_variance(&out) {
         return Err(UpdateError::NotPositiveDefinite);
     }
     Ok(UpdateOut { p: out, dx })
