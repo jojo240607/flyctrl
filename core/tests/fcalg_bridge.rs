@@ -174,3 +174,48 @@ fn world_accel_is_zero_at_static_hover() {
     let wa2 = e.world_accel();
     assert!(wa2[2] < -0.5, "净上行比力应给出向上的（NED −z）加速度: {wa2:?}");
 }
+
+/// ★装配层判据（2026-10-05）：**水平静止 400 步后姿态必须仍是水平**。
+///
+/// 动因：真链路里 `est_layout_probe` 报 `q.w = −0.664`（≈150° 倾角）✗，
+/// 而模块层 131 条判据全绿 ✓ —— 说明缺口在**装配层**（桥接喂什么、按什么次序喂）。
+/// 本判据直接用**桥接**（不是裸 `Eskf`）跑与仿真同口径的输入：
+///   · 水平静止 ⇒ `accel = (0,0,−9.81)` ✓（与 `hil.rs:61` 同口径 ✓）、陀螺全 0 ✓
+///   · 步长 13 ms（工具链真链路节奏 ✓）、400 步 ✓
+///   · 只喂 IMU（`pos = None`）⇒ 只考验 **predict + 重力观测** 这条最小闭环 ✓
+///
+/// 若本判据在 host 上失败 ⇒ 根因在**桥接/fcalg 路径**，且可在 0.02 s 内复现 ✓✓；
+/// 若通过 ⇒ 嫌疑转向 `step` 之外的融合路径（磁/位置/GPS ✓）。
+#[test]
+fn bridge_level_static_keeps_attitude() {
+    use flyctrl_core::estimator::fcalg_bridge::FcalgEstimator;
+    use flyctrl_core::estimator::trait_def::Estimator;
+    use flyctrl_core::units::{MeterPerSecondSquared, RadianPerSecond, Second};
+    use flyctrl_core::vehicle::ImuSample;
+
+    let mut est = FcalgEstimator::new();
+    let dt = Second(0.013);
+    let mut worst_abs_w = 1.0f32;
+    let mut first_bad = None;
+    for k in 0..400 {
+        let imu = ImuSample {
+            accel: [
+                MeterPerSecondSquared(0.0),
+                MeterPerSecondSquared(0.0),
+                MeterPerSecondSquared(-9.81),
+            ],
+            gyro: [RadianPerSecond(0.0); 3],
+        };
+        let st = est.step(dt, imu, None, None);
+        // 水平静止 ⇒ 单位四元数 ±q 都合法 ⇒ 比 |w| ✓
+        let aw = st.att.w.abs();
+        if aw < 0.9 && first_bad.is_none() {
+            first_bad = Some((k, st.att.w, st.att.x, st.att.y, st.att.z));
+        }
+        worst_abs_w = worst_abs_w.min(aw);
+    }
+    assert!(
+        worst_abs_w > 0.9,
+        "水平静止 400 步后姿态必须仍水平：worst |w| = {worst_abs_w}；首次越界 = {first_bad:?}"
+    );
+}
