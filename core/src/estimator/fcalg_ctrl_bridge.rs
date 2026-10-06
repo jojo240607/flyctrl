@@ -10,10 +10,12 @@
 //! # ★已登记（本桥接**不实现**，且**必须计数**，绝不静默）
 //! `set_measured_airspeed_vec` / `set_world_accel` —— 新栈无对应通道。
 //!
-//! # ★★已登记（**未经检验**，刻意写明而非假装）
-//! "期望加速度 → 期望姿态"的构造（`desired_attitude`）只判了**零加速度 ⇒ 纯偏航**这一条；
-//! 其**倾角符号约定未获判据**（需要"加速北向 ⇒ 机头下俯"这类方向判据 + 一手参照）。
-//! 在本仓补上该判据之前，**不要把本桥接用于真机**。
+//! # ★★判据现状（更新，见 `desired_attitude` 的文档）
+//! ✅ **推力方向约定已获判据**（`thrust_direction_matches_required_accel`）——
+//!    这条完全确定符号，并覆盖"加速北向 ⇒ 机头下俯"。
+//! ⚠**仍登记**：倾角**如何在 roll/pitch 之间分配**是**约定选择**（多解），
+//!    需一手参照（PX4 `quat_from_axis_angle` 的半角分配）才能定。
+//!    ⇒ **在该项取证之前不要把本桥接用于真机。**
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
@@ -32,8 +34,14 @@ pub static CTRL_NOT_IMPLEMENTED_CALLS: AtomicU32 = AtomicU32::new(0);
 ///
 /// 构造：`z_b_des = −normalize(a_des − g_ned)`（机体系 z 向下；推力沿 −z_b）
 /// ⇒ 先求"把世界 ẑ 转到 z_b_des"的最短旋转 `q_tilt`，再叠加偏航：`q_des = q_yaw ∘ q_tilt`。
-/// ⚠倾角**符号约定未经判据**（见模块头"已登记"）。零加速度时退化为纯偏航 ✓（有判据）。
-fn desired_attitude(a_des: [f32; 3], yaw: f32) -> Quat {
+/// # 判据现状（更新）
+/// ✅ **方向约定已有判据**：判据为"期望姿态下机体 −z 轴（推力方向）在世界系
+///    必须指向 `a_des − g_ned`"—— 这条**完全确定符号**，并覆盖"加速北向 ⇒ 机头下俯"。
+/// ✅ 零加速度 ⇒ 退化为纯偏航（有判据）。
+/// ⚠**仍登记的约定选择**：倾角**如何在 roll/pitch 之间分配**（多个解都满足方向约束）。
+///    PX4 用"半角分配"（`quat_from_axis_angle` 的 tilt 均分）；本实现未对该分配方式取证。
+///    ⇒ 需要一手参照才能定；**在此之前不要把本桥接用于真机**。
+pub fn desired_attitude(a_des: [f32; 3], yaw: f32) -> Quat {
     const G: f32 = 9.806_65;
     let f = [a_des[0], a_des[1], a_des[2] - G]; // = a_des − g_ned（g_ned = (0,0,+G)）
     let n = ffi_sqrt(f[0] * f[0] + f[1] * f[1] + f[2] * f[2]);

@@ -427,7 +427,24 @@ impl Estimator for EskfEstimator {
 
 
     fn update_alt(&mut self, alt: f32) {
-        let r = self.f.update_baro(alt).is_ok();
+        // ★§5.228【诊断】保留失败**种类**（原先 `is_ok()` 把原因丢了 ✗ ⇒ 无法区分
+        //   "P 奇异/NaN"、"NIS 判定拒收"、"NIS 为负"）
+        let res = self.f.update_baro(alt);
+        let r = res.is_ok();
+        let code = match res {
+            Ok(_) => 0.0f32,
+            Err(e) => {
+                if e.contains("奇异") {
+                    1.0
+                } else if e.contains("NIS 为负") {
+                    2.0
+                } else if e.contains("超门限") {
+                    3.0
+                } else {
+                    4.0
+                }
+            }
+        };
         if r {
             self.n_baro = self.n_baro.wrapping_add(1);
             bump(3);
@@ -442,6 +459,10 @@ impl Estimator for EskfEstimator {
             (*d)[1] = self.f.st.p[2];
             (*d)[2] = self.f.st.v[2];
             (*d)[3] = if r { 1.0 } else { 0.0 };
+            // ★§5.228【诊断】[4]=失败种类码（1=奇异 2=NIS负 3=超门限）[5]=Pzz 对角（NaN/负 ⇒ 协方差已退化 ✓）
+            (*d)[4] = code;
+            (*d)[5] = self.f.p[crate::estimator::eskf::I_POS + 2]
+                [crate::estimator::eskf::I_POS + 2];
         }
     }
 

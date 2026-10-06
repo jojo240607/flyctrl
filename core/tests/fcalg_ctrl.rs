@@ -78,3 +78,51 @@ fn reset_invalidates_rate_setpoint() {
     c.reset();
     assert!(!c.rate_setpoint().valid, "reset 后速率设定必须无效");
 }
+
+/// ★**推力方向判据（定义性，完全确定符号）**：期望姿态下机体 −z 轴（推力方向）
+/// 在世界系必须指向 `a_des − g_ned`。这条覆盖"加速北向 ⇒ 机头下俯"等方向约定 ——
+/// 首版把 `a_des − g` 写成 `a_des + g`（悬停翻 180°）正是被这类判据拓出来的。
+#[test]
+fn thrust_direction_matches_required_accel() {
+    use flyctrl_core::estimator::fcalg_ctrl_bridge::desired_attitude;
+    const G: f32 = 9.806_65;
+    let cases: [[f32; 3]; 6] = [
+        [0.0, 0.0, 0.0],     // 悬停
+        [1.5, 0.0, 0.0],     // 加速向北
+        [-2.0, 0.0, 0.0],    // 加速向南
+        [0.0, 1.0, 0.0],     // 加速向东
+        [0.0, 0.0, 2.0],     // 净上行加速
+        [1.0, -1.0, -3.0],   // 斜向
+    ];
+    for a in cases {
+        let q = desired_attitude(a, 0.0);
+        // 推力方向 = 机体 −z 转到世界
+        let thrust_dir = q.rotate([0.0, 0.0, -1.0]);
+        // 需求方向 = normalize(a_des − g_ned)，g_ned = (0,0,+G)
+        let f = [a[0], a[1], a[2] - G];
+        let n = (f[0] * f[0] + f[1] * f[1] + f[2] * f[2]).sqrt();
+        let want = [f[0] / n, f[1] / n, f[2] / n];
+        for k in 0..3 {
+            assert!(
+                (thrust_dir[k] - want[k]).abs() < 1e-4,
+                "a_des={a:?}: 推力方向须指向 a_des−g: {thrust_dir:?} vs {want:?}"
+            );
+        }
+    }
+}
+
+/// 偏航保持（小倾角下各约定一致）：倾角很小且 yaw=ψ 时，期望姿态的 ZYX yaw ≈ ψ。
+/// ⚠大倾角下的"倾角如何在 roll/pitch 间分配"是**约定选择**（多解，PX4 用半角分配）
+///   ⇒ 本判据只覆盖小倾角；该分配方式**仍登记为未取证**。
+#[test]
+fn yaw_is_preserved_for_small_tilt() {
+    use flyctrl_core::estimator::fcalg_ctrl_bridge::desired_attitude;
+    for psi in [-1.0f32, -0.2, 0.0, 0.5, 1.3] {
+        let q = desired_attitude([0.3, -0.2, 0.0], psi); // 小倾角
+        let y = q.to_euler_zyx()[2];
+        assert!(
+            (y - psi).abs() < 5e-3,
+            "小倾角下 yaw 须保持: {y} vs {psi}"
+        );
+    }
+}

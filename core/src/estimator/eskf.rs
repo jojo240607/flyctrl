@@ -889,6 +889,21 @@ pub fn update_vec3(
     //   vel/pos：1e-6..1e6（PX4 同值 ✓）；这里统一给全部状态一个下界 eps ✓
     for i in 0..N {
         if !(newp[i][i] > 1e-6) {
+            // ★★★§5.229【诊断：区分 NaN / 负值 / 极小 —— 原实现一律写成 1e-6 ⇒ **销毁证据** ✗】
+            //   关键：`!(NaN > 1e-6)` **也为真** ⇒ NaN 被静默变成地板值 ✗
+            //   ⇒ 下游只看得到"方差正常且很小"，看不到"已经崩了" ⇒ 失去可观测性且证据被抹掉 ✓
+            //   计数写入 ESKF_VZ[6..10]（复用现有探针，无需新增符号 ✓）
+            unsafe {
+                let d = core::ptr::addr_of_mut!(crate::estimator::eskf_estimator::ESKF_VZ);
+                if newp[i][i] != newp[i][i] {
+                    (*d)[6] += 1.0; // NaN 计数
+                } else if newp[i][i] < 0.0 {
+                    (*d)[7] += 1.0; // 负方差计数
+                } else {
+                    (*d)[8] += 1.0; // 极小正值计数
+                }
+                (*d)[9] = i as f32; // 最后一个越界维
+            }
             newp[i][i] = 1e-6;
         } else if newp[i][i] > 1e6 {
             newp[i][i] = 1e6;
