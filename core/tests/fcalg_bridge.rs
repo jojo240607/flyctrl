@@ -331,3 +331,45 @@ fn bridge_level_static_with_pos_keeps_attitude() {
         est.n_gps_pos_rejected
     );
 }
+
+/// ★偏航漂移探针（2026-10-05）：**对齐固件的更新次数**（250 Hz × 5.2 s ≈ 1300 次）。
+///
+/// 动因（真链路实测）：真值 `TRUTH att(rpy) = [0,0,0]`（完全水平、航向 0 ✓）而
+/// 估计为 `wxyz = [0.5654, 0.0013, 0.1109, −0.8173]` ⇒ **纯偏航 ~111°** ✗ ✓。
+/// 而既有判据 #1 只跑 **400 次** update（13 ms/步），固件跑 **~1300 次**（250 Hz）
+/// ⇒ 同一总时长、更新次数差 3.25× ⇒ 若存在"每次更新推一点偏航"的机制，
+/// 判据 #1 会因次数少而**恰好不越阈值** ✗✓ —— 故本探针把次数补齐。
+///
+/// 只**打印**（前 400 步的硬判据仍由判据 #1 负责 ✓，本探针不制造红灯 ✓）。
+#[test]
+fn bridge_yaw_drift_probe() {
+    use flyctrl_core::estimator::fcalg_bridge::FcalgEstimator;
+    use flyctrl_core::estimator::trait_def::*;
+    use flyctrl_core::units::{MeterPerSecondSquared, RadianPerSecond, Second};
+    use flyctrl_core::vehicle::ImuSample;
+
+    let mut est = FcalgEstimator::new();
+    let dt = Second(4.0 / 1000.0); // ★与固件同口径（ekf_task.rs:32 ✓）
+    let mut worst = 1.0f32;
+    for k in 0..1300 {
+        let imu = ImuSample {
+            accel: [
+                MeterPerSecondSquared(0.0),
+                MeterPerSecondSquared(0.0),
+                MeterPerSecondSquared(-9.81),
+            ],
+            gyro: [RadianPerSecond(0.0); 3],
+        };
+        let _ = est.step(dt, imu, None, None);
+        worst = worst.min(est.state().att.w.abs());
+        if k == 399 || k == 799 || k == 1299 {
+            eprintln!(
+                "[yaw] after {} steps: yaw = {:.5} rad ({:.2} deg) | worst|w| = {:.5}",
+                k + 1,
+                est.yaw_rad(),
+                est.yaw_rad().to_degrees(),
+                worst
+            );
+        }
+    }
+}
