@@ -266,3 +266,55 @@ fn bridge_level_static_with_mag_keeps_attitude() {
         "加磁观测后水平静止 400 步仍须水平：worst |w| = {worst_abs_w}；首次越界 = {first_bad:?}"
     );
 }
+
+/// ★装配层判据 #3（2026-10-05）：**加位置/GPS 观测**后水平静止仍须水平。
+///
+/// 动因（嫌疑 #1 排除后的剩余项）：真链路 `q.w = −0.664`（≈150°）✗，
+/// 而判据 #1（predict+重力 ✓）、#2（磁 ✓）均绿 ⇒ 覆盖缺口只剩**位置/GPS 路径** ✗。
+/// 做法：`step()`（水平静止 IMU）+ `update_fusion(Some(pos_only(0,0,0)), None)`
+/// （静止悬停 ⇒ 位置观测应为 (0,0,0) ⇒ 创新为 0 ⇒ 姿态应不动 ✓），400 步 ✓。
+/// **附带断言**：位置观测必须**真的被接受**（否则本判据没测到东西 ✗ —— 仪器自身要可信 ✓）。
+#[test]
+fn bridge_level_static_with_pos_keeps_attitude() {
+    use flyctrl_core::estimator::fcalg_bridge::FcalgEstimator;
+    use flyctrl_core::estimator::trait_def::*;
+    use flyctrl_core::units::{Meter, MeterPerSecondSquared, RadianPerSecond, Second};
+    use flyctrl_core::vehicle::{ImuSample, PosSample};
+
+    let mut est = FcalgEstimator::new();
+    let dt = Second(0.013);
+    let mut worst_abs_w = 1.0f32;
+    let mut first_bad = None;
+    for k in 0..400 {
+        let imu = ImuSample {
+            accel: [
+                MeterPerSecondSquared(0.0),
+                MeterPerSecondSquared(0.0),
+                MeterPerSecondSquared(-9.81),
+            ],
+            gyro: [RadianPerSecond(0.0); 3],
+        };
+        let _ = est.step(dt, imu, None, None);
+        est.update_fusion(Some(PosSample::pos_only([Meter(0.0); 3])), None);
+        let st2 = est.state();
+        let aw = st2.att.w.abs();
+        if aw < 0.9 && first_bad.is_none() {
+            first_bad = Some((k, st2.att.w, st2.att.x, st2.att.y, st2.att.z));
+        }
+        worst_abs_w = worst_abs_w.min(aw);
+    }
+    // 仪器可信性：位置观测确实被采用过（否则本判据是空转 ✗）
+    assert!(
+        est.n_gps_pos > 0,
+        "位置观测必须真的被接受（n_gps_pos={}，n_gps_pos_rejected={}）—— 否则本判据未测到东西 ✗",
+        est.n_gps_pos,
+        est.n_gps_pos_rejected
+    );
+    assert!(
+        worst_abs_w > 0.9,
+        "加位置观测后水平静止 400 步仍须水平：worst |w| = {worst_abs_w}；首次越界 = {first_bad:?}；\
+         n_gps_pos={} n_gps_pos_rejected={}",
+        est.n_gps_pos,
+        est.n_gps_pos_rejected
+    );
+}
