@@ -11,6 +11,12 @@ description = "飞控 App 分区：直接引用 joc-rtos-app-sdk（rtos-app-sdk�
 crate-type = ["staticlib"]
 name = "flyctrl_app"
 
+# ★数值核单独优化（2026-10-05）：实测新栈每控制拍超预算 ≈1.84×，
+#   而全局是 `opt-level = "z"`（尺寸优先 ✗ 对 21×21 矩阵循环极不利）✓
+#   ⇒ 只对 fcalg 开到 3（定点：其余代码尺寸不变 ✓）。
+[profile.release.package.fcalg]
+opt-level = 3
+
 [profile.release]
 opt-level = "z"      # 尺寸优先（APP_FLASH 384KB / APP_RAM 111KB 预算）
 lto = true
