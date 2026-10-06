@@ -8,6 +8,9 @@ license.workspace = true
 # 本 crate 是飞控核心逻辑：单位系统、状态机、估计算法、控制律。
 # 设计为 no_std 友好（不依赖 std/alloc），可在 host 与嵌入式固件间共享。
 [dependencies]
+# ★接线用（可选）：新栈 fcalg。**默认关闭** ⇒ 现有估计器/控制路径零影响。
+# 开启方式：--features fcalg-est（桥接实现见 core/src/estimator/fcalg_bridge.rs，尚未落地）
+fcalg = { path = "../fcalg", optional = true }
 
 # 共用 MAVLink v2 编解码核心（帧层 + codec 全消息 + 地面站兼容层）。
 # 单一事实来源：本 crate 不再手搓帧层/编解码，只保留 VehicleState 便捷封装。
@@ -36,3 +39,5 @@ buf-guard = ["mavlink-core/buf-guard"]
 stm32f407 = ["dep:stm32f4", "dep:cortex-m", "dep:cortex-m-rt"]
 # ★§5.192 计算量探针（H 场"预算类回归"守卫；**默认关 ⇒ 固件零开销** ✓）
 cost-probe = []
+# ★接线开关：启用后 flyctrl-core 可依赖 fcalg 的新估计器（渐进接线，默认关）
+fcalg-est = ["dep:fcalg"]
