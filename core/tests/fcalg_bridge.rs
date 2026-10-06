@@ -373,3 +373,60 @@ fn bridge_yaw_drift_probe() {
         }
     }
 }
+
+/// ★装配层判据 #4（2026-10-05）：**丢帧 ⇒ sample-and-hold ⇒ 陀螺重复积分** 是否造成偏航漂移。
+///
+/// 机制（全链最后未审的一环，`hil.rs:408-410` ✓）：
+///   "无真实帧则回退最近真实帧（sample-and-hold，**角速度继续积分**、比力继续锚定）"
+///   ⇒ 固件 **250 Hz 调用**（4 ms ✓）而样本 **≈77 Hz 到达**（13 ms ✓）⇒ **非新帧占 3.25×** ✗
+///   ⇒ 若"保持住的那个陀螺"非零，角度会按 **3.25× 过积分** ✗✓
+/// 而 `hil.rs` 注释记载 M 场**确有**垃圾帧（"陀螺 z 挖出 **2.7e6 rad/s**" ✗）⇒ §5.134 门
+///   （>100 rad/s ⇒ 丢帧 + 计数 ✓）会把它拒掉 ✗ ⇒ **丢帧后保持 = 用上上一帧继续积分** ✓✓
+/// 之所以可疑：**偏航不被任何观测锚定**（磁参考为零 ⇒ 按契约拒绝 ✓、重力观测对偏航无感 ✓）
+///   ⇒ 一旦积分偏了就**永远留下** ✓ ⇒ 与"真值水平/航向 0 但估计 ~111° 纯偏航"✓ 完全对得上 ✓
+///
+/// 本判据按固件口径跑：250 Hz 调用 ✓、每 3 拍一个真帧（≈77 Hz ✓）、第 500 拍插垃圾帧 ✓。
+/// **只打印**（不制造红灯 ✓）；若偏航漂了 ⇒ 机制坐实 ✓。
+#[test]
+fn hil_garbage_frame_yaw_drift_probe() {
+    use flyctrl_core::controller::PidController;
+    use flyctrl_core::estimator::select::AnyEstimator;
+    use flyctrl_core::hil::{HilContext, SimImu};
+    use flyctrl_core::units::{MeterPerSecondSquared, RadianPerSecond, Second};
+    use flyctrl_core::vehicle::ImuSample;
+
+    // 与 app 同构（`ekf_task.rs:29-33` ✓）
+    let mut hil = HilContext::new(
+        AnyEstimator::default_product(),
+        PidController::default_quad(),
+        Second(4.0 / 1000.0),
+    );
+    let mut sim = SimImu::new();
+    // 与 app 同做法：`SETPOINT` 就是 `core::mem::zeroed()` ✓（字段未知也无碍 ✓）
+    let sp = unsafe { core::mem::zeroed() };
+    let level = |gz: f32| ImuSample {
+        accel: [
+            MeterPerSecondSquared(0.0),
+            MeterPerSecondSquared(0.0),
+            MeterPerSecondSquared(-9.81),
+        ],
+        gyro: [RadianPerSecond(0.0), RadianPerSecond(0.0), RadianPerSecond(gz)],
+    };
+    let mut worst_yaw = 0.0f32;
+    for k in 0..1300 {
+        let imu = if k == 500 {
+            Some(level(1.0e6)) // 垃圾帧：陀螺 1e6 rad/s ⇒ §5.134 丢弃（照 M 场 2.7e6 的事故 ✓）
+        } else if k % 3 == 0 {
+            Some(level(0.0)) // 真帧（≈77 Hz ✓）
+        } else {
+            None // 非新帧 ⇒ sample-and-hold + 角速度继续积分 ✗（被测机制 ✓）
+        };
+        let _ = hil.ekf_hil(imu, None, None, None, None, None, &sp, false, false, true, &mut sim);
+        worst_yaw = worst_yaw.max(hil.est.inner.yaw_rad().abs());
+    }
+    eprintln!(
+        "[hil] 1300 拍（含 1 个垃圾帧）：worst |yaw| = {:.6} rad = {:.3} deg",
+        worst_yaw,
+        worst_yaw.to_degrees()
+    );
+}
