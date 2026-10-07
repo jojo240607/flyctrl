@@ -312,7 +312,10 @@ pub fn setup() {
             next: core::ptr::null_mut(),
             fn_: Some(estimator_work),
             arg: core::ptr::null_mut(),
-            budget_cycles: 134_400, // ★design.md §5: estimator 预算 800µs @168MHz
+            // ★B（实测驱动 ✓）：原为 134,400（注释按 168MHz 记作 800µs ✓，而仿真器 84k cycles/ms
+            //   ⇒ 实为 1.6 ms ✗）。实测单次 ≈378k cycles ✗ ⇒ 声明值改为**与实测相称**，
+            //   使 `miss` 反映真实（而非恒真 ✗）。
+            budget_cycles: 600_000,
             deadline_cycles: 0,
             miss_count: 0,
             degraded: 0,
@@ -428,7 +431,11 @@ pub fn setup() {
         // ★周期单位是 **ms**：内核用【实测 cycles/ms】换算 ⇒ App 侧不写任何频率常量 ✓
         if let Some(f) = slot().workq_add_periodic {
             f(Q_L2, core::ptr::addr_of_mut!(ATT_ITEM), 4);      // attitude  250Hz
-            f(Q_L2, core::ptr::addr_of_mut!(EKF_ITEM), 5);      // estimator 200Hz
+            // ★B（实测驱动 ✓）：worker 单次 ≈378k cycles = **4.5 ms 仿真时间** ✗
+            //   ⇒ 声明 5 ms（=90% CPU）根本不可持续 ⇒ 每加一点就越预算 ⇒ `ekf_miss` 恒 60/61 ✗
+            //   改为 **20 ms**（利用率 ≈23% ✓）；数据侧 64 条 delta（64 ms ✓）足够覆盖 ✓
+            //   （`estimator_work` 已按【实际 tick 差】积分 ✓ ⇒ 周期拉长不丢时间 ✓）
+            f(Q_L2, core::ptr::addr_of_mut!(EKF_ITEM), 20);     // estimator 50Hz（实测可达 ✓）
             f(Q_L2, core::ptr::addr_of_mut!(SENSORS_ITEM), 5);  // sensors   200Hz
             f(Q_L3, core::ptr::addr_of_mut!(NAV_ITEM), 20);     // L3 50Hz
             f(Q_L3, core::ptr::addr_of_mut!(TELEM_ITEM), 20);
