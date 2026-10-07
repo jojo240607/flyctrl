@@ -290,6 +290,12 @@ pub struct HilDiag {
     pub ekf_miss: f32,
     /// ★实测：工作项降级累计（超预算 ⇒ 降级 ✓）
     pub ekf_degraded: f32,
+    /// ★实测：worker 三段耗时（cycles ✓）—— 排空 ring / ekf_hil / 诊断
+    pub t_drain_cyc: f32,
+    pub t_ekf_cyc: f32,
+    pub t_diag_cyc: f32,
+    /// ★B-实测：本拍排空 IMU_RING 时**因缓冲满而丢弃**的 1kHz delta 条数（累计 ✓）
+    pub delta_dropped: f32,
 }
 #[link_section = ".rust_bss"]
 pub static mut HIL_DIAG: HilDiag = unsafe { core::mem::zeroed() };

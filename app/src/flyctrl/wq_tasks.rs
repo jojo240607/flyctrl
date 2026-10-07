@@ -89,9 +89,16 @@ extern "C" fn estimator_work(_arg: *mut c_void) {
         let r = &mut *core::ptr::addr_of_mut!(crate::flyctrl::IMU_RING);
         let mut n = 0usize;
         while let Some(d) = r.pop() {
-            if n < hil.imu_deltas.len() { hil.imu_deltas[n] = d; n += 1; }
+            if n < hil.imu_deltas.len() {
+                hil.imu_deltas[n] = d;
+                n += 1;
+            } else {
+                // ★契约 §4「永不静默」：装满后仍弹出的样本**必须计数** ✓（此前静默丢弃 ✗）
+                DROPPED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            }
         }
         hil.imu_deltas_len = n;
+        T_EXEC_DRAIN = rtos_app_sdk::rtos::cycle_now();
     }
     // ★design.md §7：积分用**实际 dt**（本拍与上拍 tick 差），不用名义 4ms——
     //   否则 worker 被延后时 item 成批补跑、EKF 每拍仍积 4ms ⇒ **过积分** ⇒ 漂移。
@@ -106,6 +113,7 @@ extern "C" fn estimator_work(_arg: *mut c_void) {
         let d = &mut *core::ptr::addr_of_mut!(crate::flyctrl::HIL_DIAG);
         d.n_ekf_calls += 1.0;
         d.sum_dt_ms += dt_ms as f32;
+        d.delta_dropped = DROPPED.load(core::sync::atomic::Ordering::Relaxed) as f32;
         // ★实测：上一次执行周期数（IT_EXEC_EKF 在 worker 末尾写入 ✓）+ 漏拍/降级（workq 自己的 ✓）
         d.it_exec_ekf_cyc = core::ptr::read_volatile(core::ptr::addr_of!(IT_EXEC_EKF)) as f32;
         d.ekf_miss = core::ptr::read_volatile(core::ptr::addr_of!(EKF_ITEM.miss_count)) as f32;
@@ -142,6 +150,7 @@ extern "C" fn estimator_work(_arg: *mut c_void) {
         imu_in, gps, baro_alt, None, None, mag, &sp, sp_valid, armed, rc.fresh, sim_imu,
     );
     unsafe {
+        T_EXEC_EKF = rtos_app_sdk::rtos::cycle_now();
         let s = &mut *core::ptr::addr_of_mut!(EST_STATE);
         s.est = est;
         s.health = health;
@@ -178,6 +187,13 @@ extern "C" fn estimator_work(_arg: *mut c_void) {
             info!(tag: "rejdbg", "rej maxres={:.2} |nu|={:.2} nis={:.2} n={} | ok maxres={:.2} |nu|={:.2} nis={:.2}",
                   rj0, rj1, rj2, rjn, ok0, ok1, ok2);
         }
+    }
+    {
+        let t_end = rtos_app_sdk::rtos::cycle_now();
+        let d = unsafe { &mut *core::ptr::addr_of_mut!(crate::flyctrl::HIL_DIAG) };
+        d.t_drain_cyc = unsafe { T_EXEC_DRAIN }.wrapping_sub(t_it) as f32;
+        d.t_ekf_cyc = unsafe { T_EXEC_EKF }.wrapping_sub(unsafe { T_EXEC_DRAIN }) as f32;
+        d.t_diag_cyc = t_end.wrapping_sub(unsafe { T_EXEC_EKF }) as f32;
     }
     unsafe { IT_EXEC_EKF = rtos_app_sdk::rtos::cycle_now().wrapping_sub(t_it); }
     // ★★★接线（fcalg-est）：旧栈 8 项磁场诊断里，**新栈只暴露 mag_i / mag_b / yaw_rad**。
@@ -261,6 +277,13 @@ extern "C" fn uplink_work(_arg: *mut c_void) {
 
 
 /// ★装配（在**大栈 setup 任务**里调用：构造 `HilContext` 瞬时值需要栈）。
+static DROPPED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static mut T_EXEC_DRAIN: u32 = 0;
+static mut T_EXEC_EKF: u32 = 0;
+
+/// ★装配（在**大栈 setup 任务**里调用：构造 `HilContext` 瞬时值需要栈）。
+pub fn setup2_placeholder_marker() {}
+
 pub fn setup() {
     unsafe {
         // estimator 静态状态

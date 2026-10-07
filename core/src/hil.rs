@@ -153,7 +153,11 @@ where
     pub last_gyro_ctl: [f32; 3],
     /// ★design.md §7：本拍待 predict 的 IMU **增量**（宿主从 `ImuRing` 排空后填入）——
     ///   1kHz IMU → 250Hz 估计器时**逐样本 predict**，不丢样本 ✓。
-    pub imu_deltas: [crate::imu_ring::ImuDelta; 16],
+    /// ★2026-10-05（实测驱动 ✓）：容量 16 → **64**。
+    ///   实测：真链路 62 拍内**丢弃 86 条** delta（≈25% 的 IMU 数据从未进入估计器 ✗），
+    ///   因 worker 单次 397k cycles ≫ 预算 ⇒ 调用稀疏 ⇒ 每拍排空的条数远超 16 ✗。
+    ///   64 条 ≈ 64 ms 的 1 kHz 数据 ⇒ 覆盖实测 ~43 ms 的调用间隔 ✓（余量 ✓）。
+    pub imu_deltas: [crate::imu_ring::ImuDelta; 64],
     pub imu_deltas_len: usize,
 }
 
@@ -209,7 +213,7 @@ where
             //   `G_ESKF_GYR_LPF > 0` 可覆盖；≤0（含裸 bin 读 0）⇒ **40Hz** ✓
             imu_gyro_lpf: imu_f.gyro_lpf,
             last_gyro_ctl: [0.0; 3],
-            imu_deltas: [crate::imu_ring::ImuDelta::ZERO; 16],
+            imu_deltas: [crate::imu_ring::ImuDelta::ZERO; 64],
             imu_deltas_len: 0,
             // ★§5.136：陀螺陷波 Q 可配（A/B 定位 9Hz 姿态振荡的相位来源：
             //   实测 Q=5 时 9Hz 处相位滞后使姿态环越过临界 ⇒ 增长型振荡 ✗；
