@@ -296,6 +296,9 @@ pub struct HilDiag {
     pub t_diag_cyc: f32,
     /// ★B-实测：本拍排空 IMU_RING 时**因缓冲满而丢弃**的 1kHz delta 条数（累计 ✓）
     pub delta_dropped: f32,
+    /// ★A-实测：每拍 `propagate_covariance` / `update` 的调用次数（成本模型的分母 ✓）
+    pub n_prop: f32,
+    pub n_upd: f32,
 }
 #[link_section = ".rust_bss"]
 pub static mut HIL_DIAG: HilDiag = unsafe { core::mem::zeroed() };

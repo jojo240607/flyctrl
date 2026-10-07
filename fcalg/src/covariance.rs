@@ -133,6 +133,9 @@ fn gate_cov(a: &Cov) -> Result<(), Violation> {
 /// 而 6/21 的死重按 N³ 标度 ≈ **2.8×** ✓。仅**每核一次**分支 ⇒ 不触发"内层加分支"的负优化 ✓。
 pub static mut ACTIVE_N: usize = N;
 
+/// ★A-实测：各核每拍被调用几次（决定"成本模型该按什么乘"✓）
+pub static PROP_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
 /// 由桥接在"磁不可用"时调用（见 `fcalg_bridge`：`mag_i == [0,0,0]` ⇒ 15 ✓）
 pub fn set_active_n(n: usize) {
     unsafe {
@@ -146,6 +149,7 @@ pub fn propagate_covariance_into(
     q: &Cov,
     out: &mut Cov,
 ) -> Result<(), CovError> {
+    let _ = PROP_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     // ① 入口门（契约 §4）：非有限一律显式拒绝，**不做任何钳位**
     gate_cov(p).map_err(CovError::NonFinite)?;
     gate_cov(q).map_err(CovError::NonFinite)?;

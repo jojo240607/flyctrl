@@ -98,6 +98,11 @@ pub extern "C" fn ekf_entry(_arg: *mut c_void) {
             d.last_mag_yaw_innov = fl.last_mag_yaw_innov;
             d.yaw_rad = fl.st.q.yaw();
             d.gated = gated as u32;
+            d.n_ekf_hil = d.n_ekf_hil.wrapping_add(1);
+            d.arg_baro_alt = baro_alt.unwrap_or(-999.0);
+            d.arg_gps_pz = gps.map(|p| p.pos[2].0).unwrap_or(-999.0);
+            d.arg_sp_valid = sp_valid as u32 as f32;
+            d.arg_rc_fresh = rc.fresh as u32 as f32;
         }
 
         st.sample(st.tick().wrapping_sub(t0));

@@ -114,6 +114,8 @@ extern "C" fn estimator_work(_arg: *mut c_void) {
         d.n_ekf_calls += 1.0;
         d.sum_dt_ms += dt_ms as f32;
         d.delta_dropped = DROPPED.load(core::sync::atomic::Ordering::Relaxed) as f32;
+        d.n_prop = flyctrl_core::estimator::fcalg_bridge::prop_calls() as f32;
+        d.n_upd = flyctrl_core::estimator::fcalg_bridge::upd_calls() as f32;
         // ★实测：上一次执行周期数（IT_EXEC_EKF 在 worker 末尾写入 ✓）+ 漏拍/降级（workq 自己的 ✓）
         d.it_exec_ekf_cyc = core::ptr::read_volatile(core::ptr::addr_of!(IT_EXEC_EKF)) as f32;
         d.ekf_miss = core::ptr::read_volatile(core::ptr::addr_of!(EKF_ITEM.miss_count)) as f32;

@@ -198,6 +198,10 @@ impl Default for FcalgEstimator {
 impl FcalgEstimator {
     pub fn new() -> Self {
         let prm = ObsParams::default();
+        // ★A（实测驱动 ✓）：磁参考未配置（M 场实况 ✓）⇒ 磁 6 态无观测/无驱动
+        //   ⇒ 不参与矩阵运算（末尾块行+列双向原样拷贝 ⇒ P 仍正定 ✓）；实测 6.5% ✓
+        //   ⚠本轮曾因 A/B 后 `git checkout` 误删本接线 ✗ ⇒ 已补回 ✓（提交与树对齐 ✓）
+        fcalg::covariance::set_active_n(N - 6);
         Self {
             f: Eskf::new(State::level(), diag_cov(P_INIT), 10),
             gate_sigma: 0.0, // ⇒ 用 dof 感知的导出门限（见字段注释）
@@ -231,6 +235,8 @@ impl FcalgEstimator {
     /// `set_mag_reference` / `set_mag_hard_iron` 的对应 ✓（写进标称态）
     pub fn set_mag_ref(&mut self, mag_i: [f32; 3]) {
         self.f.st.mag_i = mag_i;
+        // 配置了参考 ⇒ 磁态重新参与运算（全维 ⇒ 与原先逐位相同 ✓）
+        fcalg::covariance::set_active_n(if mag_i == [0.0; 3] { N - 6 } else { N });
     }
     pub fn set_mag_bias(&mut self, mag_b: [f32; 3]) {
         self.f.st.mag_b = mag_b;
@@ -454,4 +460,12 @@ impl Estimator for FcalgEstimator {
         self.not_impl_calls = self.not_impl_calls.wrapping_add(1);
         NOT_IMPLEMENTED_CALLS.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// ★A-实测：fcalg 内核调用计数（累计 ✓）
+pub fn prop_calls() -> u32 {
+    fcalg::covariance::PROP_CALLS.load(core::sync::atomic::Ordering::Relaxed)
+}
+pub fn upd_calls() -> u32 {
+    fcalg::update::UPD_CALLS.load(core::sync::atomic::Ordering::Relaxed)
 }

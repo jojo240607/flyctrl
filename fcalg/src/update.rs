@@ -69,6 +69,8 @@ pub(crate) fn inv3(a: &[[f32; 3]; 3]) -> Option<[[f32; 3]; 3]> {
 /// **写入口**：`P` 与 `dx` 写进调用方缓冲，返回 `nis_sigma` ——
 /// **不再按值返回 `UpdateOut`**（其 `p: Cov` = 1,764 B 的返回临时量 ✗，
 /// 是实测栈溢出 4,128 B 的另一来源）✓。
+/// ★A-实测：`update_into` 每拍被调用几次 ✓
+pub static UPD_CALLS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 pub fn update_into(
     p: &Cov,
     h: &[[f32; N]; 3],
@@ -96,6 +98,7 @@ pub fn update_into(
             Violation::Inf
         }));
     }
+    let _ = UPD_CALLS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     // ② PHᵀ
     let mut pht = [[0.0f32; 3]; N];
     for i in 0..N {
