@@ -725,3 +725,67 @@ fn hil_app_config_noisy_probe() {
         }
     }
 }
+
+/// ★装配层判据 #10（2026-10-05）：**双路喂入** —— 复现"从完美输入跑飞"?
+///
+/// 代码级依据（本轮查明 ✓）：
+///   · `hil.rs:597-630`（在 `ekf_hil` **内部**）：若 `imu_deltas_len > 0`
+///     ⇒ 累计后调 `self.est.predict_delta(...)` ✓
+///   · `wq_tasks.rs:87-94`：`rate_task` 排空 **1 kHz `IMU_RING`** 填入 `hil.imu_deltas` ✓
+///   · `ekf_task.rs:58-71`：同一次 `ekf_hil` 调用**还**传入 250 Hz 的 `frame` ✓
+/// ⇒ 真链路**同时**走两条路 ✗：①用 frame 走 `step` ✓ ②用 1 kHz delta 走 `predict_delta` ✓
+/// ⇒ **同一段真实运动被积分两次** ✗
+/// 而我的全部判据（#1–#9）**从不填 `imu_deltas`** ✗ ⇒ 只走 ① ⇒ 所以 host 完美 ✓✗
+///
+/// 本判据按真链路同时喂两条 ✓（静止水平：4×1ms delta = (0,0,−0.00981)×4 ✓）。
+/// **只打印**（不制造红灯 ✓）；若速度出现明显的双倍恒定增量 ⇒ 根因坐实 ✓✓
+#[test]
+fn hil_dual_path_probe() {
+    use flyctrl_core::controller::PidController;
+    use flyctrl_core::estimator::select::AnyEstimator;
+    use flyctrl_core::hil::{HilContext, SimImu};
+    use flyctrl_core::imu_ring::ImuDelta;
+    use flyctrl_core::units::{Meter, MeterPerSecondSquared, RadianPerSecond, Second};
+    use flyctrl_core::vehicle::{ImuSample, PosSample};
+
+    let mut hil = HilContext::new(
+        AnyEstimator::default_product(),
+        PidController::default_quad(),
+        Second(4.0 / 1000.0),
+    );
+    hil.est.set_observation_noise(0.25, 0.01, 0.09);
+    let mut sim = SimImu::new();
+    let sp = unsafe { core::mem::zeroed() };
+    let frame = ImuSample {
+        accel: [MeterPerSecondSquared(0.0), MeterPerSecondSquared(0.0), MeterPerSecondSquared(-9.81)],
+        gyro: [RadianPerSecond(0.0); 3],
+    };
+    let d = ImuDelta {
+        delta_vel: [0.0, 0.0, -9.81 * 0.001],
+        dt_ang: 0.001,
+        dt_vel: 0.001,
+        ..ImuDelta::ZERO
+    };
+    for k in 0..1300u32 {
+        // ① 1 kHz delta（照 wq_tasks.rs:87-94 ✓）
+        for i in 0..4 {
+            hil.imu_deltas[i] = d;
+        }
+        hil.imu_deltas_len = 4;
+        // ② 250 Hz frame（照 ekf_task.rs ✓）
+        let imu = if k % 3 == 0 { Some(frame) } else { None };
+        let pos = Some(PosSample::pos_only([Meter(0.0); 3]));
+        let _ = hil.ekf_hil(imu, pos, Some(0.0), None, None, None, &sp, false, false, true, &mut sim);
+        if k == 49 || k == 199 || k == 399 || k == 1299 {
+            let st = hil.est.state();
+            let q = st.att;
+            // ★关键通道是【速度】：双份积分下姿态仍被重力观测保持水平 ✓，
+            //   而每拍多出的恒定速度增量会累积 ✗ ⇒ 只在速度上现形 ✓
+            eprintln!(
+                "[dual] 第 {:4} 拍：w={:+.4} 俯仰≈{:.1}° | vel = [{:+.4}, {:+.4}, {:+.4}] m/s",
+                k + 1, q.w, 2.0 * (q.x.abs().min(1.0)).asin().to_degrees(),
+                st.vel[0].0, st.vel[1].0, st.vel[2].0
+            );
+        }
+    }
+}
