@@ -127,6 +127,19 @@ fn gate_cov(a: &Cov) -> Result<(), Violation> {
 /// 动因（实测）：真固件里 L2 worker 栈溢出 4,128 B，其中一个来源就是
 /// `→ Cov` 的**按值返回临时量**（1,764 B/次，本函数与 `update` 各一次）✓。
 /// 索引对 `&mut Cov` 同样有效 ⇒ **函数体与原来逐字一致** ✓（零语义改动）。
+/// ★A（实测驱动 ✓）：**有效维数**。磁的 6 态（`I_MAGI/I_MAGB`）在"磁参考未配置"时
+/// 无观测、无驱动 ⇒ 令其不参与矩阵运算（末尾块**原样拷贝** ⇒ P 仍正定 ✓）。
+/// 实测依据：单次 `ekf_hil` ≈488k cycles、其中矩阵核占大头；`mac = 21 cycles/op` ✗，
+/// 而 6/21 的死重按 N³ 标度 ≈ **2.8×** ✓。仅**每核一次**分支 ⇒ 不触发"内层加分支"的负优化 ✓。
+pub static mut ACTIVE_N: usize = N;
+
+/// 由桥接在"磁不可用"时调用（见 `fcalg_bridge`：`mag_i == [0,0,0]` ⇒ 15 ✓）
+pub fn set_active_n(n: usize) {
+    unsafe {
+        ACTIVE_N = if n >= 3 && n <= N { n } else { N };
+    }
+}
+
 pub fn propagate_covariance_into(
     p: &Cov,
     f: &[[f32; N]; N],
@@ -139,24 +152,25 @@ pub fn propagate_covariance_into(
     for r in f.iter() {
         gate_all(Stage::L7Covariance, r).map_err(CovError::NonFinite)?;
     }
-    // ② FP = F·P
+    // ② FP = F·P（仅前 `an` 维 ✓；`an = N` 时行为与原先逐位相同 ✓）
+    let an = unsafe { ACTIVE_N };
     let mut fp = [[0.0f32; N]; N];
-    for i in 0..N {
+    for i in 0..an {
         for k in 0..N {
             let fik = f[i][k];
             if fik == 0.0 {
                 continue;
             }
-            for j in 0..N {
+            for j in 0..an {
                 fp[i][j] += fik * p[k][j];
             }
         }
     }
     // ③ 上三角：out = FP·Fᵀ + Q，随后镜像 ⇒ 逐位对称（写入调用方缓冲 ✓）
-    for i in 0..N {
+    for i in 0..an {
         for j in 0..=i {
             let mut s = q[i][j];
-            for k in 0..N {
+            for k in 0..an {
                 let fjk = f[j][k];
                 if fjk == 0.0 {
                     continue;
@@ -165,6 +179,17 @@ pub fn propagate_covariance_into(
             }
             out[i][j] = s;
             out[j][i] = s;
+        }
+    }
+    // ③b 未参与运算的尾部块**原样拷贝**（保证 P 完整、正定 ✓；an=N 时循环为空 ✓）
+    for i in an..N {
+        for j in 0..N {
+            out[i][j] = p[i][j];
+        }
+    }
+    for i in 0..an {
+        for j in an..N {
+            out[i][j] = p[i][j];
         }
     }
     // ④ 后置：非有限 ⇒ 拒绝（**不得钳位**）
