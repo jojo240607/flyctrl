@@ -273,6 +273,23 @@ pub struct HilDiag {
     pub motor: [f32; 4],
     /// 本拍是否有效（门控 ✓）。
     pub gated: u32,
+    /// ★2026-10-05 实参记录（追加于末尾 ⇒ 既有偏移不变 ✓）：待查的真链路实际喂入值
+    pub arg_baro_alt: f32,
+    pub arg_gps_pz: f32,
+    pub arg_sp_valid: f32,
+    pub arg_rc_fresh: f32,
+    /// ★2026-10-05 E4：`ekf_hil` 累计调用次数（判"节拍是否符合 250 Hz" ✓）
+    pub n_ekf_hil: u32,
+    /// ★实测用：estimator_work 实际调用次数（f32 ⇒ dump 明文可读 ✓）
+    pub n_ekf_calls: f32,
+    /// ★实测用：各次 dt_ms 的累计和 ⇒ 与仿真经过时间比对（时间一致性 ✓）
+    pub sum_dt_ms: f32,
+    /// ★实测：上一次 estimator_work 的执行周期数（换算 µs 用 cycles_per_ms ✓）
+    pub it_exec_ekf_cyc: f32,
+    /// ★实测：工作项漏拍累计（workq 自己的计数 ✓）
+    pub ekf_miss: f32,
+    /// ★实测：工作项降级累计（超预算 ⇒ 降级 ✓）
+    pub ekf_degraded: f32,
 }
 #[link_section = ".rust_bss"]
 pub static mut HIL_DIAG: HilDiag = unsafe { core::mem::zeroed() };

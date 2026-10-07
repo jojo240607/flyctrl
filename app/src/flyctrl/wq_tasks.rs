@@ -102,6 +102,25 @@ extern "C" fn estimator_work(_arg: *mut c_void) {
         now.wrapping_sub(last)
     }.clamp(1, 50) as f32;
     hil.dt = Second(dt_ms / 1000.0);
+    unsafe {
+        let d = &mut *core::ptr::addr_of_mut!(crate::flyctrl::HIL_DIAG);
+        d.n_ekf_calls += 1.0;
+        d.sum_dt_ms += dt_ms as f32;
+        // ★实测：上一次执行周期数（IT_EXEC_EKF 在 worker 末尾写入 ✓）+ 漏拍/降级（workq 自己的 ✓）
+        d.it_exec_ekf_cyc = core::ptr::read_volatile(core::ptr::addr_of!(IT_EXEC_EKF)) as f32;
+        d.ekf_miss = core::ptr::read_volatile(core::ptr::addr_of!(EKF_ITEM.miss_count)) as f32;
+        d.ekf_degraded = core::ptr::read_volatile(core::ptr::addr_of!(EKF_ITEM.degraded)) as f32;
+    }
+    // ★2026-10-05 验证打印：**实际 tick 间隔** vs 样本代表的 4ms
+    //   反推假设：workq 1ms 量化 ⇒ 实际 ≈4.4ms ✗ ⇒ ab_z 吸收 ~3.8% ⇒ 重力门关闭 ⇒ 发散 ✓
+    {
+        static mut DBG_DT_N: u32 = 0;
+        let c = unsafe { DBG_DT_N };
+        unsafe { DBG_DT_N = DBG_DT_N.wrapping_add(1) };
+        if c % 250 == 0 || c < 20 {
+            rtos_app_sdk::info!(tag: "dtdbg", "dt_ms={} n_deltas={}", dt_ms, hil.imu_deltas_len);
+        }
+    }
     let (imu, gps, baro_alt, mag, rc, armed, seq_now) = unsafe {
         let f = &*core::ptr::addr_of!(SENSOR_FRAME);
         (f.imu, f.gps, f.baro_alt, f.mag, f.rc, f.armed, SENSOR_SEQ)
