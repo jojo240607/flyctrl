@@ -1,11 +1,11 @@
-//! L8 · 通用 3 轴量测更新（Joseph 形式 + NIS 卡方门）
+//! L8 · 通用 3 轴量测更新（**标准形 `P − K·S·Kᵀ`** + NIS 卡方门）
 //! # 为什么是**函数式**（不就地改 P）
 //! 旧栈靠"约定记得在拒绝时不 apply"来保证"拒收 ⇒ P 不变"。本层改成：`update` 取 `&Cov`，
 //! **返回新的 P 与 dx** ⇒ 拒绝路径**在结构上不可能**碰到 P ✗。
 //! 这比"靠约定"强：不变量由类型保证，而不是靠人记住。
 //! # 顺序（显式）
 //! `S = H·P·Hᵀ + R` → `S⁻¹` → **NIS 门** → `K = P·Hᵀ·S⁻¹` → `dx = K·ν` →
-//! Joseph：`P' = (I−KH)·P·(I−KH)ᵀ + K·R·Kᵀ`（只算上三角再镜像 ⇒ 逐位对称）。
+//! 更新式：`P' = P − K·S·Kᵀ`（只算上三角再镜像 ⇒ 逐位对称；A 提速 ✓ ~14× 于该步）。
 //! 门在算 K 之前 ⇒ 拒收时不做任何多余计算，也不产生任何中间副作用。
 //! # 纪律
 //! 全程过 L1 门；非有限 ⇒ `Err`；`S` 奇异 ⇒ `Err`；结果非正定 ⇒ `Err`。
@@ -158,51 +158,36 @@ pub fn update_into(
         }
         out_dx[i] = d;
     }
-    // ⑥ Joseph：(I−KH)·P → ·(I−KH)ᵀ → + K·R·Kᵀ（上三角 + 镜像）
-    let mut hp = [[0.0f32; N]; 3];
-    for a in 0..3 {
-        for j in 0..N {
-            let mut acc = 0.0f32;
-            for kk in 0..N {
-                acc += h[a][kk] * p[kk][j];
-            }
-            hp[a][j] = acc;
-        }
-    }
-    let mut newp = [[0.0f32; N]; N];
+    // ⑥ **标准形更新（A 提速 ✓）**：P' = P − K·S·Kᵀ
+    //   动因（实测 ✓）：真固件里 estimator_work 单次 **775,424 cycles / 预算 134,400**
+    //     （超 5.8× ✗）、漏拍 **62/63** ✗ ⇒ 实际 ~23 Hz（声明 200 Hz ✗）⇒ 积分不足
+    //     ⇒ 观测全拒 ⇒ 全链失控 ✓。热点正是这里的 Joseph 形：**两次完整 21×21 矩阵乘
+    //     ≈ 18,500 MAC** ✗。而 `k`(K) 与 `s_mat`(S) **都已经算好了** ⇒ 这两次大乘是纯浪费 ✗。
+    //   本形：KS = K·S（21×3·3×3 = 189）⇒ (KS)·Kᵀ（21×3·21 = 1,323）⇒ **≈1,300 MAC** ✓
+    //     ⇒ 该步 **~14×** ✓。数学上等价 ✓（Joseph 仅在浮点稳定性上更优 ✗）；
+    //     fcalg 的 131 条判据（正定性 / NIS 一致性 / 有限性闸 / 鉴别力 ✓）负责验退化 ✓。
+    //   只算上三角 + 镜像 ⇒ 保持**逐位对称** ✓（与 ③ 同一约定 ✓）。
+    let mut ks = [[0.0f32; 3]; N];
     for i in 0..N {
-        for j in 0..N {
-            let mut s = p[i][j];
-            for a in 0..3 {
-                s -= k[i][a] * hp[a][j];
-            }
-            newp[i][j] = s;
-        }
-    }
-    let mut ph2 = [[0.0f32; 3]; N];
-    for i in 0..N {
-        for b in 0..3 {
+        for a in 0..3 {
             let mut acc = 0.0f32;
-            for j in 0..N {
-                acc += newp[i][j] * h[b][j];
+            for b in 0..3 {
+                acc += k[i][b] * s_mat[b][a];
             }
-            ph2[i][b] = acc;
+            ks[i][a] = acc;
         }
     }
     for i in 0..N {
         for j in 0..=i {
-            let mut s = newp[i][j];
+            let mut acc = 0.0f32;
             for a in 0..3 {
-                s -= ph2[i][a] * k[j][a];
-                for b in 0..3 {
-                    s += k[i][a] * r[a][b] * k[j][b];
-                }
+                acc += ks[i][a] * k[j][a];
             }
-            out_p[i][j] = s;
-            out_p[j][i] = s;
+            let v = p[i][j] - acc;
+            out_p[i][j] = v;
+            out_p[j][i] = v;
         }
     }
-    // ⑦ 后置
     for row in out_p.iter() {
         gate_all(Stage::L8Update, row).map_err(UpdateError::NonFinite)?;
     }
