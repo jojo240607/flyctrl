@@ -438,6 +438,35 @@ pub fn setup() {
     let cpu_per_ms = slot().cycles_per_ms.map(|f| f()).unwrap_or(0);
     info!(tag: "wq", "calib: cycles/ms={} (仿真器期望 ~84000，真机 ~168000)", cpu_per_ms);
     info!(tag: "wq", "design.md §5: L2/L3 队列自带调度器（item 声明周期 + EDF）ready");
+
+    // ★A-推进（2026-10-05）：**基本运算单价**微基准 —— 决定"提速该往哪打" ✓
+    //   背景（实测 ✓）：`ekf_hil` 同物在 host(release) 折合 1,088 cycles，固件 **397k** ✗
+    //   ⇒ 同一份算法在固件里多跑 ~10× 指令/访存 ⇒ 需分辨：浮点？访存？调用？✗
+    unsafe {
+        use core::hint::black_box as bb;
+        const N: u32 = 20_000;
+        let mut x = 1.0001f32;
+        let t0 = rtos_app_sdk::rtos::cycle_now();
+        for i in 0..N { x = bb(x * 1.0000001f32 + (i as f32) * 1e-9f32); }
+        let c_mac = rtos_app_sdk::rtos::cycle_now().wrapping_sub(t0) / N;
+        let t1 = rtos_app_sdk::rtos::cycle_now();
+        for _ in 0..N { x = bb(flyctrl_core::math::sqrt(x.abs() + 1.0)); }
+        let c_sqrt = rtos_app_sdk::rtos::cycle_now().wrapping_sub(t1) / N;
+        let t2 = rtos_app_sdk::rtos::cycle_now();
+        for _ in 0..N { x = bb(x / 1.0000001f32); }
+        let c_div = rtos_app_sdk::rtos::cycle_now().wrapping_sub(t2) / N;
+        let t3 = rtos_app_sdk::rtos::cycle_now();
+        for i in 0..N { x = bb(flyctrl_core::math::atan2(x * 1e-6, (i as f32) + 1.0)); }
+        let c_atan2 = rtos_app_sdk::rtos::cycle_now().wrapping_sub(t3) / N;
+        // 访存：顺序扫一个大数组（.bss ✓）
+        static mut BIG: [f32; 4096] = [0.0; 4096];
+        let t4 = rtos_app_sdk::rtos::cycle_now();
+        let b = &mut *core::ptr::addr_of_mut!(BIG);
+        for _ in 0..64 { for k in 0..4096 { b[k] = bb(b[k] * 1.0000001f32); } }
+        let c_ram = rtos_app_sdk::rtos::cycle_now().wrapping_sub(t4) / (64 * 4096);
+        info!(tag: "unit", "cycles/op: mac={} sqrt={} div={} atan2={} ram_rw={}",
+              c_mac, c_sqrt, c_div, c_atan2, c_ram);
+    }
 }
 
 /// ★design.md §3：DRDY 到（ISR）。
