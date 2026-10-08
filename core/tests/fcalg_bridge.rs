@@ -789,3 +789,211 @@ fn hil_dual_path_probe() {
         }
     }
 }
+
+/// ★装配层判据 #11（2026-10-05）：**逐拍复刻完整真序列**（此前判据只复刻子集 ✗）。
+///
+/// 方法论缺口（本轮看清 ✓）：既有 #1–#10 各复刻真序列的**一个子集** ⇒ 反复验证"数值不对"✗；
+/// 而实测唯一写者就是 `ekf_hil`（`attitude_step`/`rate_step` 不存在 ✓，`rate_task` 只碰 PID ✓）
+/// ⇒ 差异只能在**调用序列 / `HilContext` 内部状态** ✓。
+///
+/// 本判据复刻四项此前从未同时出现的要素：
+///   ① **开机前 ~78 ms 无真实帧**（走 `SimImu` 回退，其比力含 `0.05·sin t` 横向分量 ✗）
+///   ② `ekf_task.rs:37-38` 的全局量 `G_ESKF_MAG_HDG_GATE=2.0` / `G_ESKF_MAG_YAW_ON=0.0`
+///   ③ `imu_deltas` 用**实测抖动 dt**（1.0096~1.1518 ms ✓，而非均匀 1 ms ✗）
+///   ④ `rc_fresh = false`（实测 ✓；此前判据一律传 true ✗）
+/// **只打印**（不制造红灯 ✓）；与真链路曲线逐点对照 ✓。
+#[test]
+fn hil_full_sequence_probe() {
+    use flyctrl_core::controller::PidController;
+    use flyctrl_core::estimator::select::AnyEstimator;
+    use flyctrl_core::hil::{HilContext, SimImu};
+    use flyctrl_core::imu_ring::ImuDelta;
+    use flyctrl_core::units::{Meter, MeterPerSecondSquared, RadianPerSecond, Second};
+    use flyctrl_core::vehicle::{ImuSample, PosSample};
+
+    // ② 全局量（照 ekf_task.rs:37-38 ✓）
+    unsafe {
+        flyctrl_core::estimator::eskf::G_ESKF_MAG_HDG_GATE = 2.0;
+        flyctrl_core::estimator::eskf::G_ESKF_MAG_YAW_ON = 0.0;
+    }
+    let mut hil = HilContext::new(
+        AnyEstimator::default_product(),
+        PidController::default_quad(),
+        Second(4.0 / 1000.0),
+    );
+    hil.est.set_observation_noise(0.25, 0.01, 0.09);
+    let mut sim = SimImu::new();
+    let sp = unsafe { core::mem::zeroed() };
+    let frame = ImuSample {
+        accel: [MeterPerSecondSquared(0.0), MeterPerSecondSquared(0.0), MeterPerSecondSquared(-9.81)],
+        gyro: [RadianPerSecond(0.0); 3],
+    };
+    // ③ 实测的抖动 dt（来自 IMU_RING dump ✓）
+    let dts = [0.0010096f32, 0.0011471, 0.0011518, 0.0011343];
+    for k in 0..1300u32 {
+        for i in 0..4 {
+            hil.imu_deltas[i] = ImuDelta {
+                delta_vel: [0.0, 0.0, -9.81 * dts[i]],
+                dt_ang: dts[i],
+                dt_vel: dts[i],
+                ..ImuDelta::ZERO
+            };
+        }
+        hil.imu_deltas_len = 4;
+        // ① 前 6 拍无真实帧（≈78 ms ✓）；② 之后每 3 拍一帧 ✓
+        let imu = if k >= 6 && k % 3 == 0 { Some(frame) } else { None };
+        let _ = hil.ekf_hil(
+            imu,
+            Some(PosSample::pos_only([Meter(0.0); 3])),
+            Some(0.0),
+            None,
+            None,
+            None,
+            &sp,
+            false,
+            false,
+            false, // ④ rc_fresh = false（实测 ✓）
+            &mut sim,
+        );
+        if k == 29 || k == 59 || k == 99 || k == 199 || k == 299 || k == 1299 {
+            let st = hil.est.state();
+            let q = st.att;
+            eprintln!(
+                "[full] 第 {:4} 拍：w={:+.5} 俯仰≈{:5.2}° | vel=[{:+.4}, {:+.4}, {:+.4}]",
+                k + 1, q.w, 2.0 * (q.x.abs().min(1.0)).asin().to_degrees(),
+                st.vel[0].0, st.vel[1].0, st.vel[2].0
+            );
+        }
+    }
+}
+
+/// ★★装配层判据 #12（2026-10-05）：**按固件自己打印的条件复现跑飞** ✓✓
+///
+/// 依据（固件内置诊断，`wq_tasks.rs::estimator_work` 的 ekfdbg ✓，本轮首次读到 ✓）：
+///   `[c] I 65 nav: first loop done; **sp_valid=true**` ✗
+///   `[c] I 56 gps: fix established: … **alt=4.0** (NED origin locked)` ✗ ⇒ NED z = **−4 m**
+///   `ekfdbg: … gpsP=3/3 **gpsV=0/5** **grav=1/7** mag=5/0/0 | ab=(0,0,0.372)`
+///   ⇒ ① 位置初值 −4 m（而观测喂 ≈0 ✗）② 速度通道**全拒** ✗ ③ 重力 **~85% 被门控** ✗
+/// ⇒ 姿态无锚定 + 速度无反馈 ⇒ "从完美输入跑飞" ✓
+/// 而我的既有判据一律 `setpoint_valid=false` + `pos=(0,0,0)` ✗ ⇒ **从未复现** ✓（这是缺口 ✓）
+///
+/// 本判据照固件条件喂：`sp.pos=[0,0,−4]` ✓ + `setpoint_valid=true` ✓，其余同 #8/#11 ✓。
+/// **只打印**（不制造红灯 ✓）。
+#[test]
+fn hil_fw_conditions_probe() {
+    use flyctrl_core::controller::PidController;
+    use flyctrl_core::estimator::select::AnyEstimator;
+    use flyctrl_core::hil::{HilContext, SimImu};
+    use flyctrl_core::units::{Meter, MeterPerSecondSquared, RadianPerSecond, Second};
+    use flyctrl_core::vehicle::{ImuSample, PosSample};
+
+    let mut hil = HilContext::new(
+        AnyEstimator::default_product(),
+        PidController::default_quad(),
+        Second(4.0 / 1000.0),
+    );
+    hil.est.set_observation_noise(0.25, 0.01, 0.09); // 固件配置 ✓
+    let mut sim = SimImu::new();
+    // ★固件条件：SETPOINT.pos = GPS 原点（alt=4 ⇒ NED z=−4 ✓）
+    let mut sp = unsafe { core::mem::zeroed::<flyctrl_core::controller::Setpoint>() };
+    sp.pos = [Meter(0.0), Meter(0.0), Meter(-4.0)];
+    let frame = ImuSample {
+        accel: [MeterPerSecondSquared(0.0), MeterPerSecondSquared(0.0), MeterPerSecondSquared(-9.81)],
+        gyro: [RadianPerSecond(0.0); 3],
+    };
+    for k in 0..1300u32 {
+        let imu = if k >= 6 && k % 3 == 0 { Some(frame) } else { None };
+        let pos = Some(PosSample::pos_only([Meter(0.0); 3])); // 观测喂原点（≈0 ✓）
+        let _ = hil.ekf_hil(
+            imu, pos, Some(0.0), None, None, None, &sp,
+            true,  // ★ setpoint_valid = true（照固件 ✓）
+            false, false, &mut sim,
+        );
+        if k == 49 || k == 199 || k == 399 || k == 799 || k == 1299 {
+            let st = hil.est.state();
+            let q = st.att;
+            // ★追加：加计零偏轨迹 —— 固件实测 ab_z 在 6 步内长到 **+0.372** ✗，
+            //   而它是"重力幅值门关闭 ⇒ 姿态无锚"这条链的【种子】✓
+            let ab = hil.est.accel_bias();
+            eprintln!(
+                "[fw] 第 {:4} 拍：w={:+.5} 倾角≈{:5.2}° | vel=[{:+.3}, {:+.3}, {:+.3}] | pos=[{:+.3}, {:+.3}, {:+.3}] | **ab=[{:+.4}, {:+.4}, {:+.4}]**",
+                k + 1, q.w, 2.0 * (q.x.abs().min(1.0)).asin().to_degrees(),
+                st.vel[0].0, st.vel[1].0, st.vel[2].0,
+                st.pos[0].0, st.pos[1].0, st.pos[2].0, ab[0], ab[1], ab[2]
+            );
+        }
+    }
+}
+
+/// ★成本基准（2026-10-05）：量 `step`+融合的单次代价，与固件实测对照 ✓
+///
+/// 固件实测：单次 `estimator_work` = **488,707 cycles**（≈5.8 ms @84,000 cyc/ms ✓）
+/// ⇒ 若 host(release ✓ 同档优化) 量出的值远小于此 ⇒ 差距在**环境/调用结构** ✗；
+///   若相当 ⇒ 差距在 **fcalg 的算术本身** ✓ ⇒ 下一步直接优化算术 ✓
+/// **只打印**（不制造红灯 ✓）。
+#[test]
+fn bench_ekf_cost() {
+    use flyctrl_core::estimator::select::AnyEstimator;
+    use flyctrl_core::estimator::trait_def::*;
+    use flyctrl_core::units::{MeterPerSecondSquared, RadianPerSecond, Second};
+    use flyctrl_core::vehicle::ImuSample;
+
+    let mut est = AnyEstimator::default_product();
+    est.set_observation_noise(0.25, 0.01, 0.09);
+    let dt = Second(5.0 / 1000.0); // 照固件实际（实测 dt_ms=5 ✓）
+    let imu = ImuSample {
+        accel: [MeterPerSecondSquared(0.0), MeterPerSecondSquared(0.0), MeterPerSecondSquared(-9.81)],
+        gyro: [RadianPerSecond(0.0); 3],
+    };
+    let n = 20_000u32;
+    // 预热
+    for _ in 0..100 {
+        let _ = est.step(dt, imu, None, None);
+    }
+    let t0 = std::time::Instant::now();
+    for _ in 0..n {
+        let _ = est.step(dt, imu, None, None);
+    }
+    let el = t0.elapsed();
+    let ns = el.as_nanos() as f64 / n as f64;
+    eprintln!(
+        "[bench] step() 单次 = **{:.1} ns** = {:.3} ms ⇒ 折合 **{:.0} cycles** @84MHz（Host release ✓）",
+        ns, ns / 1e6, ns * 0.084
+    );
+    eprintln!("[bench] 固件实测 = **488707 cycles**（≈5.8 ms）⇒ 比值 = {:.2}×", 488707.0 / (ns * 0.084));
+    // ★② 同一件事的另一侧：直接 bench `HilContext::ekf_hil`（= 固件量到 397k 的那个 ✓）
+    {
+        use flyctrl_core::controller::PidController;
+        use flyctrl_core::hil::{HilContext, SimImu};
+        use flyctrl_core::units::Meter;
+        use flyctrl_core::vehicle::PosSample;
+        let mut hil = HilContext::new(
+            AnyEstimator::default_product(),
+            PidController::default_quad(),
+            Second(4.0 / 1000.0),
+        );
+        hil.est.set_observation_noise(0.25, 0.01, 0.09);
+        let mut sim = SimImu::new();
+        let sp = unsafe { core::mem::zeroed() };
+        let pos = Some(PosSample::pos_only([Meter(0.0); 3]));
+        let m = 2_000u32;
+        for _ in 0..20 {
+            let _ = hil.ekf_hil(Some(imu), pos, Some(0.0), None, None, None, &sp, false, false, false, &mut sim);
+        }
+        let t = std::time::Instant::now();
+        for k in 0..m {
+            // 照真链路：每 3 拍一个真帧 + 每拍 GPS/气压 ✓
+            let i = if k % 3 == 0 { Some(imu) } else { None };
+            let _ = hil.ekf_hil(i, pos, Some(0.0), None, None, None, &sp, false, false, false, &mut sim);
+        }
+        let ns2 = t.elapsed().as_nanos() as f64 / m as f64;
+        eprintln!(
+            "[bench] **ekf_hil 单次 = {:.1} ns = {:.0} cycles** @84MHz（Host release ✓）",
+            ns2, ns2 * 0.084
+        );
+        eprintln!(
+            "[bench] 固件同物 = **397367 cycles** ⇒ 比值 = **{:.1}×**",
+            397367.0 / (ns2 * 0.084)
+        );
+    }
+}

@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "fcalg"
+version = "0.1.0"
+dependencies = [
+ "fpmath",
+ "libm",
+]
+
+[[package]]
 name = "flyctrl-app"
 version = "0.1.0"
 dependencies = [
@@ -15,6 +23,7 @@ dependencies = [
 name = "flyctrl-core"
 version = "0.1.0"
 dependencies = [
+ "fcalg",
  "fpmath",
  "libm",
  "mavlink-core",
