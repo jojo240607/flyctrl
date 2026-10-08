@@ -662,6 +662,23 @@ where
                 if !self.baro_locked {
                     self.baro_ref = alt + g.pos[2].0;
                     self.baro_locked = true;
+                } else {
+                    // ★★PX4 式气压偏置（第四轮，实测驱动 ✓）：EKF2 `baro_hgt_offset` 的语义是
+                    //   **追踪"气压观测与融合高度"之间的慢差** ✓ —— 用估计值当目标 ✓。
+                    //   前三轮失败的原因（本轮查明 ✓）：目标用了 `alt + gps.pos[2]` ✗，
+                    //   而 GPS 的 NED z 是**带噪声的测量** ⇒ 等于把噪声灌进基准 ✗ ⇒ 慢回路
+                    //   追着噪声漂 ⇒ 垂直通道被推 ⇒ 波及全状态（长窗才现 ✗）。
+                    //   掩盖风险由【门控】承担 ✓（仅在有 GPS 定位且估计有限时缓动 ✓；
+                    //   GPS 位置/速度观测仍独立作为绝对锚 ⇒ 真实垂直误差不会被吞掉 ✓）。
+                    //   τ≈30 s（比估计器动力学慢一个量级 ✓）；单拍上限 5% ⇒ 稳 ✓。
+                    const TAU_S: f32 = 30.0;
+                    let dt = self.dt.0.max(1e-3);
+                    let k = (dt / TAU_S).clamp(0.0, 0.05);
+                    let pz = self.est.state().pos[2].0;
+                    let target = alt + pz;
+                    if target.is_finite() && pz.is_finite() {
+                        self.baro_ref += k * (target - self.baro_ref);
+                    }
                 }
             }
             crate::perf::probe(16); // step_hil: 气压更新前
